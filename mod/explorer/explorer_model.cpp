@@ -44,6 +44,30 @@ constexpr std::size_t kMaxHighlightRenderers = 48;
 constexpr int kHideAndDontSaveMask = 1 | 4 | 8 | 16 | 32;
 constexpr TypeRef kSceneType{"", "UnityEngine.SceneManagement", "Scene"};
 
+#if defined(_WIN32)
+struct NativeFaultRecord {
+    std::uint32_t code = 0;
+    std::uintptr_t address = 0;
+    std::uintptr_t instruction = 0;
+};
+thread_local NativeFaultRecord g_native_fault{};
+
+int capture_native_fault(void *raw_info) {
+    auto *info = static_cast<EXCEPTION_POINTERS *>(raw_info);
+    if (!info || !info->ExceptionRecord)
+        return 0;
+    const DWORD code = info->ExceptionRecord->ExceptionCode;
+    if (code != EXCEPTION_ACCESS_VIOLATION && code != EXCEPTION_IN_PAGE_ERROR)
+        return 0;
+    g_native_fault.code = code;
+    g_native_fault.instruction = reinterpret_cast<std::uintptr_t>(info->ExceptionRecord->ExceptionAddress);
+    g_native_fault.address = info->ExceptionRecord->NumberParameters >= 2
+                                 ? static_cast<std::uintptr_t>(info->ExceptionRecord->ExceptionInformation[1])
+                                 : 0;
+    return 1;
+}
+#endif
+
 struct FlatObject {
     GameObject object{};
     int instance_id = 0;
@@ -255,7 +279,8 @@ bool reference_value_from_text(std::string_view type_name, const void *destinati
             value.display = pointer_text(resolved.handle());
         }
 #if defined(_WIN32)
-    } __except (1) {
+    } __except (capture_native_fault(_exception_info())) {
+        detail::set_error("Reference conversion raised a native access fault");
         valid = false;
     }
 #endif
@@ -286,7 +311,8 @@ template <class Read> Inspect::ValueInfo guarded_managed_read(std::string_view t
 #if defined(_WIN32)
     __try {
         return read();
-    } __except (1) {
+    } __except (capture_native_fault(_exception_info())) {
+        detail::set_error("Managed member read raised a native access fault");
         return Inspect::unavailable_value(std::string(type_name), "native access violation while reading value");
     }
 #else
@@ -306,7 +332,8 @@ Inspect::ObjectHandle tracked_reference_handle(const Inspect::ValueInfo &value) 
         // Keep inspector-created boxes strong; keep ordinary references weak.
         handle = type.is_value_type ? Inspect::PinObject(object) : Inspect::WeakObject(object);
 #if defined(_WIN32)
-    } __except (1) {
+    } __except (capture_native_fault(_exception_info())) {
+        detail::set_error("Tracked reference handle creation raised a native access fault");
         handle = {};
     }
 #endif
@@ -430,11 +457,13 @@ void build_managed_caller_index() {
     if (index.built)
         return;
     index.built = true;
-    for (std::size_t assembly_index = 0; assembly_index < URK::il2cpp::domain_get_assembly_count(); ++assembly_index) {
+    const std::size_t assembly_count = std::min<std::size_t>(URK::il2cpp::domain_get_assembly_count(), 4096);
+    for (std::size_t assembly_index = 0; assembly_index < assembly_count; ++assembly_index) {
         const auto *image = URK::il2cpp::assembly_get_image(URK::il2cpp::domain_get_assembly(assembly_index));
         if (!image)
             continue;
-        for (std::size_t class_index = 0; class_index < URK::il2cpp::image_get_class_count(image); ++class_index) {
+        const std::size_t class_count = std::min<std::size_t>(URK::il2cpp::image_get_class_count(image), 1000000);
+        for (std::size_t class_index = 0; class_index < class_count; ++class_index) {
             const auto *klass = URK::il2cpp::image_get_class(image, class_index);
             if (!klass)
                 continue;
@@ -444,7 +473,12 @@ void build_managed_caller_index() {
                 continue;
             const std::string type_name = namespc && namespc[0] ? std::string(namespc) + "." + class_name : class_name;
             void *iterator = nullptr;
+            std::unordered_set<const void *> visited_methods;
+            std::size_t method_count = 0;
             while (const auto *method = URK::il2cpp::class_get_methods(klass, &iterator)) {
+                if (++method_count > Inspect::kMaxMetadataMembersPerClass ||
+                    !visited_methods.insert(method).second)
+                    break;
                 void *const pointer = URK::il2cpp::method_pointer(method);
                 const char *method_name = URK::il2cpp::method_get_name(method);
                 if (!pointer || !method_name || !method_name[0])
@@ -486,7 +520,7 @@ std::string describe_traced_reference(std::uint64_t raw, std::string_view declar
         const auto *klass = URK::il2cpp::object_get_class(reinterpret_cast<URK::il2cpp::Object *>(address));
         type_name = Inspect::DescribeClass(klass).full_name;
 #if defined(_WIN32)
-    } __except (1) {
+    } __except (capture_native_fault(_exception_info())) {
         return fallback + " (unavailable)";
     }
 #endif
@@ -511,7 +545,7 @@ std::string describe_traced_reference(std::uint64_t raw, std::string_view declar
             instance_id = object.GetInstanceID();
             name = object.name();
 #if defined(_WIN32)
-        } __except (1) {
+        } __except (capture_native_fault(_exception_info())) {
             name.clear();
             instance_id = 0;
         }
@@ -533,6 +567,23 @@ std::string assembly_name(const Inspect::TypeInfo &type) {
     return name ? name : "";
 }
 } // namespace
+
+struct RuntimeModel::HierarchyCensus {
+    HierarchyInfo next;
+    std::uint64_t scene_generation = 0;
+    std::unordered_map<int, std::size_t> loaded_scene_indices;
+    std::size_t ddol_index = 0;
+    std::size_t hidden_index = 0;
+    detail::RootedObjectArray<GameObject> candidates;
+    std::size_t candidate_count = 0;
+    std::size_t candidate_index = 0;
+    std::vector<FlatObject> flat;
+    std::unordered_map<int, std::size_t> flat_indices;
+    Clock::time_point started{};
+    std::chrono::microseconds max_slice{};
+};
+
+RuntimeModel::~RuntimeModel() = default;
 
 RuntimeModel &RuntimeModel::instance() {
     static RuntimeModel model;
@@ -557,7 +608,10 @@ void RuntimeModel::start() {
     request_refresh();
 }
 
-void RuntimeModel::notify_native_fault() {
+void RuntimeModel::notify_native_fault(std::uint32_t code, std::uintptr_t address, std::uintptr_t instruction) {
+    native_fault_code_.store(code, std::memory_order_release);
+    native_fault_address_.store(address, std::memory_order_release);
+    native_fault_instruction_.store(instruction, std::memory_order_release);
     native_faulted_.store(true, std::memory_order_release);
 }
 
@@ -579,7 +633,12 @@ void RuntimeModel::tick() {
                        command.kind != CommandKind::ClearDiagnostics;
             });
         }
-        set_status("Explorer recovered from an invalid IL2CPP metadata pointer; select the component again.");
+        const std::uint32_t fault_code = native_fault_code_.exchange(0, std::memory_order_acq_rel);
+        const std::uintptr_t fault_address = native_fault_address_.exchange(0, std::memory_order_acq_rel);
+        const std::uintptr_t fault_instruction = native_fault_instruction_.exchange(0, std::memory_order_acq_rel);
+        set_status("Explorer isolated a native IL2CPP access fault; stale managed state was released and a census retry is pending.");
+        ModLog::error("Native recovery: code=0x%08X address=%p instruction=%p", fault_code,
+                      reinterpret_cast<void *>(fault_address), reinterpret_cast<void *>(fault_instruction));
         refresh_requested_.store(false, std::memory_order_release);
         event_refresh_pending_ = true;
         event_refresh_due_ = Clock::now() + std::chrono::milliseconds(750);
@@ -597,14 +656,16 @@ void RuntimeModel::tick() {
         event_refresh_pending_ = false;
         request_refresh();
     }
-    if (refresh_requested_.exchange(false)) {
-        refresh_hierarchy();
-        refresh_inspector(true);
-        update_highlight();
-        next_inspector_refresh_ = now + kInspectorInterval;
-        next_highlight_refresh_ = now + kHighlightInterval;
-        publish();
-        return;
+    const bool refresh_requested = refresh_requested_.exchange(false);
+    if (refresh_requested || hierarchy_census_) {
+        if (refresh_hierarchy()) {
+            refresh_inspector(true);
+            update_highlight();
+            next_inspector_refresh_ = now + kInspectorInterval;
+            next_highlight_refresh_ = now + kHighlightInterval;
+            publish();
+            return;
+        }
     }
 
     // Paused Live Data preserves the published snapshot.
@@ -645,6 +706,7 @@ void RuntimeModel::tick() {
 
 void RuntimeModel::stop() {
     MethodTracer::stop_all();
+    hierarchy_census_.reset();
     clear_selection();
     ModUI::Highlight::enqueue_clear();
     hierarchy_instance_ids_.clear();
@@ -656,7 +718,8 @@ void RuntimeModel::stop() {
     for (auto &[_, handle] : class_browser_static_handles_)
         Inspect::FreeObjectHandle(handle);
     class_browser_static_handles_.clear();
-    highlight_renderers_.clear();
+    clear_highlight_renderer_cache();
+    clear_highlight_camera_cache();
     hierarchy_ = std::make_shared<const HierarchyInfo>();
     working_ = {};
     working_.hierarchy = hierarchy_;
@@ -671,6 +734,12 @@ void RuntimeModel::request_refresh() {
 }
 
 void RuntimeModel::enqueue(Command command) {
+    command.sequence = next_command_sequence_.fetch_add(1, std::memory_order_relaxed);
+    if (command.scene_generation == 0 && command.kind != CommandKind::SceneHint &&
+        command.kind != CommandKind::ObjectDestroyRequested) {
+        if (const auto current = published_.load(std::memory_order_acquire); current && current->hierarchy)
+            command.scene_generation = current->hierarchy->scene_generation;
+    }
     std::lock_guard<std::mutex> lock(command_mutex_);
     if (command.kind == CommandKind::LoadComponentMetadata) {
         const bool already_queued = std::any_of(commands_.begin(), commands_.end(), [&](const Command &pending) {
@@ -694,39 +763,40 @@ void RuntimeModel::process_commands() {
         pending.swap(commands_);
     }
 
-    // Coalesce destruction bursts, retaining the selected object's event.
+    // Coalesce destruction bursts in place. Scene hints remain ordering
+    // barriers; moving them to the end allowed pre-transition commands to run
+    // against objects from a different scene generation.
     if (pending.size() > 1) {
+        const std::size_t original_count = pending.size();
         std::vector<Command> coalesced;
         coalesced.reserve(pending.size());
-        std::optional<Command> latest_scene_hint;
-        std::optional<Command> destroy_notification;
-        std::optional<Command> selected_destroy_notification;
+        std::optional<std::size_t> destroy_index;
         for (Command &command : pending) {
-            if (command.kind == CommandKind::SceneHint) {
-                latest_scene_hint = std::move(command);
-            } else if (command.kind == CommandKind::ObjectDestroyRequested) {
-                if (command.instance_id == working_.selected_instance_id)
-                    selected_destroy_notification = std::move(command);
-                else if (!destroy_notification)
-                    destroy_notification = std::move(command);
-            } else {
+            if (command.kind != CommandKind::ObjectDestroyRequested) {
                 coalesced.push_back(std::move(command));
+                continue;
+            }
+            if (!destroy_index) {
+                destroy_index = coalesced.size();
+                coalesced.push_back(std::move(command));
+            } else if (command.instance_id == working_.selected_instance_id) {
+                // Clearing early is safe and retains the selected object's
+                // identity without processing every notification in a burst.
+                coalesced[*destroy_index] = std::move(command);
             }
         }
-        if (latest_scene_hint)
-            coalesced.push_back(std::move(*latest_scene_hint));
-        if (selected_destroy_notification)
-            coalesced.push_back(std::move(*selected_destroy_notification));
-        else if (destroy_notification)
-            coalesced.push_back(std::move(*destroy_notification));
         pending = std::move(coalesced);
+        if (pending.size() != original_count)
+            ModLog::info("Command queue coalesced destruction burst: before=%zu after=%zu", original_count,
+                         pending.size());
     }
-    for (const Command &command : pending) {
+    for (std::size_t command_index = 0; command_index < pending.size(); ++command_index) {
+        const Command &command = pending[command_index];
 #if defined(_WIN32)
         bool native_fault = false;
         __try {
             process_command(command);
-        } __except (1) {
+        } __except (capture_native_fault(_exception_info())) {
             native_fault = true;
         }
         if (native_fault) {
@@ -748,25 +818,51 @@ void RuntimeModel::process_commands() {
                         "; retry after the component finishes initializing or changes state.";
                 }
                 component_reflection_.erase(command.instance_id);
+                detail::clear_metadata_caches();
                 clear_error();
                 set_status("Component metadata access failed for " +
                            (component != working_.inspector.components.end() ? component->type_name
                                                                              : std::to_string(command.instance_id)));
-                ModLog::error("Component metadata access violation: id=%d type=%s stage=%s", command.instance_id,
+                ModLog::error("Component metadata access violation: id=%d type=%s stage=%s code=0x%08X address=%p instruction=%p",
+                              command.instance_id,
                               component != working_.inspector.components.end() ? component->type_name.c_str()
-                                                                                : "<unknown>",
-                              active_metadata_stage_.empty() ? "<unknown>" : active_metadata_stage_.c_str());
+                                                                                 : "<unknown>",
+                              active_metadata_stage_.empty() ? "<unknown>" : active_metadata_stage_.c_str(),
+                              g_native_fault.code, reinterpret_cast<void *>(g_native_fault.address),
+                              reinterpret_cast<void *>(g_native_fault.instruction));
                 active_metadata_stage_.clear();
                 publish_recovery_snapshot();
                 continue;
             }
             clear_error();
             set_status("Explorer blocked a native access violation while processing a command.");
-            ModLog::warn("Explorer command kind=%d blocked a native access violation", static_cast<int>(command.kind));
+            ModLog::warn("Explorer command kind=%d sequence=%llu blocked a native access violation: code=0x%08X address=%p instruction=%p",
+                         static_cast<int>(command.kind), static_cast<unsigned long long>(command.sequence),
+                         g_native_fault.code, reinterpret_cast<void *>(g_native_fault.address),
+                         reinterpret_cast<void *>(g_native_fault.instruction));
+            std::vector<Command> retry;
+            std::size_t dropped = 0;
+            for (std::size_t index = command_index + 1; index < pending.size(); ++index) {
+                const CommandKind kind = pending[index].kind;
+                if (kind == CommandKind::Select || kind == CommandKind::ClearSelection ||
+                    kind == CommandKind::Refresh || kind == CommandKind::SceneHint ||
+                    kind == CommandKind::ObjectDestroyRequested || kind == CommandKind::ClearDiagnostics)
+                    retry.push_back(std::move(pending[index]));
+                else
+                    ++dropped;
+            }
+            const std::size_t safe_requeued = retry.size();
+            if (!retry.empty()) {
+                std::lock_guard<std::mutex> lock(command_mutex_);
+                retry.insert(retry.end(), std::make_move_iterator(commands_.begin()),
+                             std::make_move_iterator(commands_.end()));
+                commands_ = std::move(retry);
+            }
+            ModLog::warn("Command fault disposition: safe_requeued=%zu unsafe_dropped=%zu", safe_requeued, dropped);
             // Do not continue this tick: publishing, refreshing, or freeing a
             // stale handle can immediately repeat the same fault. The next
             // tick uses the native-only recovery path.
-            notify_native_fault();
+            notify_native_fault(g_native_fault.code, g_native_fault.address, g_native_fault.instruction);
             return;
         }
 #else
@@ -776,6 +872,22 @@ void RuntimeModel::process_commands() {
 }
 
 void RuntimeModel::process_command(const Command &command) {
+    const bool lifecycle_command = command.kind == CommandKind::SceneHint ||
+                                   command.kind == CommandKind::ObjectDestroyRequested;
+    if (!lifecycle_command && command.scene_generation != 0 && command.scene_generation != scene_generation_) {
+        set_status("Ignored a command from an expired scene generation");
+        ModLog::warn("Dropped stale command: kind=%d sequence=%llu queued_generation=%llu current_generation=%llu",
+                     static_cast<int>(command.kind), static_cast<unsigned long long>(command.sequence),
+                     static_cast<unsigned long long>(command.scene_generation),
+                     static_cast<unsigned long long>(scene_generation_));
+        return;
+    }
+    if (command.hierarchy_revision != 0 &&
+        (!hierarchy_ || command.hierarchy_revision != hierarchy_->revision)) {
+        set_status("Hierarchy changed before the command could be applied; please retry");
+        request_refresh();
+        return;
+    }
     const bool component_command =
         command.kind == CommandKind::LoadComponentMetadata || command.kind == CommandKind::LoadComponentClassCatalog ||
         command.kind == CommandKind::LoadClassBrowserCatalog || command.kind == CommandKind::FindClassInstances ||
@@ -801,6 +913,12 @@ void RuntimeModel::process_command(const Command &command) {
             object = resolve_selected_object();
         if (!object)
             object = resolve_live_game_object(command.instance_id, command_root.handle);
+        if (object && command.expected_object_address != 0 &&
+            reinterpret_cast<std::uintptr_t>(object.handle()) != command.expected_object_address) {
+            object = {};
+            set_status("Object identity changed before the command could be applied; please retry");
+            request_refresh();
+        }
     }
     if (!object && command.kind != CommandKind::Refresh && command.kind != CommandKind::ClearSelection &&
         command.kind != CommandKind::SceneHint && command.kind != CommandKind::ClearDiagnostics && !component_command &&
@@ -966,7 +1084,7 @@ void RuntimeModel::process_command(const Command &command) {
 #if defined(_WIN32)
             __try {
                 component.SetProperty("enabled", command.bool_value);
-            } __except (1) {
+            } __except (capture_native_fault(_exception_info())) {
                 clear_error();
                 set_status("Set component enabled blocked an invalid native access");
                 return;
@@ -1041,6 +1159,11 @@ void RuntimeModel::process_command(const Command &command) {
             publish();
             return;
         case CommandKind::SceneHint:
+            ++scene_generation_;
+            hierarchy_census_.reset();
+            ModLog::info("Scene generation advanced: generation=%llu handle=%d name=%s",
+                         static_cast<unsigned long long>(scene_generation_), command.int_value,
+                         command.text.empty() ? "<unknown>" : command.text.c_str());
             active_scene_handle_hint_ = command.int_value;
             active_scene_name_hint_ = command.text;
             // Release strong explorer roots before scene teardown.
@@ -1051,12 +1174,14 @@ void RuntimeModel::process_command(const Command &command) {
             event_refresh_due_ = Clock::now() + kEventRefreshDebounce;
             return;
         case CommandKind::ObjectDestroyRequested:
-            // Only the selected object needs immediate cache teardown.
-            if (command.instance_id != working_.selected_instance_id)
-                return;
-            clear_selection();
-            clear_object_inspector();
-            request_refresh();
+            if (command.instance_id == working_.selected_instance_id) {
+                clear_selection();
+                clear_object_inspector();
+            }
+            // Non-selected destruction also invalidates hierarchy membership.
+            // Debounce the census rather than silently retaining a stale tree.
+            event_refresh_pending_ = true;
+            event_refresh_due_ = Clock::now() + kEventRefreshDebounce;
             return;
     }
 
@@ -1070,79 +1195,102 @@ void RuntimeModel::process_command(const Command &command) {
     publish();
 }
 
-void RuntimeModel::refresh_hierarchy() {
-    HierarchyInfo next{};
-    next.revision = next_hierarchy_revision_++;
-    next.source = "Event-driven Resources census / native adjacency";
-    hierarchy_instance_ids_.clear();
+bool RuntimeModel::refresh_hierarchy() {
+    const bool starting = !hierarchy_census_;
+    if (starting)
+        hierarchy_census_ = std::make_unique<HierarchyCensus>();
+    HierarchyCensus &state = *hierarchy_census_;
+    HierarchyInfo &next = state.next;
 
-    const Scene active_scene = SceneManager::GetActiveScene();
-    int active_handle = boxed_scene_handle(active_scene);
-    if (active_handle == 0)
-        active_handle = active_scene_handle_hint_;
+    if (starting) {
+        state.started = Clock::now();
+        state.scene_generation = scene_generation_;
+        next.revision = next_hierarchy_revision_++;
+        next.scene_generation = scene_generation_;
+        next.source = "Event-driven Resources census / native adjacency / frame-budgeted";
+        hierarchy_instance_ids_.clear();
 
-    // Identify loaded scenes without calling methods on boxed Scene values.
-    std::unordered_map<int, std::size_t> loaded_scene_indices;
-    const int scene_count = std::clamp(SceneManager::sceneCount(), 0, kMaxSceneCount);
-    for (int index = 0; index < scene_count; ++index) {
-        const Scene scene = SceneManager::GetSceneAt(index);
-        const int handle = boxed_scene_handle(scene);
-        if (handle == 0 || loaded_scene_indices.contains(handle))
-            continue;
-        SceneNode node{};
-        node.handle = handle;
-        node.name = scene_name_from_handle(handle);
-        if (node.name.empty() && handle == active_scene_handle_hint_)
-            node.name = active_scene_name_hint_;
-        if (node.name.empty())
-            node.name = "Scene " + std::to_string(handle);
-        node.active = handle == active_handle;
-        loaded_scene_indices.emplace(handle, next.scenes.size());
-        next.scenes.push_back(std::move(node));
+        const Scene active_scene = SceneManager::GetActiveScene();
+        int active_handle = boxed_scene_handle(active_scene);
+        if (active_handle == 0)
+            active_handle = active_scene_handle_hint_;
+
+        const int scene_count = std::clamp(SceneManager::sceneCount(), 0, kMaxSceneCount);
+        for (int index = 0; index < scene_count; ++index) {
+            const Scene scene = SceneManager::GetSceneAt(index);
+            const int handle = boxed_scene_handle(scene);
+            if (handle == 0 || state.loaded_scene_indices.contains(handle))
+                continue;
+            SceneNode node{};
+            node.handle = handle;
+            node.name = scene_name_from_handle(handle);
+            if (node.name.empty() && handle == active_scene_handle_hint_)
+                node.name = active_scene_name_hint_;
+            if (node.name.empty())
+                node.name = "Scene " + std::to_string(handle);
+            node.active = handle == active_handle;
+            state.loaded_scene_indices.emplace(handle, next.scenes.size());
+            next.scenes.push_back(std::move(node));
+        }
+
+        if (active_handle != 0 && !state.loaded_scene_indices.contains(active_handle)) {
+            SceneNode node{};
+            node.handle = active_handle;
+            node.name = scene_name_from_handle(active_handle);
+            if (node.name.empty())
+                node.name = active_scene_name_hint_;
+            if (node.name.empty())
+                node.name = "Active Scene";
+            node.active = true;
+            next.scenes.insert(next.scenes.begin(), std::move(node));
+            state.loaded_scene_indices.clear();
+            for (std::size_t index = 0; index < next.scenes.size(); ++index)
+                state.loaded_scene_indices[next.scenes[index].handle] = index;
+        }
+
+        state.ddol_index = next.scenes.size();
+        SceneNode ddol{};
+        ddol.name = "DontDestroyOnLoad";
+        ddol.dont_destroy_on_load = true;
+        next.scenes.push_back(std::move(ddol));
+
+        state.hidden_index = next.scenes.size();
+        SceneNode hidden{};
+        hidden.name = "HideAndDontSave";
+        hidden.hide_and_dont_save = true;
+        next.scenes.push_back(std::move(hidden));
+
+        state.candidates = Object::FindObjectsOfTypeAllRooted<GameObject>();
+        state.candidate_count = std::min(state.candidates.size(), kMaxCensusCandidates);
+        ModLog::info("Hierarchy census started: generation=%llu candidates=%zu budget_ms=2",
+                     static_cast<unsigned long long>(state.scene_generation), state.candidate_count);
+        if (state.candidates.size() > kMaxCensusCandidates)
+            next.source += " (candidate cap reached)";
+        state.flat.reserve(state.candidate_count);
+        state.flat_indices.reserve(state.candidate_count);
     }
 
-    if (active_handle != 0 && !loaded_scene_indices.contains(active_handle)) {
-        SceneNode node{};
-        node.handle = active_handle;
-        node.name = scene_name_from_handle(active_handle);
-        if (node.name.empty())
-            node.name = active_scene_name_hint_;
-        if (node.name.empty())
-            node.name = "Active Scene";
-        node.active = true;
-        loaded_scene_indices.emplace(active_handle, next.scenes.size());
-        next.scenes.insert(next.scenes.begin(), std::move(node));
-        // Insertion changed every prior index.
-        loaded_scene_indices.clear();
-        for (std::size_t i = 0; i < next.scenes.size(); ++i)
-            loaded_scene_indices[next.scenes[i].handle] = i;
+    if (state.scene_generation != scene_generation_) {
+        hierarchy_census_.reset();
+        request_refresh();
+        return false;
     }
 
-    const std::size_t ddol_index = next.scenes.size();
-    SceneNode ddol{};
-    ddol.name = "DontDestroyOnLoad";
-    ddol.dont_destroy_on_load = true;
-    next.scenes.push_back(std::move(ddol));
-
-    const std::size_t hidden_index = next.scenes.size();
-    SceneNode hidden{};
-    hidden.name = "HideAndDontSave";
-    hidden.hide_and_dont_save = true;
-    next.scenes.push_back(std::move(hidden));
-
-    std::vector<GameObject> candidates = Object::FindObjectsOfTypeAll<GameObject>();
-    if (candidates.size() > kMaxCensusCandidates) {
-        candidates.resize(kMaxCensusCandidates);
-        next.source += " (candidate cap reached)";
-    }
-
-    std::vector<FlatObject> flat;
-    flat.reserve(candidates.size());
-    std::unordered_map<int, std::size_t> flat_indices;
-    flat_indices.reserve(candidates.size());
+    auto &flat = state.flat;
+    auto &flat_indices = state.flat_indices;
+    const Clock::time_point slice_started = Clock::now();
+    const Clock::time_point deadline = slice_started + std::chrono::milliseconds(2);
+    std::size_t processed_this_slice = 0;
 
     // Build parent-child relations natively after one managed census.
-    for (const GameObject &object : candidates) {
+    for (; state.candidate_index < state.candidate_count; ++state.candidate_index) {
+        if (processed_this_slice >= 64 && Clock::now() >= deadline) {
+            state.max_slice = std::max(state.max_slice,
+                std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - slice_started));
+            return false;
+        }
+        ++processed_this_slice;
+        const GameObject &object = state.candidates[state.candidate_index];
         if (!object)
             continue;
         const int instance_id = object.GetInstanceID();
@@ -1170,6 +1318,12 @@ void RuntimeModel::refresh_hierarchy() {
         flat_indices.emplace(instance_id, flat.size());
         flat.push_back(std::move(record));
     }
+    state.max_slice = std::max(state.max_slice,
+        std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - slice_started));
+
+    const std::size_t ddol_index = state.ddol_index;
+    const std::size_t hidden_index = state.hidden_index;
+    auto &loaded_scene_indices = state.loaded_scene_indices;
 
     std::vector<std::vector<std::size_t>> children(flat.size());
     std::vector<std::size_t> root_indices;
@@ -1193,6 +1347,7 @@ void RuntimeModel::refresh_hierarchy() {
         hierarchy_instance_ids_.insert(source.instance_id);
         HierarchyNode node{};
         node.instance_id = source.instance_id;
+        node.object_address = reinterpret_cast<std::uintptr_t>(source.object.handle());
         node.name = source.name;
         node.pointer_text = pointer_text(source.object.handle());
         node.active = source.active;
@@ -1244,6 +1399,10 @@ void RuntimeModel::refresh_hierarchy() {
                      next.scenes.size(), next.roots, next.objects);
     }
 
+    const auto census_elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - state.started);
+    ModLog::info("hierarchy census timing: candidates=%zu total_ms=%lld max_slice_us=%lld",
+                 state.candidate_count, static_cast<long long>(census_elapsed.count()),
+                 static_cast<long long>(state.max_slice.count()));
     hierarchy_ = std::make_shared<const HierarchyInfo>(std::move(next));
     working_.hierarchy = hierarchy_;
 
@@ -1254,6 +1413,8 @@ void RuntimeModel::refresh_hierarchy() {
         if (!hierarchy_instance_ids_.contains(working_.selected_instance_id) || !resolve_selected_object())
             clear_selection();
     }
+    hierarchy_census_.reset();
+    return true;
 }
 
 void RuntimeModel::refresh_inspector(bool include_components) {
@@ -1286,7 +1447,8 @@ void RuntimeModel::refresh_inspector(bool include_components) {
         info.class_name = object_type.name;
         info.components.clear();
         clear_component_cache();
-        for (const Component &candidate : selected_.GetComponents<Component>()) {
+        const auto components = selected_.GetComponentsRooted<Component>();
+        for (const Component &candidate : components) {
             if (!candidate)
                 continue;
             Inspect::ObjectHandle handle = Inspect::PinObject(Object{candidate.handle()});
@@ -1318,7 +1480,7 @@ void RuntimeModel::refresh_inspector(bool include_components) {
 #if defined(_WIN32)
                 __try {
                     enabled = component.GetProperty<bool>("enabled");
-                } __except (1) {
+                } __except (capture_native_fault(_exception_info())) {
                     // Record native faults from malformed third-party metadata.
                     clear_error();
                     ModLog::warn("Component enabled probe blocked a native access violation: id=%d type=%s",
@@ -1347,7 +1509,8 @@ void RuntimeModel::refresh_inspector(bool include_components) {
         candidates.reserve(kMaxHighlightRenderers);
         const Transform highlight_transform = selected_.transform();
         const Vector3 highlight_position = highlight_transform ? highlight_transform.position() : Vector3{};
-        for (const Renderer& renderer : selected_.GetComponentsInChildren<Renderer>(true)) {
+        const auto renderers = selected_.GetComponentsInChildrenRooted<Renderer>(true);
+        for (const Renderer& renderer : renderers) {
             if (!renderer || !renderer.alive())
                 continue;
             const Transform renderer_transform = renderer.transform();
@@ -1371,10 +1534,13 @@ void RuntimeModel::refresh_inspector(bool include_components) {
             [](const HighlightRendererCandidate& left, const HighlightRendererCandidate& right) {
                 return left.distance_squared < right.distance_squared;
             });
-        highlight_renderers_.clear();
+        clear_highlight_renderer_cache();
         highlight_renderers_.reserve(candidates.size());
-        for (const HighlightRendererCandidate& candidate : candidates)
-            highlight_renderers_.push_back(candidate.renderer);
+        for (const HighlightRendererCandidate& candidate : candidates) {
+            Inspect::ObjectHandle handle = Inspect::WeakObject(Object{candidate.renderer.handle()});
+            if (handle.handle)
+                highlight_renderers_.push_back(handle);
+        }
     }
 
     const Transform transform = selected_.transform();
@@ -1614,7 +1780,7 @@ void RuntimeModel::load_component_class_catalog() {
     constexpr std::uint32_t kTypeAttributeAbstract = 0x80u;
     constexpr std::size_t kMaxComponentClasses = 20000;
 
-    const std::size_t assembly_count = URK::il2cpp::domain_get_assembly_count();
+    const std::size_t assembly_count = std::min<std::size_t>(URK::il2cpp::domain_get_assembly_count(), 4096);
     for (std::size_t assembly_index = 0; assembly_index < assembly_count; ++assembly_index) {
         const URK::il2cpp::Assembly *assembly = URK::il2cpp::domain_get_assembly(assembly_index);
         const URK::il2cpp::Image *image = assembly ? URK::il2cpp::assembly_get_image(assembly) : nullptr;
@@ -1622,7 +1788,7 @@ void RuntimeModel::load_component_class_catalog() {
         if (!image || !image_name || !image_name[0])
             continue;
 
-        const std::size_t class_count = URK::il2cpp::image_get_class_count(image);
+        const std::size_t class_count = std::min<std::size_t>(URK::il2cpp::image_get_class_count(image), 1000000);
         for (std::size_t class_index = 0; class_index < class_count; ++class_index) {
             const URK::il2cpp::Class *klass = URK::il2cpp::image_get_class(image, class_index);
             if (!klass || klass == component_base)
@@ -1633,7 +1799,11 @@ void RuntimeModel::load_component_class_catalog() {
 
             bool is_component = URK::il2cpp::class_is_assignable_from(component_base, klass) != 0;
             if (!is_component) {
-                for (const URK::il2cpp::Class *parent = URK::il2cpp::class_get_parent(klass); parent;
+                std::unordered_set<const URK::il2cpp::Class *> visited_parents;
+                std::size_t parent_depth = 0;
+                for (const URK::il2cpp::Class *parent = URK::il2cpp::class_get_parent(klass);
+                     parent && parent_depth++ < Inspect::kMaxMetadataInheritanceDepth &&
+                     visited_parents.insert(parent).second;
                      parent = URK::il2cpp::class_get_parent(parent)) {
                     if (parent == component_base) {
                         is_component = true;
@@ -1692,14 +1862,14 @@ void RuntimeModel::load_class_browser_catalog() {
     constexpr std::uint32_t kTypeAttributeAbstract = 0x80u;
     constexpr std::uint32_t kTypeAttributeSealed = 0x100u;
     constexpr std::size_t kMaxBrowserClasses = 50000;
-    const std::size_t assembly_count = URK::il2cpp::domain_get_assembly_count();
+    const std::size_t assembly_count = std::min<std::size_t>(URK::il2cpp::domain_get_assembly_count(), 4096);
     for (std::size_t assembly_index = 0; assembly_index < assembly_count; ++assembly_index) {
         const URK::il2cpp::Assembly *assembly = URK::il2cpp::domain_get_assembly(assembly_index);
         const URK::il2cpp::Image *image = assembly ? URK::il2cpp::assembly_get_image(assembly) : nullptr;
         const char *image_name = image ? URK::il2cpp::image_get_name(image) : nullptr;
         if (!image || !image_name || !image_name[0])
             continue;
-        const std::size_t class_count = URK::il2cpp::image_get_class_count(image);
+        const std::size_t class_count = std::min<std::size_t>(URK::il2cpp::image_get_class_count(image), 1000000);
         for (std::size_t class_index = 0; class_index < class_count; ++class_index) {
             const URK::il2cpp::Class *klass = URK::il2cpp::image_get_class(image, class_index);
             if (!klass)
@@ -1724,8 +1894,12 @@ void RuntimeModel::load_class_browser_catalog() {
             entry.is_component = component_base && (URK::il2cpp::class_is_assignable_from(component_base, klass) != 0 ||
                                                     URK::il2cpp::class_has_parent(klass, component_base) != 0);
             void *interface_iterator = nullptr;
+            std::unordered_set<const URK::il2cpp::Class *> visited_interfaces;
+            std::size_t interface_count = 0;
             while (const URK::il2cpp::Class *interface_type =
                        URK::il2cpp::class_get_interfaces(klass, &interface_iterator)) {
+                if (++interface_count > 4096 || !visited_interfaces.insert(interface_type).second)
+                    break;
                 const Inspect::TypeInfo interface_info = Inspect::DescribeClass(interface_type);
                 if (!interface_info.full_name.empty())
                     entry.interfaces.push_back(interface_info.full_name);
@@ -1777,9 +1951,11 @@ void RuntimeModel::find_class_instances(const Command &command) {
     }
 
     // Query instances through Unity's managed API; inspect statics separately.
-    const std::vector<Object> direct_instances =
-        command.bool_value ? Object::FindObjectsOfTypeAll<Object>(command.image, command.namespc, command.class_name)
-                           : Object::FindObjectsOfType<Object>(command.image, command.namespc, command.class_name);
+    const auto direct_instances = command.bool_value
+        ? detail::FindObjectsUsingRooted<Object>(ResourcesType, "FindObjectsOfTypeAll", command.image,
+                                                 command.namespc, command.class_name)
+        : detail::FindObjectsUsingRooted<Object>(UnityObjectType, "FindObjectsOfType", command.image,
+                                                 command.namespc, command.class_name);
     constexpr std::size_t kMaxDirectInstanceResults = 512;
     for (const Object &object : direct_instances) {
         if (working_.class_browser_instances.size() >= kMaxDirectInstanceResults)
@@ -1839,14 +2015,14 @@ void RuntimeModel::find_class_instances(const Command &command) {
     };
 
     // Static references cover non-Unity managed singletons and interfaces.
-    const std::size_t assembly_count = URK::il2cpp::domain_get_assembly_count();
+    const std::size_t assembly_count = std::min<std::size_t>(URK::il2cpp::domain_get_assembly_count(), 4096);
     for (std::size_t assembly_index = 0; assembly_index < assembly_count && seen.size() < kMaxGraphNodes;
          ++assembly_index) {
         const URK::il2cpp::Assembly *assembly = URK::il2cpp::domain_get_assembly(assembly_index);
         const URK::il2cpp::Image *image = assembly ? URK::il2cpp::assembly_get_image(assembly) : nullptr;
         if (!image)
             continue;
-        const std::size_t class_count = URK::il2cpp::image_get_class_count(image);
+        const std::size_t class_count = std::min<std::size_t>(URK::il2cpp::image_get_class_count(image), 1000000);
         for (std::size_t class_index = 0; class_index < class_count && seen.size() < kMaxGraphNodes; ++class_index) {
             const URK::il2cpp::Class *klass = URK::il2cpp::image_get_class(image, class_index);
             if (!klass)
@@ -1867,8 +2043,8 @@ void RuntimeModel::find_class_instances(const Command &command) {
         }
     }
 
-    const std::vector<Object> unity_roots =
-        command.bool_value ? Object::FindObjectsOfTypeAll<Object>() : Object::FindObjectsOfType<Object>();
+    const auto unity_roots = command.bool_value ? Object::FindObjectsOfTypeAllRooted<Object>()
+                                                : Object::FindObjectsOfTypeRooted<Object>();
     for (const Object &root : unity_roots) {
         if (seen.size() >= kMaxGraphNodes)
             break;
@@ -2284,7 +2460,7 @@ void RuntimeModel::set_member_value(const Command &command, bool property, const
             else
                 written = Inspect::SetField(target, member, value);
 #if defined(_WIN32)
-        } __except (1) {
+        } __except (capture_native_fault(_exception_info())) {
             Inspect::FreeObjectHandle(argument_root);
             clear_error();
             set_status(std::string("Set ") + (is_property ? "property" : "field") +
@@ -2403,7 +2579,7 @@ void RuntimeModel::write_back_value_type_object_inspector() {
                 written = Inspect::SetFieldFromBox(parent, reflection->second.fields[index], boxed);
         }
 #if defined(_WIN32)
-    } __except (1) {
+    } __except (capture_native_fault(_exception_info())) {
         clear_error();
         set_status("Value-type write-back blocked an invalid native access");
         return;
@@ -3101,7 +3277,8 @@ GameObject RuntimeModel::resolve_live_game_object(int instance_id, Inspect::Obje
     // Stripped players may omit the internal lookup. The fallback is used only
     // for an explicit user command and roots the matching wrapper before it is
     // retained by the model.
-    for (const GameObject &candidate : Object::FindObjectsOfTypeAll<GameObject>()) {
+    const auto candidates = Object::FindObjectsOfTypeAllRooted<GameObject>();
+    for (const GameObject &candidate : candidates) {
         if (!candidate)
             continue;
         if (candidate.GetInstanceID() == instance_id)
@@ -3159,7 +3336,7 @@ void RuntimeModel::select_object(GameObject object, Inspect::ObjectHandle root) 
     selected_ = GameObject{rooted.handle()};
     working_.selected_instance_id = instance_id;
     working_.inspector = {};
-    highlight_renderers_.clear();
+    clear_highlight_renderer_cache();
 }
 
 void RuntimeModel::update_highlight() {
@@ -3189,10 +3366,14 @@ void RuntimeModel::update_highlight() {
 
     const Clock::time_point camera_now = Clock::now();
     if (camera_now >= next_highlight_camera_refresh_ || highlight_cameras_.empty()) {
-        highlight_cameras_.clear();
-        for (const Camera& candidate : Object::FindObjectsOfType<Camera>()) {
-            if (candidate && candidate.alive() && candidate.enabled())
-                highlight_cameras_.push_back(candidate);
+        clear_highlight_camera_cache();
+        const auto cameras = Object::FindObjectsOfTypeRooted<Camera>();
+        for (const Camera& candidate : cameras) {
+            if (candidate && candidate.alive() && candidate.enabled()) {
+                Inspect::ObjectHandle handle = Inspect::WeakObject(Object{candidate.handle()});
+                if (handle.handle)
+                    highlight_cameras_.push_back(handle);
+            }
         }
         next_highlight_camera_refresh_ = camera_now + kHighlightCameraRefreshInterval;
     }
@@ -3203,7 +3384,8 @@ void RuntimeModel::update_highlight() {
         camera_samples.reserve(9);
         if (selected_transform)
             camera_samples.push_back(selected_transform.position());
-        for (const Renderer& renderer : highlight_renderers_) {
+        for (const Inspect::ObjectHandle& renderer_handle : highlight_renderers_) {
+            const Renderer renderer{Inspect::ResolveObjectHandle(renderer_handle).handle()};
             if (!renderer || !renderer.alive())
                 continue;
             camera_samples.push_back(renderer.bounds().center);
@@ -3214,7 +3396,8 @@ void RuntimeModel::update_highlight() {
         int best_visible_samples = -1;
         int best_front_samples = -1;
         float best_center_distance = std::numeric_limits<float>::max();
-        for (const Camera& candidate : highlight_cameras_) {
+        for (const Inspect::ObjectHandle& camera_handle : highlight_cameras_) {
+            const Camera candidate{Inspect::ResolveObjectHandle(camera_handle).handle()};
             if (!candidate || !candidate.alive())
                 continue;
             int visible_samples = 0;
@@ -3320,7 +3503,8 @@ void RuntimeModel::update_highlight() {
     };
     projected = project_rect_transform();
     // Choose the smallest valid projection from nearby renderers.
-    for (const Renderer &renderer : highlight_renderers_) {
+    for (const Inspect::ObjectHandle &renderer_handle : highlight_renderers_) {
+        const Renderer renderer{Inspect::ResolveObjectHandle(renderer_handle).handle()};
         if (projected || !camera)
             break;
         if (!renderer || !renderer.alive())
@@ -3515,6 +3699,18 @@ void RuntimeModel::update_highlight() {
         ModUI::Highlight::enqueue_set_screen_rect(highlight_id_, ImVec2(min_x, min_y), ImVec2(max_x, max_y));
 }
 
+void RuntimeModel::clear_highlight_renderer_cache() {
+    for (Inspect::ObjectHandle &handle : highlight_renderers_)
+        Inspect::FreeObjectHandle(handle);
+    highlight_renderers_.clear();
+}
+
+void RuntimeModel::clear_highlight_camera_cache() {
+    for (Inspect::ObjectHandle &handle : highlight_cameras_)
+        Inspect::FreeObjectHandle(handle);
+    highlight_cameras_.clear();
+}
+
 void RuntimeModel::clear_selection() {
     if (highlight_id_ != 0) {
         ModUI::Highlight::enqueue_remove(highlight_id_);
@@ -3528,16 +3724,14 @@ void RuntimeModel::clear_selection() {
     Inspect::FreeObjectHandle(selected_handle_);
     clear_locked_members();
     clear_component_cache();
-    highlight_renderers_.clear();
+    clear_highlight_renderer_cache();
     working_.selected_instance_id = 0;
     working_.inspector = {};
 }
 
 void RuntimeModel::discard_managed_state_after_native_fault() {
-    // This path intentionally leaks only the affected IL2CPP GC handles. The
-    // process is still running after an access violation, so calling the
-    // corresponding free API can dereference the same stale metadata/object
-    // record and turn a recoverable fault into an endless main-thread loop.
+    const std::uint64_t quarantined_before = Inspect::QuarantinedObjectHandleCount();
+    hierarchy_census_.reset();
     if (highlight_id_ != 0)
         ModUI::Highlight::enqueue_remove(highlight_id_);
     if (highlight_locator_id_ != 0)
@@ -3546,24 +3740,26 @@ void RuntimeModel::discard_managed_state_after_native_fault() {
     highlight_locator_id_ = 0;
 
     selected_ = {};
-    selected_handle_ = {};
+    Inspect::FreeObjectHandle(selected_handle_);
     hierarchy_instance_ids_.clear();
-    component_handles_.clear();
-    reference_handles_.clear();
-    object_inspector_history_.clear();
-    object_inspector_handle_ = {};
+    clear_locked_members();
+    clear_component_cache();
+    clear_object_inspector();
+    for (auto &[_, handle] : class_browser_handles_)
+        Inspect::FreeObjectHandle(handle);
     class_browser_handles_.clear();
+    for (auto &[_, handle] : class_browser_static_handles_)
+        Inspect::FreeObjectHandle(handle);
     class_browser_static_handles_.clear();
-    locked_members_.clear();
-    field_watches_.clear();
     component_reflection_.clear();
     active_metadata_stage_.clear();
+    detail::clear_metadata_caches();
     object_inspector_reflection_ = {};
     sampled_component_members_.clear();
     sampled_object_fields_.clear();
     sampled_object_properties_.clear();
-    highlight_renderers_.clear();
-    highlight_cameras_.clear();
+    clear_highlight_renderer_cache();
+    clear_highlight_camera_cache();
     working_.selected_instance_id = 0;
     working_.inspector = {};
     working_.object_inspector = {};
@@ -3575,6 +3771,11 @@ void RuntimeModel::discard_managed_state_after_native_fault() {
     // to render. Keeping them avoids a blank workspace while the next census
     // rebuilds the non-owning object index.
     working_.hierarchy = hierarchy_;
+    const std::uint64_t quarantined_after = Inspect::QuarantinedObjectHandleCount();
+    if (quarantined_after != quarantined_before)
+        ModLog::error("GC handle recovery quarantined %llu handle(s); total=%llu",
+                      static_cast<unsigned long long>(quarantined_after - quarantined_before),
+                      static_cast<unsigned long long>(quarantined_after));
 }
 
 void RuntimeModel::set_status(std::string message) {
@@ -3655,8 +3856,23 @@ void RuntimeModel::publish() {
         ++(handle.weak ? working_.weak_handle_count : working_.strong_handle_count);
     for (const auto &[_, handle] : class_browser_static_handles_)
         ++(handle.weak ? working_.weak_handle_count : working_.strong_handle_count);
+    for (const auto &[_, locked] : locked_members_)
+        if (locked.value_root.handle)
+            ++(locked.value_root.weak ? working_.weak_handle_count : working_.strong_handle_count);
+    for (const Inspect::ObjectHandle &handle : highlight_renderers_)
+        if (handle.handle)
+            ++(handle.weak ? working_.weak_handle_count : working_.strong_handle_count);
+    for (const Inspect::ObjectHandle &handle : highlight_cameras_)
+        if (handle.handle)
+            ++(handle.weak ? working_.weak_handle_count : working_.strong_handle_count);
     if (object_inspector_handle_.handle)
         ++(object_inspector_handle_.weak ? working_.weak_handle_count : working_.strong_handle_count);
+    if (hierarchy_census_ && hierarchy_census_->candidates)
+        ++working_.strong_handle_count;
+    working_.quarantined_handle_count = Inspect::QuarantinedObjectHandleCount();
+    working_.hierarchy_census_active = hierarchy_census_ != nullptr;
+    working_.hierarchy_census_processed = hierarchy_census_ ? hierarchy_census_->candidate_index : 0;
+    working_.hierarchy_census_candidates = hierarchy_census_ ? hierarchy_census_->candidate_count : 0;
     working_.managed_used_bytes = URK::il2cpp::gc_get_used_size();
     working_.managed_heap_bytes = URK::il2cpp::gc_get_heap_size();
     ++working_.revision;
@@ -3682,7 +3898,17 @@ void RuntimeModel::publish_recovery_snapshot() {
         count_handle(handle);
     for (const auto &[_, handle] : class_browser_static_handles_)
         count_handle(handle);
+    for (const auto &[_, locked] : locked_members_)
+        count_handle(locked.value_root);
+    for (const Inspect::ObjectHandle &handle : highlight_renderers_)
+        count_handle(handle);
+    for (const Inspect::ObjectHandle &handle : highlight_cameras_)
+        count_handle(handle);
     count_handle(object_inspector_handle_);
+    working_.quarantined_handle_count = Inspect::QuarantinedObjectHandleCount();
+    working_.hierarchy_census_active = hierarchy_census_ != nullptr;
+    working_.hierarchy_census_processed = hierarchy_census_ ? hierarchy_census_->candidate_index : 0;
+    working_.hierarchy_census_candidates = hierarchy_census_ ? hierarchy_census_->candidate_count : 0;
     ++working_.revision;
     published_.store(std::make_shared<const Snapshot>(working_));
 }

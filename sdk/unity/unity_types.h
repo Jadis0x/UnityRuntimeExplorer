@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cctype>
 #include <cstdio>
 #include <cstddef>
@@ -228,6 +229,22 @@ inline std::unordered_map<std::string, const void*>& class_cache() { static std:
 inline std::unordered_map<std::string, void*>& type_cache() { static std::unordered_map<std::string, void*> value; return value; }
 inline std::unordered_map<std::string, const void*>& method_cache() { static std::unordered_map<std::string, const void*> value; return value; }
 inline std::unordered_map<std::string, const void*>& field_cache() { static std::unordered_map<std::string, const void*> value; return value; }
+inline std::atomic<std::uint64_t>& quarantined_gchandle_counter() {
+    static std::atomic<std::uint64_t> value{0};
+    return value;
+}
+#if defined(_WIN32)
+inline int native_access_exception_filter(unsigned long code) {
+    return code == 0xC0000005ul || code == 0xC0000006ul ? 1 : 0;
+}
+#endif
+inline void clear_metadata_caches() {
+    std::lock_guard<std::mutex> lock(cache_mutex());
+    class_cache().clear();
+    type_cache().clear();
+    method_cache().clear();
+    field_cache().clear();
+}
 inline void clear_error() { error_slot().clear(); }
 inline void set_error(std::string_view text) { error_slot() = std::string(text); }
 inline const char* fallback_error() { return error_slot().empty() ? nullptr : error_slot().c_str(); }
@@ -304,10 +321,12 @@ struct Backend {
         if (!klass) { set_error("Unity method lookup failed: class is null"); return nullptr; }
         const std::string cacheKey = member_cache_key(klass, name, argc);
         { std::lock_guard<std::mutex> lock(cache_mutex()); const auto found = method_cache().find(cacheKey); if (found != method_cache().end()) return found->second; }
-        auto n=z(name); const void* current=klass;
+        auto n=z(name); const void* current=klass; std::unordered_set<const void*> parents; std::size_t depth=0;
         while (current) {
-            void* it=nullptr; const void* match=nullptr; int matches=0;
+            if (depth++ >= 128 || !parents.insert(current).second) { set_error("Unity method lookup rejected a cyclic or excessive inheritance chain"); return nullptr; }
+            void* it=nullptr; const void* match=nullptr; int matches=0; std::unordered_set<const void*> members; std::size_t member_count=0;
             while (const auto* m = URK::il2cpp::class_get_methods(static_cast<const URK::il2cpp::Class*>(current), &it)) {
+                if (++member_count > 32768 || !members.insert(m).second) { set_error("Unity method lookup rejected a cyclic or excessive method iterator"); return nullptr; }
                 const char* mn = URK::il2cpp::method_get_name(m); if (!mn || n != mn) continue;
                 if (argc < 0 || static_cast<int>(URK::il2cpp::method_get_param_count(m)) == argc) { match=m; ++matches; }
             }
@@ -321,10 +340,12 @@ struct Backend {
         if (!klass) { set_error("Unity exact method lookup failed: class is null"); return nullptr; }
         const std::string cacheKey = member_cache_key(klass, name, parameterTypeNames);
         { std::lock_guard<std::mutex> lock(cache_mutex()); const auto found = method_cache().find(cacheKey); if (found != method_cache().end()) return found->second; }
-        auto n=z(name); int same_arity=0; std::string first_mismatch; const void* current=klass;
+        auto n=z(name); int same_arity=0; std::string first_mismatch; const void* current=klass; std::unordered_set<const void*> parents; std::size_t depth=0;
         while (current) {
-            void* it=nullptr; const void* match=nullptr; int matches=0;
+            if (depth++ >= 128 || !parents.insert(current).second) { set_error("Unity exact method lookup rejected a cyclic or excessive inheritance chain"); return nullptr; }
+            void* it=nullptr; const void* match=nullptr; int matches=0; std::unordered_set<const void*> members; std::size_t member_count=0;
             while (const auto* m = URK::il2cpp::class_get_methods(static_cast<const URK::il2cpp::Class*>(current), &it)) {
+                if (++member_count > 32768 || !members.insert(m).second) { set_error("Unity exact method lookup rejected a cyclic or excessive method iterator"); return nullptr; }
                 const char* mn = URK::il2cpp::method_get_name(m); if (!mn || n != mn || URK::il2cpp::method_get_param_count(m) != parameterTypeNames.size()) continue; ++same_arity;
                 bool ok=true; for (std::uint32_t i=0; i<parameterTypeNames.size(); ++i) { char buf[256]{}; const auto* pt=URK::il2cpp::method_get_param(m,i); const char* want=parameterTypeNames[i]; const bool named=URK::il2cpp::type_get_name(pt, buf, sizeof(buf)); std::string_view got(named ? buf : ""); if (!want || !named || (!type_name_matches(got, want))) { if (first_mismatch.empty()) first_mismatch=std::string("; first mismatch param=")+std::to_string(i)+" requested="+(want?want:"<null>")+" actual="+(got.empty()?"<unavailable>":std::string(got)); ok=false; break; } }
                 if (ok) { match=m; ++matches; }
@@ -351,10 +372,11 @@ struct Backend {
     static const void* find_field(const void* klass, std::string_view name) {
         const std::string cacheKey = member_cache_key(klass, name, -1);
         { std::lock_guard<std::mutex> lock(cache_mutex()); const auto found = field_cache().find(cacheKey); if (found != field_cache().end()) return found->second; }
-        auto n=z(name); const void* current=klass;
+        auto n=z(name); const void* current=klass; std::unordered_set<const void*> parents; std::size_t depth=0;
         while (current) {
-            void* it=nullptr;
-            while (const auto* f = URK::il2cpp::class_get_fields(static_cast<const URK::il2cpp::Class*>(current), &it)) { const char* fn = URK::il2cpp::field_get_name(f); if (fn && n == fn) { std::lock_guard<std::mutex> lock(cache_mutex()); field_cache()[cacheKey] = f; return f; } }
+            if (depth++ >= 128 || !parents.insert(current).second) { set_error("Unity field lookup rejected a cyclic or excessive inheritance chain"); return nullptr; }
+            void* it=nullptr; std::unordered_set<const void*> members; std::size_t member_count=0;
+            while (const auto* f = URK::il2cpp::class_get_fields(static_cast<const URK::il2cpp::Class*>(current), &it)) { if (++member_count > 32768 || !members.insert(f).second) { set_error("Unity field lookup rejected a cyclic or excessive field iterator"); return nullptr; } const char* fn = URK::il2cpp::field_get_name(f); if (fn && n == fn) { std::lock_guard<std::mutex> lock(cache_mutex()); field_cache()[cacheKey] = f; return f; } }
             current = URK::il2cpp::class_get_parent(static_cast<const URK::il2cpp::Class*>(current));
         }
         return nullptr;
@@ -382,6 +404,91 @@ struct Backend {
     static void* value_box(const void* klass, void* data) { return URK::il2cpp::value_box(static_cast<const URK::il2cpp::Class*>(klass), data); }
 
     static std::int64_t string_length(void* string) { return static_cast<std::int64_t>(URK::il2cpp::string_length(static_cast<URK::il2cpp::String*>(string))); }
+};
+inline void append_backend_error();
+
+// Owns a strong GC handle to a managed reference array while exposing its
+// elements as the SDK's lightweight wrappers.  The wrappers deliberately do
+// not own their targets; the managed array does for the lifetime of this
+// lease.  This is intended for multi-call scans where returning a plain vector
+// of raw managed pointers would otherwise introduce a GC race.
+template<class T> class RootedObjectArray {
+  public:
+    RootedObjectArray() = default;
+    RootedObjectArray(const RootedObjectArray&) = delete;
+    RootedObjectArray& operator=(const RootedObjectArray&) = delete;
+
+    RootedObjectArray(RootedObjectArray&& other) noexcept
+        : items_(std::move(other.items_)), root_(std::exchange(other.root_, 0)) {}
+    RootedObjectArray& operator=(RootedObjectArray&& other) noexcept {
+        if (this != &other) {
+            reset();
+            items_ = std::move(other.items_);
+            root_ = std::exchange(other.root_, 0);
+        }
+        return *this;
+    }
+    ~RootedObjectArray() { reset(); }
+
+    explicit operator bool() const { return root_ != 0; }
+    bool empty() const { return items_.empty(); }
+    std::size_t size() const { return items_.size(); }
+    const T& operator[](std::size_t index) const { return items_[index]; }
+    auto begin() const { return items_.begin(); }
+    auto end() const { return items_.end(); }
+    std::vector<T> copy_items() const { return items_; }
+
+    void reset() {
+        items_.clear();
+        if (!root_)
+            return;
+        const std::uint32_t root = std::exchange(root_, 0);
+#if defined(_WIN32)
+        __try {
+            Backend::gchandle_free(root);
+        } __except (native_access_exception_filter(_exception_code())) {
+            quarantined_gchandle_counter().fetch_add(1, std::memory_order_relaxed);
+            set_error("Unity rooted array release raised a native access fault; one array handle was quarantined");
+        }
+#else
+        Backend::gchandle_free(root);
+#endif
+    }
+
+    static RootedObjectArray from_managed_array(void* array, std::string_view operation) {
+        RootedObjectArray out;
+        if (!array) {
+            if (!fallback_error()) set_error(std::string(operation) + " returned a null managed array");
+            return out;
+        }
+        out.root_ = Backend::gchandle_new(array, 0);
+        if (!out.root_) {
+            set_error(std::string(operation) + " could not root the managed result array");
+            append_backend_error();
+            return out;
+        }
+        if (!Backend::has_array_length() || !Backend::has_array_ref_at()) {
+            set_error(std::string(operation) + " requires array_length and array_ref_at exports");
+            append_backend_error();
+            out.reset();
+            return out;
+        }
+        constexpr std::size_t kMaxManagedReferenceArrayElements = 1u << 20;
+        const std::size_t reported_count = Backend::array_length(array);
+        const std::size_t count = std::min(reported_count, kMaxManagedReferenceArrayElements);
+        if (reported_count > kMaxManagedReferenceArrayElements)
+            set_error(std::string(operation) + " truncated an excessive managed array length");
+        out.items_.reserve(count);
+        for (std::size_t index = 0; index < count; ++index) {
+            if (void* item = Backend::array_ref_at(array, index))
+                out.items_.emplace_back(item);
+        }
+        return out;
+    }
+
+  private:
+    std::vector<T> items_;
+    std::uint32_t root_ = 0;
 };
 inline void append_backend_error() { const char* e = Backend::backend_last_error(); if (e && e[0]) { if (!error_slot().empty()) error_slot() += "; backend: "; error_slot() += e; } }
 inline std::string managed_string_to_utf8(void* value) {
@@ -574,7 +681,8 @@ template<> struct FieldOut<std::string> { void* value=nullptr; void* ptr(){ retu
 template<class T> void* field_value(T& v) { FieldArg<std::remove_cvref_t<T>> a(v); return a.ptr; }
 template<class Ret, class... Args> Ret InvokeStatic(TypeRef type, std::string_view methodName, Args&&... args);
 template<class T, class... Args> std::vector<T> StaticArrayCall(TypeRef type, std::string_view methodName, Args&&... args);
-  template<class T, class... ExtraArgs> std::vector<T> FindObjectsUsing(TypeRef owner, std::string_view methodName, std::string_view image, std::string_view namespc, std::string_view className, ExtraArgs&&... extraArgs);
+template<class T, class... ExtraArgs> std::vector<T> FindObjectsUsing(TypeRef owner, std::string_view methodName, std::string_view image, std::string_view namespc, std::string_view className, ExtraArgs&&... extraArgs);
+template<class T, class... ExtraArgs> RootedObjectArray<T> FindObjectsUsingRooted(TypeRef owner, std::string_view methodName, std::string_view image, std::string_view namespc, std::string_view className, ExtraArgs&&... extraArgs);
 }
 struct TypeObject { void* handle_ = nullptr; explicit TypeObject(void* h=nullptr) : handle_(h) {} void* handle() const { return handle_; } explicit operator bool() const { return handle_ != nullptr; } };
 
@@ -604,6 +712,8 @@ struct Object {
     template<class T> static std::vector<T> FindObjectsOfType() { const TypeRef type = T::unity_type(); return FindObjectsOfType<T>(type.image, type.namespc, type.name); }
     template<class T> static std::vector<T> FindObjectsByType(FindObjectsSortMode sortMode = FindObjectsSortMode::None) { const TypeRef type = T::unity_type(); return FindObjectsByType<T>(type.image, type.namespc, type.name, sortMode); }
     template<class T> static std::vector<T> FindObjectsOfTypeAll() { const TypeRef type = T::unity_type(); return FindObjectsOfTypeAll<T>(type.image, type.namespc, type.name); }
+    template<class T> static detail::RootedObjectArray<T> FindObjectsOfTypeRooted() { const TypeRef type = T::unity_type(); return detail::FindObjectsUsingRooted<T>(UnityObjectType, "FindObjectsOfType", type.image, type.namespc, type.name); }
+    template<class T> static detail::RootedObjectArray<T> FindObjectsOfTypeAllRooted() { const TypeRef type = T::unity_type(); return detail::FindObjectsUsingRooted<T>(ResourcesType, "FindObjectsOfTypeAll", type.image, type.namespc, type.name); }
     template<class T> static T FindObjectOfType() { auto all = FindObjectsOfType<T>(); return all.empty() ? T{} : all.front(); }
     template<class T> static T FindObjectOfTypeAll() { auto all = FindObjectsOfTypeAll<T>(); return all.empty() ? T{} : all.front(); }
     template<class T> static T FindObject() { return FindObjectOfType<T>(); }
@@ -630,6 +740,7 @@ struct Object {
     template<class Ret = void, class... Args> Ret InvokeGeneric(std::string_view methodName, const std::vector<TypeObject>& genericTypes, Args&&... args) const;
     template<class T = Object> std::vector<T> CallArrayExact(std::string_view methodName, const std::vector<const char*>& parameterTypeNames, void** rawArgs) const;
     template<class T = Object, class... Args> std::vector<T> CallArrayExact(std::string_view methodName, const std::vector<const char*>& parameterTypeNames, Args&&... args) const;
+    template<class T = Object, class... Args> detail::RootedObjectArray<T> CallArrayExactRooted(std::string_view methodName, const std::vector<const char*>& parameterTypeNames, Args&&... args) const;
     std::vector<std::string> CallStringArrayExact(std::string_view methodName, const std::vector<const char*>& parameterTypeNames) const;
     template<class T> void SetReferenceArrayProperty(std::string_view propertyName, const std::vector<T>& values) const;
     template<class T> T GetProperty(std::string_view propertyName) const { return Call<T>(std::string("get_") + std::string(propertyName)); }

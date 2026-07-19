@@ -19,6 +19,7 @@ namespace Explorer {
 
 struct HierarchyNode {
     int instance_id = 0;
+    std::uintptr_t object_address = 0;
     std::string name;
     std::string pointer_text;
     bool active = false;
@@ -40,6 +41,7 @@ struct HierarchyInfo {
     std::size_t roots = 0;
     std::size_t objects = 0;
     std::uint64_t revision = 0;
+    std::uint64_t scene_generation = 0;
 };
 
 struct ComponentInfo {
@@ -252,52 +254,56 @@ struct Snapshot {
     std::unordered_set<std::uint64_t> locked_member_keys;
     std::size_t strong_handle_count = 0;
     std::size_t weak_handle_count = 0;
+    std::uint64_t quarantined_handle_count = 0;
+    bool hierarchy_census_active = false;
+    std::size_t hierarchy_census_processed = 0;
+    std::size_t hierarchy_census_candidates = 0;
     std::int64_t managed_used_bytes = 0;
     std::int64_t managed_heap_bytes = 0;
     std::uint64_t revision = 0;
 };
 
 enum class CommandKind {
-    Select,
-    ClearSelection,
-    Refresh,
-    DeleteObject,
-    DuplicateObject,
-    Rename,
-    SetTag,
-    SetLayer,
-    SetStatic,
-    SetActive,
-    SetLocalPosition,
-    SetLocalRotation,
-    SetLocalScale,
-    AddComponent,
-    DeleteComponent,
-    SetComponentEnabled,
-    SetLiveData,
-    LoadComponentMetadata,
-    LoadComponentClassCatalog,
-    LoadClassBrowserCatalog,
-    FindClassInstances,
-    LoadClassBrowserStaticState,
-    LoadClassBrowserMembers,
-    SetFieldValue,
-    SetPropertyValue,
-    SampleMemberValue,
-    SetArrayPage,
-    InvokeMethod,
-    SetMethodTrace,
-    ClearMethodTrace,
-    CloseMethodTrace,
-    SetFieldWatch,
-    ClearFieldWatch,
-    CloseFieldWatch,
-    InspectReference,
-    InspectRawReference,
-    CloseObjectInspectorTab,
-    SceneHint,
-    ObjectDestroyRequested,
-    ClearDiagnostics,
+    Select = 0,
+    ClearSelection = 1,
+    Refresh = 2,
+    DeleteObject = 3,
+    DuplicateObject = 4,
+    Rename = 5,
+    SetTag = 6,
+    SetLayer = 7,
+    SetStatic = 8,
+    SetActive = 9,
+    SetLocalPosition = 10,
+    SetLocalRotation = 11,
+    SetLocalScale = 12,
+    AddComponent = 13,
+    DeleteComponent = 14,
+    SetComponentEnabled = 15,
+    SetLiveData = 16,
+    LoadComponentMetadata = 17,
+    LoadComponentClassCatalog = 18,
+    LoadClassBrowserCatalog = 19,
+    FindClassInstances = 20,
+    LoadClassBrowserStaticState = 21,
+    LoadClassBrowserMembers = 22,
+    SetFieldValue = 23,
+    SetPropertyValue = 24,
+    SampleMemberValue = 25,
+    SetArrayPage = 26,
+    InvokeMethod = 27,
+    SetMethodTrace = 28,
+    ClearMethodTrace = 29,
+    CloseMethodTrace = 30,
+    SetFieldWatch = 31,
+    ClearFieldWatch = 32,
+    CloseFieldWatch = 33,
+    InspectReference = 34,
+    InspectRawReference = 35,
+    CloseObjectInspectorTab = 36,
+    SceneHint = 37,
+    ObjectDestroyRequested = 38,
+    ClearDiagnostics = 39,
 };
 
 struct Command {
@@ -310,6 +316,12 @@ struct Command {
     // It prevents a queued command from being applied after the user switches
     // to another inspected object.
     std::uint64_t object_inspector_token = 0;
+    // Captured from the immutable UI snapshot. Zero means that the producer is
+    // a lifecycle hook rather than a hierarchy/inspector interaction.
+    std::uint64_t scene_generation = 0;
+    std::uint64_t hierarchy_revision = 0;
+    std::uintptr_t expected_object_address = 0;
+    std::uint64_t sequence = 0;
     bool bool_value = false;
     bool object_inspector_target = false;
     bool lock_value = false;
@@ -325,12 +337,14 @@ struct Command {
 class RuntimeModel {
   public:
     static RuntimeModel &instance();
+    ~RuntimeModel();
 
     void start();
     void tick();
     void stop();
     // Called by the main-thread SEH boundary; recovery waits for the next tick.
-    void notify_native_fault();
+    void notify_native_fault(std::uint32_t code = 0, std::uintptr_t address = 0,
+                             std::uintptr_t instruction = 0);
     void request_refresh();
     void enqueue(Command command);
     std::shared_ptr<const Snapshot> snapshot() const;
@@ -340,7 +354,7 @@ class RuntimeModel {
 
     void process_commands();
     void process_command(const Command &command);
-    void refresh_hierarchy();
+    bool refresh_hierarchy();
     void refresh_inspector(bool include_components);
     void load_component_metadata(int component_instance_id);
     void load_component_class_catalog();
@@ -375,6 +389,8 @@ class RuntimeModel {
     void refresh_object_inspector_values(bool force = false);
     void release_reference_handle(std::uint64_t token);
     void update_highlight();
+    void clear_highlight_renderer_cache();
+    void clear_highlight_camera_cache();
     // The hierarchy stores non-owning Unity object wrappers. Resolve a fresh
     // object at selection time so a scene transition cannot turn a stale
     // hierarchy entry into an inspector target.
@@ -399,6 +415,8 @@ class RuntimeModel {
     std::atomic<std::shared_ptr<const Snapshot>> published_;
     Snapshot working_{};
     std::shared_ptr<const HierarchyInfo> hierarchy_;
+    struct HierarchyCensus;
+    std::unique_ptr<HierarchyCensus> hierarchy_census_;
     // Membership only; hierarchy snapshots must never retain managed wrappers.
     std::unordered_set<int> hierarchy_instance_ids_;
     // Keeps cached selected components alive.
@@ -408,6 +426,8 @@ class RuntimeModel {
     std::unordered_map<std::uint64_t, URK::Unity::Inspect::ObjectHandle> object_inspector_history_;
     std::uint64_t next_reference_token_ = 1;
     std::uint64_t next_hierarchy_revision_ = 1;
+    std::uint64_t scene_generation_ = 1;
+    std::atomic<std::uint64_t> next_command_sequence_{1};
     std::uint64_t next_method_result_id_ = 1;
     std::uint64_t next_field_watch_id_ = 1;
     URK::Unity::Inspect::ObjectHandle object_inspector_handle_{};
@@ -444,9 +464,9 @@ class RuntimeModel {
     // managed GameObject wrapper rooted independently from that snapshot.
     URK::Unity::Inspect::ObjectHandle selected_handle_{};
     URK::Unity::GameObject selected_{};
-    std::vector<URK::Unity::Renderer> highlight_renderers_;
+    std::vector<URK::Unity::Inspect::ObjectHandle> highlight_renderers_;
     // Cache active cameras instead of relying on Camera.main.
-    std::vector<URK::Unity::Camera> highlight_cameras_;
+    std::vector<URK::Unity::Inspect::ObjectHandle> highlight_cameras_;
     std::uint32_t highlight_id_ = 0;
     std::uint32_t highlight_locator_id_ = 0;
     int active_scene_handle_hint_ = 0;
@@ -462,6 +482,9 @@ class RuntimeModel {
     bool event_refresh_pending_ = false;
     bool live_data_ = false;
     std::atomic<bool> native_faulted_{false};
+    std::atomic<std::uint32_t> native_fault_code_{0};
+    std::atomic<std::uintptr_t> native_fault_address_{0};
+    std::atomic<std::uintptr_t> native_fault_instruction_{0};
     Clock::time_point event_refresh_due_{};
 };
 

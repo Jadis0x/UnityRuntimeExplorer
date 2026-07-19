@@ -10,7 +10,38 @@
 
 #include <utility>
 
+#if defined(_WIN32)
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <Windows.h>
+#endif
+
 namespace ModRuntime {
+#if defined(_WIN32)
+namespace {
+struct RuntimeFaultRecord {
+  std::uint32_t code = 0;
+  std::uintptr_t address = 0;
+  std::uintptr_t instruction = 0;
+};
+thread_local RuntimeFaultRecord g_runtime_fault{};
+
+int capture_runtime_fault(void* raw_info) {
+  auto* info = static_cast<EXCEPTION_POINTERS*>(raw_info);
+  if (!info || !info->ExceptionRecord) return 0;
+  const DWORD code = info->ExceptionRecord->ExceptionCode;
+  if (code != EXCEPTION_ACCESS_VIOLATION && code != EXCEPTION_IN_PAGE_ERROR) return 0;
+  g_runtime_fault.code = code;
+  g_runtime_fault.instruction = reinterpret_cast<std::uintptr_t>(info->ExceptionRecord->ExceptionAddress);
+  g_runtime_fault.address = info->ExceptionRecord->NumberParameters >= 2
+                                ? static_cast<std::uintptr_t>(info->ExceptionRecord->ExceptionInformation[1])
+                                : 0;
+  return 1;
+}
+} // namespace
+#endif
+
 bool start(const URK_ModContext* ctx) {
   URK::set_context(ctx);
   if (!URK::initialize_backend(ctx)) {
@@ -30,9 +61,12 @@ void update() {
   // update; RuntimeModel will discard stale reflection state next frame.
   __try {
     Explorer::RuntimeModel::instance().tick();
-  } __except (1) {
-    Explorer::RuntimeModel::instance().notify_native_fault();
-    ModLog::error("Explorer update caught a native access violation; recovery scheduled");
+  } __except (capture_runtime_fault(_exception_info())) {
+    Explorer::RuntimeModel::instance().notify_native_fault(
+        g_runtime_fault.code, g_runtime_fault.address, g_runtime_fault.instruction);
+    ModLog::error("Explorer update caught a native access fault; recovery scheduled: code=0x%08X address=%p instruction=%p",
+                  g_runtime_fault.code, reinterpret_cast<void*>(g_runtime_fault.address),
+                  reinterpret_cast<void*>(g_runtime_fault.instruction));
   }
 #else
   Explorer::RuntimeModel::instance().tick();

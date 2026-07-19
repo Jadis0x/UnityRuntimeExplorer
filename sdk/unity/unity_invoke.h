@@ -169,22 +169,32 @@ template<class Ret, class... Args> Ret detail::InvokeStatic(TypeRef type, std::s
 }
 
 template<class T, class... Args> std::vector<T> detail::StaticArrayCall(TypeRef type, std::string_view methodName, Args&&... args) {
-    std::vector<T> out; void* array = InvokeStatic<void*>(type, methodName, std::forward<Args>(args)...);
-    if (!array) { if (!fallback_error()) set_error(std::string("Unity array call returned null: ")+std::string(methodName)); return out; }
-    if (!Backend::has_array_length()) { set_error("Unity array length unavailable: backend array_length API is unavailable"); append_backend_error(); return out; }
-    const std::size_t count = Backend::array_length(array); if (count == 0) { append_backend_error(); return out; }
-    if (!Backend::has_array_ref_at()) { set_error("Unity array element access unavailable: backend array_ref_at API is unavailable"); append_backend_error(); return out; }
-    out.reserve(count); for (std::size_t i=0; i<count; ++i) { void* item=Backend::array_ref_at(array, i); if (item) out.emplace_back(item); } return out;
+    void* array = InvokeStatic<void*>(type, methodName, std::forward<Args>(args)...);
+    return RootedObjectArray<T>::from_managed_array(array, "Unity static array call").copy_items();
 }
 
 template<class T, class... ExtraArgs> std::vector<T> detail::FindObjectsUsing(TypeRef owner, std::string_view methodName, std::string_view image, std::string_view namespc, std::string_view className, ExtraArgs&&... extraArgs) {
     std::vector<T> out; clear_error(); TypeRef target{image, namespc, className}; void* type = target.resolve_type_object(); if (!type) { set_error(std::string("Unity object finding failed: class not found: ")+std::string(image)+":"+std::string(namespc)+"."+std::string(className)); append_backend_error(); return out; } void* array = InvokeStatic<void*>(owner, methodName, TypeObject{type}, std::forward<ExtraArgs>(extraArgs)...);
     if (!array && methodName == "FindObjectsOfType" && sizeof...(ExtraArgs) == 0) { clear_error(); array = InvokeStatic<void*>(owner, "FindObjectsByType", TypeObject{type}, FindObjectsSortMode::None); }
-    if (!array) { if (!fallback_error()) set_error(std::string("Unity object finding failed: returned array was null: ")+std::string(methodName)); return out; }
-    if (!Backend::has_array_length()) { set_error("Unity object finding failed: backend array_length API is unavailable"); append_backend_error(); return out; }
-    const std::size_t count = Backend::array_length(array); if (count == 0) { append_backend_error(); return out; }
-    if (!Backend::has_array_ref_at()) { set_error("Unity object finding failed: Unity array element access unavailable: backend array_ref_at API is unavailable"); append_backend_error(); return out; }
-    out.reserve(count); for (std::size_t i=0; i<count; ++i) { void* item=Backend::array_ref_at(array, i); if (item) out.emplace_back(item); } if(out.empty()) set_error(std::string("Unity object finding failed: no non-null instances found: ")+std::string(image)+":"+std::string(namespc)+"."+std::string(className)); return out;
+    out = RootedObjectArray<T>::from_managed_array(array, "Unity object finding").copy_items();
+    if(out.empty() && !fallback_error()) set_error(std::string("Unity object finding failed: no non-null instances found: ")+std::string(image)+":"+std::string(namespc)+"."+std::string(className)); return out;
+}
+
+template<class T, class... ExtraArgs> detail::RootedObjectArray<T> detail::FindObjectsUsingRooted(TypeRef owner, std::string_view methodName, std::string_view image, std::string_view namespc, std::string_view className, ExtraArgs&&... extraArgs) {
+    clear_error();
+    TypeRef target{image, namespc, className};
+    void* type = target.resolve_type_object();
+    if (!type) {
+        set_error(std::string("Unity rooted object finding failed: class not found: ") + std::string(image) + ":" + std::string(namespc) + "." + std::string(className));
+        append_backend_error();
+        return {};
+    }
+    void* array = InvokeStatic<void*>(owner, methodName, TypeObject{type}, std::forward<ExtraArgs>(extraArgs)...);
+    if (!array && methodName == "FindObjectsOfType" && sizeof...(ExtraArgs) == 0) {
+        clear_error();
+        array = InvokeStatic<void*>(owner, "FindObjectsByType", TypeObject{type}, FindObjectsSortMode::None);
+    }
+    return RootedObjectArray<T>::from_managed_array(array, "Unity rooted object finding");
 }
 
 template<class T> T Object::GetField(std::string_view fieldName) const { detail::clear_error(); detail::FieldOut<std::remove_cvref_t<T>> out{}; if(!handle_) { detail::set_error("Unity Object::GetField failed: target object is null"); return out.get(); } const void* k=detail::Backend::object_get_class(handle_); if(!k) { detail::set_error("Unity Object::GetField failed: object_get_class failed"); detail::append_backend_error(); return out.get(); } const void* f=detail::Backend::find_field(k, fieldName); if(!f) { detail::set_error(std::string("Unity Object::GetField failed: field not found: ")+std::string(fieldName)); detail::append_backend_error(); return out.get(); } if(!detail::Backend::field_get_value(handle_, f, out.ptr())) { detail::set_error(std::string("Unity Object::GetField failed: field read failed: ")+std::string(fieldName)); detail::append_backend_error(); } return out.get(); }
@@ -345,6 +355,28 @@ template<class Ret, class... Args> Ret Object::InvokeGeneric(std::string_view me
 }
 template<class T> std::vector<T> Object::CallArrayExact(std::string_view methodName, const std::vector<const char*>& parameterTypeNames, void** rawArgs) const { std::vector<T> out; detail::clear_error(); if(!handle_) { detail::set_error("Unity Object::CallArrayExact failed: target object is null"); return out; } const void* k=detail::Backend::object_get_class(handle_); if(!k) { detail::set_error("Unity Object::CallArrayExact failed: object_get_class failed"); detail::append_backend_error(); return out; } const void* m=detail::Backend::find_method_exact(k, methodName, parameterTypeNames); if(!m) { const std::string lookupDetail = detail::fallback_error() ? detail::fallback_error() : ""; detail::set_error(std::string("Unity Object::CallArrayExact failed: exact method not found: ")+detail::signature_text(methodName, parameterTypeNames)+(lookupDetail.empty() ? std::string{} : std::string("; detail: ")+lookupDetail)); detail::append_backend_error(); return out; } void* array=nullptr; void* ex=nullptr; if(!detail::Backend::runtime_invoke(m,handle_,rawArgs,&array,&ex) || ex) { detail::set_error(std::string("Unity Object::CallArrayExact failed: runtime_invoke exception in ")+detail::signature_text(methodName, parameterTypeNames)); detail::append_backend_error(); return out; } if(!array) { detail::set_error(std::string("Unity Object::CallArrayExact failed: returned array was null: ")+std::string(methodName)); detail::append_backend_error(); return out; } if(!detail::Backend::has_array_length()) { detail::set_error("Unity Object::CallArrayExact failed: backend array_length API is unavailable"); detail::append_backend_error(); return out; } const std::size_t count=detail::Backend::array_length(array); if(count==0) return out; if(!detail::Backend::has_array_ref_at()) { detail::set_error("Unity Object::CallArrayExact failed: backend array_ref_at API is unavailable"); detail::append_backend_error(); return out; } out.reserve(count); for(std::size_t i=0; i<count; ++i) { void* item=detail::Backend::array_ref_at(array, i); if(item) out.emplace_back(item); } return out; }
 template<class T, class... Args> std::vector<T> Object::CallArrayExact(std::string_view methodName, const std::vector<const char*>& parameterTypeNames, Args&&... args) const { auto pack=std::tuple<detail::Arg<std::remove_cvref_t<Args>>...>(detail::Arg<std::remove_cvref_t<Args>>(std::forward<Args>(args))...); std::array<void*, sizeof...(Args)> argv{}; std::size_t i=0; bool argsValid=true; std::apply([&](auto&... a){ ((argsValid=argsValid && a.valid, argv[i++]=a.ptr), ...); }, pack); if (!argsValid) { detail::clear_error(); detail::set_error(std::string("Unity Object::CallArrayExact failed: managed string argument allocation failed in ")+std::string(methodName)); detail::append_backend_error(); return {}; } return CallArrayExact<T>(methodName, parameterTypeNames, argv.data()); }
+template<class T, class... Args> detail::RootedObjectArray<T> Object::CallArrayExactRooted(std::string_view methodName, const std::vector<const char*>& parameterTypeNames, Args&&... args) const {
+    detail::clear_error();
+    if (!handle_) { detail::set_error("Unity Object::CallArrayExactRooted failed: target object is null"); return {}; }
+    const void* klass = detail::Backend::object_get_class(handle_);
+    if (!klass) { detail::set_error("Unity Object::CallArrayExactRooted failed: object_get_class failed"); detail::append_backend_error(); return {}; }
+    const void* method = detail::Backend::find_method_exact(klass, methodName, parameterTypeNames);
+    if (!method) { detail::set_error(std::string("Unity Object::CallArrayExactRooted failed: exact method not found: ") + detail::signature_text(methodName, parameterTypeNames)); detail::append_backend_error(); return {}; }
+    auto pack = std::tuple<detail::Arg<std::remove_cvref_t<Args>>...>(detail::Arg<std::remove_cvref_t<Args>>(std::forward<Args>(args))...);
+    std::array<void*, sizeof...(Args)> argv{};
+    std::size_t index = 0;
+    bool args_valid = true;
+    std::apply([&](auto&... argument) { ((args_valid = args_valid && argument.valid, argv[index++] = argument.ptr), ...); }, pack);
+    if (!args_valid) { detail::set_error(std::string("Unity Object::CallArrayExactRooted failed: managed argument allocation failed in ") + std::string(methodName)); return {}; }
+    void* array = nullptr;
+    void* exception = nullptr;
+    if (!detail::Backend::runtime_invoke(method, handle_, argv.data(), &array, &exception) || exception) {
+        detail::set_error(std::string("Unity Object::CallArrayExactRooted failed: runtime_invoke exception in ") + detail::signature_text(methodName, parameterTypeNames));
+        detail::append_backend_error();
+        return {};
+    }
+    return detail::RootedObjectArray<T>::from_managed_array(array, "Unity Object::CallArrayExactRooted");
+}
 inline std::vector<std::string> Object::CallStringArrayExact(std::string_view methodName, const std::vector<const char*>& parameterTypeNames) const { std::vector<std::string> out; detail::clear_error(); if(!handle_) { detail::set_error("Unity Object::CallStringArrayExact failed: target object is null"); return out; } const void* k=detail::Backend::object_get_class(handle_); if(!k) { detail::set_error("Unity Object::CallStringArrayExact failed: object_get_class failed"); detail::append_backend_error(); return out; } const void* m=detail::Backend::find_method_exact(k, methodName, parameterTypeNames); if(!m) { const std::string lookupDetail = detail::fallback_error() ? detail::fallback_error() : ""; detail::set_error(std::string("Unity Object::CallStringArrayExact failed: exact method not found: ")+detail::signature_text(methodName, parameterTypeNames)+(lookupDetail.empty() ? std::string{} : std::string("; detail: ")+lookupDetail)); detail::append_backend_error(); return out; } void* array=nullptr; void* ex=nullptr; if(!detail::Backend::runtime_invoke(m,handle_,nullptr,&array,&ex) || ex) { detail::set_error(std::string("Unity Object::CallStringArrayExact failed: runtime_invoke exception in ")+detail::signature_text(methodName, parameterTypeNames)); detail::append_backend_error(); return out; } if(!array) { detail::set_error(std::string("Unity Object::CallStringArrayExact failed: returned array was null: ")+std::string(methodName)); detail::append_backend_error(); return out; } if(!detail::Backend::has_array_length()) { detail::set_error("Unity Object::CallStringArrayExact failed: backend array_length API is unavailable"); detail::append_backend_error(); return out; } const std::size_t count=detail::Backend::array_length(array); if(count==0) return out; if(!detail::Backend::has_array_ref_at()) { detail::set_error("Unity Object::CallStringArrayExact failed: backend array_ref_at API is unavailable"); detail::append_backend_error(); return out; } out.reserve(count); for(std::size_t i=0; i<count; ++i) { void* item=detail::Backend::array_ref_at(array, i); if(!item) { detail::set_error(std::string("Unity Object::CallStringArrayExact failed: string array contains a null element in ")+std::string(methodName)); detail::append_backend_error(); out.clear(); return out; } out.emplace_back(detail::managed_string_to_utf8(item)); if(detail::fallback_error()) { out.clear(); return out; } } return out; }
 
 }

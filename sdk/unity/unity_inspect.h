@@ -8,9 +8,18 @@ namespace URK::Unity {
 // URK_UNITY_INSPECT_BEGIN
 namespace Inspect {
 inline constexpr std::uint32_t kStaticMemberFlag = 0x0010u;
-inline constexpr std::size_t kMaxMetadataInheritanceDepth = 256;
-inline constexpr std::size_t kMaxMetadataMembers = 1u << 20;
-inline constexpr std::uint32_t kMaxMethodParameters = 1024;
+inline constexpr std::size_t kMaxMetadataInheritanceDepth = 128;
+inline constexpr std::size_t kMaxMetadataMembers = 131072;
+inline constexpr std::size_t kMaxMetadataMembersPerClass = 32768;
+inline constexpr std::uint32_t kMaxMethodParameters = 256;
+#if defined(_WIN32)
+inline int metadata_exception_filter(unsigned long code) {
+    // Access violation and in-page error are the only faults that can safely be
+    // translated into an invalid-metadata result. Stack overflow, illegal
+    // instruction and every unrelated exception must continue to the host.
+    return code == 0xC0000005ul || code == 0xC0000006ul ? 1 : 0;
+}
+#endif
 struct TypeInfo {
     const void* handle = nullptr;
     std::string namespc;
@@ -102,6 +111,9 @@ struct ObjectHandle {
     bool weak = false;
     bool pinned = false;
 };
+inline std::uint64_t QuarantinedObjectHandleCount() {
+    return detail::quarantined_gchandle_counter().load(std::memory_order_relaxed);
+}
 inline void emit(DiagnosticSink sink, const char* text) { if (sink) sink(text); }
 inline std::string type_name(const void* type) {
     if (!type) return {};
@@ -113,8 +125,8 @@ inline std::string type_name(const void* type) {
     __try {
         return URK::il2cpp::type_get_name(static_cast<const URK::il2cpp::Type*>(type), out, sizeof(out))
             ? std::string(out) : std::string{};
-    } __except (1) {
-        detail::set_error("Unity Inspect type_get_name read an invalid type record");
+    } __except (metadata_exception_filter(_exception_code())) {
+        detail::set_error("Unity Inspect type_get_name raised a native access fault for an invalid type record");
         return {};
     }
 #else
@@ -139,8 +151,8 @@ inline TypeInfo DescribeClass(const void* klass) {
     out.is_value_type = URK::il2cpp::class_is_valuetype(k);
     out.is_enum = URK::il2cpp::class_is_enum(k);
 #if defined(_WIN32)
-    } __except (1) {
-        detail::set_error("Unity Inspect DescribeClass read an invalid class record");
+    } __except (metadata_exception_filter(_exception_code())) {
+        detail::set_error("Unity Inspect DescribeClass raised a native access fault for an invalid class record");
         return {};
     }
 #endif
@@ -152,8 +164,8 @@ inline TypeInfo DescribeType(const void* type) {
     __try {
         return DescribeClass(URK::il2cpp::type_get_class_or_element_class(
             static_cast<const URK::il2cpp::Type*>(type)));
-    } __except (1) {
-        detail::set_error("Unity Inspect type_get_class_or_element_class read an invalid type record");
+    } __except (metadata_exception_filter(_exception_code())) {
+        detail::set_error("Unity Inspect type_get_class_or_element_class raised a native access fault for an invalid type record");
         return {};
     }
 #else
@@ -250,8 +262,21 @@ inline Object ResolveObjectHandle(const ObjectHandle& handle) {
 inline void FreeObjectHandle(ObjectHandle& handle) {
     detail::clear_error();
     if (!handle.handle) return;
-    detail::Backend::gchandle_free(handle.handle);
+    const std::uint32_t raw_handle = handle.handle;
+    // Consume ownership before calling the backend. If a damaged runtime table
+    // faults while freeing this one handle, retrying it every recovery tick is
+    // worse than an observable, bounded one-handle leak.
     handle.handle = 0;
+#if defined(_WIN32)
+    __try {
+        detail::Backend::gchandle_free(raw_handle);
+    } __except (metadata_exception_filter(_exception_code())) {
+        detail::quarantined_gchandle_counter().fetch_add(1, std::memory_order_relaxed);
+        detail::set_error("Unity Inspect::FreeObjectHandle raised a native access fault; one GC handle was quarantined");
+    }
+#else
+    detail::Backend::gchandle_free(raw_handle);
+#endif
     handle.weak = false;
     handle.pinned = false;
 }
@@ -267,7 +292,13 @@ inline std::vector<FieldInfo> fields_from_class(const URK::il2cpp::Class* klass,
         const TypeInfo declaring = DescribeClass(current);
         if (!declaring.handle) break;
         void* it = nullptr;
+        std::unordered_set<const void*> members;
+        std::size_t member_count = 0;
         while (const auto* field = URK::il2cpp::class_get_fields(static_cast<const URK::il2cpp::Class*>(current), &it)) {
+            if (++member_count > kMaxMetadataMembersPerClass || !members.insert(field).second) {
+                detail::set_error("Unity Inspect::Fields rejected a cyclic or excessive field iterator");
+                return out;
+            }
             if (out.size() >= kMaxMetadataMembers) {
                 detail::set_error("Unity Inspect::Fields rejected an excessive member count");
                 return out;
@@ -323,11 +354,15 @@ inline MethodInfo method_info(const URK::il2cpp::Method* method, TypeInfo declar
     const std::uint32_t count = URK::il2cpp::method_get_param_count(method);
     if (count > kMaxMethodParameters) {
         detail::set_error("Unity Inspect::Methods rejected an excessive parameter count");
-        return info;
+        return {};
     }
+    if (!info.return_type_handle)
+        return {};
     info.parameters.reserve(count);
     for (std::uint32_t i = 0; i < count; ++i) {
         const void* paramType = URK::il2cpp::method_get_param(method, i);
+        if (!paramType)
+            return {};
         const char* paramName = URK::il2cpp::method_get_param_name(method, i);
         info.parameters.push_back(MethodParamInfo{paramType, paramName ? paramName : "", type_name(paramType)});
     }
@@ -345,12 +380,20 @@ inline std::vector<MethodInfo> methods_from_class(const URK::il2cpp::Class* klas
         const TypeInfo declaring = DescribeClass(current);
         if (!declaring.handle) break;
         void* it = nullptr;
+        std::unordered_set<const void*> members;
+        std::size_t member_count = 0;
         while (const auto* method = URK::il2cpp::class_get_methods(static_cast<const URK::il2cpp::Class*>(current), &it)) {
+            if (++member_count > kMaxMetadataMembersPerClass || !members.insert(method).second) {
+                detail::set_error("Unity Inspect::Methods rejected a cyclic or excessive method iterator");
+                return out;
+            }
             if (out.size() >= kMaxMetadataMembers) {
                 detail::set_error("Unity Inspect::Methods rejected an excessive member count");
                 return out;
             }
-            out.push_back(method_info(method, declaring));
+            MethodInfo info = method_info(method, declaring);
+            if (info.handle)
+                out.push_back(std::move(info));
         }
     }
     return out;
@@ -379,6 +422,10 @@ inline PropertyInfo property_info(const URK::il2cpp::Property* property, TypeInf
     info.flags = URK::il2cpp::property_get_flags(property);
     info.get_method = URK::il2cpp::property_get_get_method(property);
     info.set_method = URK::il2cpp::property_get_set_method(property);
+    if (info.get_method && URK::il2cpp::method_get_param_count(static_cast<const URK::il2cpp::Method*>(info.get_method)) != 0)
+        info.get_method = nullptr; // Indexers cannot be invoked without arguments by the explorer.
+    if (info.set_method && URK::il2cpp::method_get_param_count(static_cast<const URK::il2cpp::Method*>(info.set_method)) != 1)
+        info.set_method = nullptr;
     info.can_read = info.get_method != nullptr;
     info.can_write = info.set_method != nullptr;
     if (const void* accessor = info.get_method ? info.get_method : info.set_method) {
@@ -409,7 +456,13 @@ inline std::vector<PropertyInfo> properties_from_class(const URK::il2cpp::Class*
         const TypeInfo declaring = DescribeClass(current);
         if (!declaring.handle) break;
         void* it = nullptr;
+        std::unordered_set<const void*> members;
+        std::size_t member_count = 0;
         while (const auto* property = URK::il2cpp::class_get_properties(static_cast<const URK::il2cpp::Class*>(current), &it)) {
+            if (++member_count > kMaxMetadataMembersPerClass || !members.insert(property).second) {
+                detail::set_error("Unity Inspect::Properties rejected a cyclic or excessive property iterator");
+                return out;
+            }
             if (out.size() >= kMaxMetadataMembers) {
                 detail::set_error("Unity Inspect::Properties rejected an excessive member count");
                 return out;

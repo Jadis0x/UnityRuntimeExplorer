@@ -156,11 +156,15 @@ inline std::array<bool, 5> g_menu_released_mouse{};
 inline std::atomic_uint g_menu_toggle_count{0};
 inline std::atomic_bool g_menu_visible{false};
 inline std::atomic_int g_menu_input_requested{-1};
+inline std::atomic_int g_menu_input_applied{-1};
+inline std::atomic_ullong g_menu_input_request_tick{0};
 inline bool g_menu_input_open = false;
 inline bool g_game_focus_suspended = false;
 inline std::atomic_bool g_cursor_lease{false};
 inline std::atomic_bool g_native_cursor_owned{false};
 inline std::atomic_int g_native_cursor_requested{0};
+inline std::atomic_int g_native_cursor_applied{-1};
+inline std::atomic_ullong g_native_cursor_request_tick{0};
 inline RECT g_saved_cursor_clip{};
 inline HCURSOR g_saved_cursor = nullptr;
 inline int g_native_cursor_show_balance = 0;
@@ -781,9 +785,10 @@ inline void clear_window_mouse_buttons(HWND hwnd, bool release_capture) {
 }
 
 inline void apply_window_input_transition(HWND hwnd, WNDPROC old_wndproc, bool open) {
-  if (g_menu_input_open == open) {
-    g_menu_visible.store(open, std::memory_order_release);
-    return;
+    if (g_menu_input_open == open) {
+      g_menu_visible.store(open, std::memory_order_release);
+      g_menu_input_applied.store(open ? 1 : 0, std::memory_order_release);
+      return;
   }
 
   if (open) {
@@ -856,6 +861,7 @@ inline void apply_window_input_transition(HWND hwnd, WNDPROC old_wndproc, bool o
 
   g_menu_input_open = open;
   g_menu_visible.store(open, std::memory_order_release);
+  g_menu_input_applied.store(open ? 1 : 0, std::memory_order_release);
   queue_release_all_input(hwnd);
 }
 
@@ -976,6 +982,7 @@ inline bool request_window_cursor_state(bool open) {
   if (!message) return false;
   const int requested = open ? 1 : 0;
   g_native_cursor_requested.store(requested, std::memory_order_release);
+  g_native_cursor_request_tick.store(GetTickCount64(), std::memory_order_release);
   const DWORD window_thread = GetWindowThreadProcessId(g_hwnd, nullptr);
   if (window_thread == GetCurrentThreadId()) {
     if (SendMessageW(g_hwnd, message, open ? 1 : 0, 0) != 0) return true;
@@ -998,6 +1005,7 @@ inline bool request_window_input_state(bool open) {
   if (!message) return false;
   const int requested = open ? 1 : 0;
   g_menu_input_requested.store(requested, std::memory_order_release);
+  g_menu_input_request_tick.store(GetTickCount64(), std::memory_order_release);
   const DWORD window_thread = GetWindowThreadProcessId(g_hwnd, nullptr);
   if (window_thread == GetCurrentThreadId()) {
     if (SendMessageW(g_hwnd, message, open ? 1 : 0, 0) != 0) return true;
@@ -1041,7 +1049,11 @@ inline bool release_cursor_lease() {
 
 inline void sync_menu_state() {
   const bool open = ModConfig::show_menu;
-  if (g_menu_input_requested.load(std::memory_order_acquire) != (open ? 1 : 0) &&
+  const ULONGLONG now = GetTickCount64();
+  const int input_desired = open ? 1 : 0;
+  const bool input_timed_out = now - g_menu_input_request_tick.load(std::memory_order_acquire) >= 500;
+  if (g_menu_input_applied.load(std::memory_order_acquire) != input_desired &&
+      (g_menu_input_requested.load(std::memory_order_acquire) != input_desired || input_timed_out) &&
       !request_window_input_state(open)) {
     log(open ? "Failed to suppress game input for the ImGui menu."
              : "Failed to restore game input after closing the ImGui menu.");
@@ -1052,7 +1064,10 @@ inline void sync_menu_state() {
     release_cursor_lease();
 
   const bool native_open = open && !g_cursor_lease.load(std::memory_order_acquire);
-  if (g_native_cursor_requested.load(std::memory_order_acquire) != (native_open ? 1 : 0) &&
+  const int cursor_desired = native_open ? 1 : 0;
+  const bool cursor_timed_out = now - g_native_cursor_request_tick.load(std::memory_order_acquire) >= 500;
+  if (g_native_cursor_applied.load(std::memory_order_acquire) != cursor_desired &&
+      (g_native_cursor_requested.load(std::memory_order_acquire) != cursor_desired || cursor_timed_out) &&
       !request_window_cursor_state(native_open)) {
     log(native_open ? "Failed to acquire native cursor ownership for the ImGui menu."
                     : "Failed to restore native cursor ownership after closing the ImGui menu.");
@@ -1084,6 +1099,10 @@ inline void shutdown_imgui() {
   }
   restore_wndproc();
   g_hwnd = nullptr;
+  g_menu_input_requested.store(-1, std::memory_order_release);
+  g_menu_input_applied.store(-1, std::memory_order_release);
+  g_native_cursor_requested.store(-1, std::memory_order_release);
+  g_native_cursor_applied.store(-1, std::memory_order_release);
   if (g_active_swap_chain) { g_active_swap_chain->Release(); g_active_swap_chain = nullptr; }
   release_device_objects();
   release_dx12_objects();
@@ -1213,7 +1232,10 @@ inline LRESULT CALLBACK wndproc(HWND hwnd, UINT message, WPARAM wparam, LPARAM l
   const UINT cursor_message = menu_cursor_message();
   if (cursor_message && message == cursor_message) {
     const bool open = wparam != 0;
-    if (set_native_cursor_open(hwnd, open)) return TRUE;
+    if (set_native_cursor_open(hwnd, open)) {
+      g_native_cursor_applied.store(open ? 1 : 0, std::memory_order_release);
+      return TRUE;
+    }
     int requested = open ? 1 : 0;
     g_native_cursor_requested.compare_exchange_strong(
         requested, -1, std::memory_order_acq_rel, std::memory_order_acquire);

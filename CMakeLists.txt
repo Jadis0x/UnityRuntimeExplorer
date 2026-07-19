@@ -11,6 +11,8 @@ set(VCPKG_APPLOCAL_DEPS OFF CACHE BOOL "Generated mods keep dependencies linked 
 
 project(URK_Il2cpp_UnityRuntimeExplorer LANGUAGES CXX)
 
+include(CTest)
+
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
@@ -129,6 +131,14 @@ if(MSVC)
     )
 endif()
 urk_disable_vs_vcpkg_integration(URK_Il2cpp_UnityRuntimeExplorer)
+
+if(BUILD_TESTING)
+    add_executable(URK_ExplorerSafetyTests tests/explorer_safety_tests.cpp)
+    target_include_directories(URK_ExplorerSafetyTests PRIVATE . mod)
+    target_compile_definitions(URK_ExplorerSafetyTests PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    urk_disable_vs_vcpkg_integration(URK_ExplorerSafetyTests)
+    add_test(NAME explorer_safety_contracts COMMAND URK_ExplorerSafetyTests)
+endif()
 
 set(URK_DEPLOY_DIR "" CACHE PATH "Optional game Mods directory where the built DLL will be copied")
 if(URK_DEPLOY_DIR)

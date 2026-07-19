@@ -11,6 +11,7 @@
 #include <shellapi.h>
 
 #include <imgui.h>
+#include <imgui_internal.h>
 
 #include <algorithm>
 #include <array>
@@ -152,7 +153,14 @@ void enqueue_simple(CommandKind kind, int instance_id) {
     RuntimeModel::instance().enqueue(Command{.kind = kind, .instance_id = instance_id});
 }
 
-void render_context_menu(const HierarchyNode &node) {
+void enqueue_hierarchy_command(CommandKind kind, const HierarchyNode &node, std::uint64_t revision) {
+    Command command{.kind = kind, .instance_id = node.instance_id};
+    command.hierarchy_revision = revision;
+    command.expected_object_address = node.object_address;
+    RuntimeModel::instance().enqueue(std::move(command));
+}
+
+void render_context_menu(const HierarchyNode &node, std::uint64_t revision) {
     if (!ImGui::BeginPopupContextItem("##game-object-context"))
         return;
     ImGui::TextDisabled("%s", node.name.c_str());
@@ -160,14 +168,14 @@ void render_context_menu(const HierarchyNode &node) {
     if (ImGui::MenuItem("Copy Ptr"))
         ImGui::SetClipboardText(node.pointer_text.c_str());
     if (ImGui::MenuItem("Duplicate"))
-        enqueue_simple(CommandKind::DuplicateObject, node.instance_id);
+        enqueue_hierarchy_command(CommandKind::DuplicateObject, node, revision);
     if (ImGui::MenuItem("Delete"))
-        enqueue_simple(CommandKind::DeleteObject, node.instance_id);
+        enqueue_hierarchy_command(CommandKind::DeleteObject, node, revision);
     ImGui::EndPopup();
 }
 
 void render_node(const HierarchyNode &node, int selected_instance_id, const NodeMatchSet *matches,
-                 bool include_inactive) {
+                  bool include_inactive, std::uint64_t revision) {
     if (!include_inactive && !node.active)
         return;
     if (matches && !matches->contains(node.instance_id))
@@ -190,12 +198,12 @@ void render_node(const HierarchyNode &node, int selected_instance_id, const Node
         ImGui::PopStyleColor();
 
     if (ImGui::IsItemClicked(ImGuiMouseButton_Left))
-        enqueue_simple(CommandKind::Select, node.instance_id);
-    render_context_menu(node);
+        enqueue_hierarchy_command(CommandKind::Select, node, revision);
+    render_context_menu(node, revision);
 
     if (open && !node.children.empty()) {
         for (const HierarchyNode &child : node.children)
-            render_node(child, selected_instance_id, matches, include_inactive);
+            render_node(child, selected_instance_id, matches, include_inactive, revision);
         ImGui::TreePop();
     }
     ImGui::PopID();
@@ -247,7 +255,7 @@ void render_hierarchy(const HierarchyInfo &hierarchy, int selected_instance_id) 
         ImGui::PopStyleColor();
         if (open) {
             for (const HierarchyNode &root : scene.roots)
-                render_node(root, selected_instance_id, matches, include_inactive);
+                render_node(root, selected_instance_id, matches, include_inactive, hierarchy.revision);
             if (scene.roots.empty())
                 ImGui::TextDisabled("  No root GameObjects");
             ImGui::TreePop();
@@ -2818,6 +2826,30 @@ void render() {
     previous_field_watch_count = snapshot->field_watches.size();
 
     const int pushed_colors = push_explorer_theme(opacity);
+    const ImGuiID dockspace_id = ImGui::GetID("URKExplorerDockSpace");
+    if (!ImGui::DockBuilderGetNode(dockspace_id)) {
+        ImGui::DockBuilderAddNode(dockspace_id, ImGuiDockNodeFlags_DockSpace);
+        ImGui::DockBuilderSetNodeSize(dockspace_id, viewport->WorkSize);
+        ImGuiID workspace_dock = 0;
+        ImGuiID content_dock = dockspace_id;
+        ImGui::DockBuilderSplitNode(content_dock, ImGuiDir_Up, 0.12f, &workspace_dock, &content_dock);
+        ImGuiID hierarchy_dock = 0;
+        ImGui::DockBuilderSplitNode(content_dock, ImGuiDir_Left, 0.27f, &hierarchy_dock, &content_dock);
+        ImGuiID inspector_dock = 0;
+        ImGui::DockBuilderSplitNode(content_dock, ImGuiDir_Right, 0.43f, &inspector_dock, &content_dock);
+        ImGuiID diagnostics_dock = 0;
+        ImGui::DockBuilderSplitNode(content_dock, ImGuiDir_Down, 0.30f, &diagnostics_dock, &content_dock);
+        ImGui::DockBuilderDockWindow("URK Explorer Workspace", workspace_dock);
+        ImGui::DockBuilderDockWindow("Hierarchy##urk-hierarchy", hierarchy_dock);
+        ImGui::DockBuilderDockWindow("###urk-inspector", inspector_dock);
+        ImGui::DockBuilderDockWindow("###urk-object", content_dock);
+        ImGui::DockBuilderDockWindow("###urk-class-browser", content_dock);
+        ImGui::DockBuilderDockWindow("###urk-method-traces", content_dock);
+        ImGui::DockBuilderDockWindow("###urk-field-watches", content_dock);
+        ImGui::DockBuilderDockWindow("###urk-diagnostics", diagnostics_dock);
+        ImGui::DockBuilderFinish(dockspace_id);
+    }
+    ImGui::DockSpaceOverViewport(dockspace_id, viewport, ImGuiDockNodeFlags_PassthruCentralNode);
 
     ImGui::SetNextWindowPos(ImVec2(work_pos.x + 12.0f, work_pos.y + 12.0f), ImGuiCond_FirstUseEver);
     ImGui::SetNextWindowSize(ImVec2(std::min(900.0f, work_size.x - 24.0f), 96.0f), ImGuiCond_FirstUseEver);
@@ -2881,7 +2913,7 @@ void render() {
         ImGui::SetNextWindowPos(ImVec2(work_pos.x + work_size.x - inspector_width - 12.0f, work_pos.y + 120.0f),
                                 ImGuiCond_FirstUseEver);
         if (inspector_window_size.x > 0.0f && inspector_window_size.y > 0.0f)
-            ImGui::SetNextWindowSize(inspector_window_size, ImGuiCond_Always);
+            ImGui::SetNextWindowSize(inspector_window_size, ImGuiCond_FirstUseEver);
         else
             ImGui::SetNextWindowSize(ImVec2(inspector_width, std::max(480.0f, work_size.y * 0.80f)),
                                      ImGuiCond_FirstUseEver);
@@ -2941,15 +2973,16 @@ void render() {
         ImGui::SetNextWindowPos(ImVec2(work_pos.x + 30.0f, work_pos.y + work_size.y - 260.0f), ImGuiCond_FirstUseEver);
         ImGui::SetNextWindowSize(ImVec2(std::min(760.0f, work_size.x - 60.0f), 230.0f), ImGuiCond_FirstUseEver);
         const std::string title =
-            "Activity Log (" + std::to_string(snapshot->diagnostics.size()) + ")##urk-diagnostics";
+            "Activity Log (" + std::to_string(snapshot->diagnostics.size()) + ")###urk-diagnostics";
         if (ImGui::Begin(title.c_str(), &show_diagnostics)) {
             ImGui::TextDisabled("Latest activity");
             ImGui::TextWrapped("%s", snapshot->status.empty() ? "Ready" : snapshot->status.c_str());
             ImGui::Separator();
-            ImGui::Text("GC: %.1f MiB used / %.1f MiB heap | handles: %zu strong, %zu weak",
+            ImGui::Text("GC: %.1f MiB used / %.1f MiB heap | handles: %zu strong, %zu weak | quarantined: %llu",
                         static_cast<double>(snapshot->managed_used_bytes) / (1024.0 * 1024.0),
                         static_cast<double>(snapshot->managed_heap_bytes) / (1024.0 * 1024.0),
-                        snapshot->strong_handle_count, snapshot->weak_handle_count);
+                        snapshot->strong_handle_count, snapshot->weak_handle_count,
+                        static_cast<unsigned long long>(snapshot->quarantined_handle_count));
             ImGui::Separator();
             render_diagnostics(*snapshot);
         }
