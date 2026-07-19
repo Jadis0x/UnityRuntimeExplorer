@@ -52,6 +52,23 @@ struct FlatObject {
     bool active = false;
 };
 
+// Owns a temporary managed root while a queued GameObject command is running.
+// The root is transferred to RuntimeModel for a successful selection.
+struct ScopedObjectRoot {
+    Inspect::ObjectHandle handle{};
+
+    ScopedObjectRoot() = default;
+    ScopedObjectRoot(const ScopedObjectRoot &) = delete;
+    ScopedObjectRoot &operator=(const ScopedObjectRoot &) = delete;
+    ~ScopedObjectRoot() { Inspect::FreeObjectHandle(handle); }
+
+    Inspect::ObjectHandle release() {
+        const Inspect::ObjectHandle result = handle;
+        handle = {};
+        return result;
+    }
+};
+
 bool is_transform_component(std::string_view name) {
     return name == "UnityEngine.Transform" || name == "UnityEngine.RectTransform" || name == "Transform" ||
            name == "RectTransform";
@@ -552,7 +569,15 @@ void RuntimeModel::tick() {
         discard_managed_state_after_native_fault();
         {
             std::lock_guard<std::mutex> lock(command_mutex_);
-            commands_.clear();
+            // Preserve navigation/lifecycle input received after the fault.
+            // These commands re-resolve their targets and do not depend on the
+            // discarded reflection pointers.
+            std::erase_if(commands_, [](const Command &command) {
+                return command.kind != CommandKind::Select && command.kind != CommandKind::ClearSelection &&
+                       command.kind != CommandKind::Refresh && command.kind != CommandKind::SceneHint &&
+                       command.kind != CommandKind::ObjectDestroyRequested &&
+                       command.kind != CommandKind::ClearDiagnostics;
+            });
         }
         set_status("Explorer recovered from an invalid IL2CPP metadata pointer; select the component again.");
         refresh_requested_.store(false, std::memory_order_release);
@@ -622,7 +647,7 @@ void RuntimeModel::stop() {
     MethodTracer::stop_all();
     clear_selection();
     ModUI::Highlight::enqueue_clear();
-    objects_.clear();
+    hierarchy_instance_ids_.clear();
     clear_component_cache();
     clear_object_inspector();
     for (auto &[_, handle] : class_browser_handles_)
@@ -647,6 +672,13 @@ void RuntimeModel::request_refresh() {
 
 void RuntimeModel::enqueue(Command command) {
     std::lock_guard<std::mutex> lock(command_mutex_);
+    if (command.kind == CommandKind::LoadComponentMetadata) {
+        const bool already_queued = std::any_of(commands_.begin(), commands_.end(), [&](const Command &pending) {
+            return pending.kind == CommandKind::LoadComponentMetadata && pending.instance_id == command.instance_id;
+        });
+        if (already_queued)
+            return;
+    }
     commands_.push_back(std::move(command));
 }
 
@@ -698,15 +730,35 @@ void RuntimeModel::process_commands() {
             native_fault = true;
         }
         if (native_fault) {
-            // Cache the failure to avoid retrying invalid metadata every frame.
+            // A malformed member record belongs to one component. Keep the
+            // rooted GameObject, hierarchy, and unrelated inspector state
+            // intact, and expose an explicit retry instead of converting a
+            // reflection failure into a workspace-wide recovery.
             if (command.kind == CommandKind::LoadComponentMetadata) {
                 const auto component = std::find_if(
                     working_.inspector.components.begin(), working_.inspector.components.end(),
                     [&command](const ComponentInfo &info) { return info.instance_id == command.instance_id; });
-                if (component != working_.inspector.components.end() && !component->metadata) {
+                if (component != working_.inspector.components.end()) {
                     component->metadata = std::make_shared<ComponentInfo::Metadata>();
                     component->metadata_unavailable = true;
+                    component->metadata_error = "Native metadata access failed";
+                    if (!active_metadata_stage_.empty())
+                        component->metadata_error += " while reading " + active_metadata_stage_;
+                    component->metadata_error +=
+                        "; retry after the component finishes initializing or changes state.";
                 }
+                component_reflection_.erase(command.instance_id);
+                clear_error();
+                set_status("Component metadata access failed for " +
+                           (component != working_.inspector.components.end() ? component->type_name
+                                                                             : std::to_string(command.instance_id)));
+                ModLog::error("Component metadata access violation: id=%d type=%s stage=%s", command.instance_id,
+                              component != working_.inspector.components.end() ? component->type_name.c_str()
+                                                                                : "<unknown>",
+                              active_metadata_stage_.empty() ? "<unknown>" : active_metadata_stage_.c_str());
+                active_metadata_stage_.clear();
+                publish_recovery_snapshot();
+                continue;
             }
             clear_error();
             set_status("Explorer blocked a native access violation while processing a command.");
@@ -739,10 +791,17 @@ void RuntimeModel::process_command(const Command &command) {
         command.kind == CommandKind::CloseObjectInspectorTab ||
         command.kind == CommandKind::SetLiveData;
     const bool event_command = command.kind == CommandKind::ObjectDestroyRequested;
-    GameObject object = component_command || event_command
-                            ? GameObject{}
-                            : (command.kind == CommandKind::Select ? resolve_live_game_object(command.instance_id)
-                                                                     : find_object(command.instance_id));
+    ScopedObjectRoot command_root;
+    GameObject object{};
+    const bool needs_object = !component_command && !event_command && command.kind != CommandKind::Refresh &&
+                              command.kind != CommandKind::ClearSelection && command.kind != CommandKind::SceneHint &&
+                              command.kind != CommandKind::ClearDiagnostics;
+    if (needs_object) {
+        if (command.instance_id == working_.selected_instance_id)
+            object = resolve_selected_object();
+        if (!object)
+            object = resolve_live_game_object(command.instance_id, command_root.handle);
+    }
     if (!object && command.kind != CommandKind::Refresh && command.kind != CommandKind::ClearSelection &&
         command.kind != CommandKind::SceneHint && command.kind != CommandKind::ClearDiagnostics && !component_command &&
         !event_command) {
@@ -755,7 +814,7 @@ void RuntimeModel::process_command(const Command &command) {
     bool full_inspector_refresh = false;
     switch (command.kind) {
         case CommandKind::Select:
-            select_object(object);
+            select_object(object, command_root.release());
             full_inspector_refresh = true;
             break;
         case CommandKind::ClearSelection:
@@ -1013,8 +1072,9 @@ void RuntimeModel::process_command(const Command &command) {
 
 void RuntimeModel::refresh_hierarchy() {
     HierarchyInfo next{};
+    next.revision = next_hierarchy_revision_++;
     next.source = "Event-driven Resources census / native adjacency";
-    objects_.clear();
+    hierarchy_instance_ids_.clear();
 
     const Scene active_scene = SceneManager::GetActiveScene();
     int active_handle = boxed_scene_handle(active_scene);
@@ -1130,7 +1190,7 @@ void RuntimeModel::refresh_hierarchy() {
         const FlatObject &source = flat[index];
         if (!visited.insert(source.instance_id).second)
             return {};
-        objects_[source.instance_id] = source.object;
+        hierarchy_instance_ids_.insert(source.instance_id);
         HierarchyNode node{};
         node.instance_id = source.instance_id;
         node.name = source.name;
@@ -1188,15 +1248,16 @@ void RuntimeModel::refresh_hierarchy() {
     working_.hierarchy = hierarchy_;
 
     if (working_.selected_instance_id != 0) {
-        const auto selected = objects_.find(working_.selected_instance_id);
-        if (selected != objects_.end())
-            selected_ = selected->second;
-        else
+        // Do not replace the rooted selection with the hierarchy's raw wrapper.
+        // The census array no longer roots those wrappers after this function
+        // returns, which made high-churn games reuse freed managed addresses.
+        if (!hierarchy_instance_ids_.contains(working_.selected_instance_id) || !resolve_selected_object())
             clear_selection();
     }
 }
 
 void RuntimeModel::refresh_inspector(bool include_components) {
+    selected_ = resolve_selected_object();
     if (!selected_ || !selected_.alive()) {
         if (working_.selected_instance_id != 0)
             clear_selection();
@@ -1225,11 +1286,22 @@ void RuntimeModel::refresh_inspector(bool include_components) {
         info.class_name = object_type.name;
         info.components.clear();
         clear_component_cache();
-        for (const Component &component : selected_.GetComponents<Component>()) {
-            if (!component)
+        for (const Component &candidate : selected_.GetComponents<Component>()) {
+            if (!candidate)
                 continue;
+            Inspect::ObjectHandle handle = Inspect::PinObject(Object{candidate.handle()});
+            const Object rooted = Inspect::ResolveObjectHandle(handle);
+            const Component component{rooted.handle()};
+            if (!handle.handle || !component || !component.alive()) {
+                Inspect::FreeObjectHandle(handle);
+                continue;
+            }
             ComponentInfo component_info{};
             component_info.instance_id = component.GetInstanceID();
+            if (component_info.instance_id == 0) {
+                Inspect::FreeObjectHandle(handle);
+                continue;
+            }
             const Inspect::TypeInfo component_type = Inspect::TypeOf(Object{component.handle()});
             component_info.type_name = component_type.full_name;
             component_info.assembly_name = assembly_name(component_type);
@@ -1260,11 +1332,10 @@ void RuntimeModel::refresh_inspector(bool include_components) {
                     component_info.enabled = enabled;
                 }
                 clear_error();
-                component_objects_[component_info.instance_id] = Object{component.handle()};
-                const Inspect::ObjectHandle handle = Inspect::PinObject(Object{component.handle()});
-                if (handle.handle)
-                    component_handles_[component_info.instance_id] = handle;
+                component_handles_[component_info.instance_id] = handle;
                 info.components.push_back(std::move(component_info));
+            } else {
+                Inspect::FreeObjectHandle(handle);
             }
         }
         // Prefer renderers nearest to the selected transform.
@@ -1327,7 +1398,6 @@ void RuntimeModel::clear_component_cache() {
         }
     reference_handles_.clear();
     working_.method_results.clear();
-    component_objects_.clear();
     component_reflection_.clear();
     sampled_component_members_.clear();
     // Discard watches when their selected component changes.
@@ -1425,23 +1495,61 @@ void RuntimeModel::release_reference_handle(std::uint64_t token) {
 }
 
 void RuntimeModel::load_component_metadata(int component_instance_id) {
-    const auto object = component_objects_.find(component_instance_id);
-    if (object == component_objects_.end() || !object->second) {
+    const Object target = resolve_component(component_instance_id);
+    if (!target || !target.alive() || target.GetInstanceID() != component_instance_id) {
         set_status("Component is no longer available");
+        refresh_inspector(true);
         return;
     }
 
     auto component = std::find_if(
         working_.inspector.components.begin(), working_.inspector.components.end(),
         [component_instance_id](const ComponentInfo &info) { return info.instance_id == component_instance_id; });
-    if (component == working_.inspector.components.end() || component->metadata)
+    if (component == working_.inspector.components.end() ||
+        (component->metadata && !component->metadata_unavailable))
         return;
+    const auto fail_metadata = [&](std::string message) {
+        component_reflection_.erase(component_instance_id);
+        component->metadata = std::make_shared<ComponentInfo::Metadata>();
+        component->metadata_unavailable = true;
+        component->metadata_error = std::move(message);
+        set_status("Component metadata load failed for " + component->type_name + ": " + component->metadata_error);
+    };
+
+    const auto *klass = static_cast<const URK::il2cpp::Class *>(
+        URK::il2cpp::object_get_class(static_cast<URK::il2cpp::Object *>(target.handle())));
+    if (!klass) {
+        fail_metadata("runtime class is unavailable");
+        return;
+    }
+    const Inspect::TypeInfo current_type = Inspect::DescribeClass(klass);
+    if (!current_type.handle || current_type.full_name.empty()) {
+        fail_metadata("runtime class identity is unavailable");
+        return;
+    }
+    if (!component->type_name.empty() && component->type_name != current_type.full_name) {
+        set_status("Component changed while metadata was loading; inspector refreshed");
+        refresh_inspector(true);
+        return;
+    }
 
     auto metadata = std::make_shared<ComponentInfo::Metadata>();
     ComponentReflection reflection{};
-    reflection.fields = Inspect::Fields(object->second, true);
-    reflection.properties = Inspect::Properties(object->second, true);
-    reflection.methods = Inspect::Methods(object->second, true);
+    std::vector<std::string> metadata_warnings;
+    const auto enumerate = [&](std::string_view section, auto &&action) {
+        active_metadata_stage_ = std::string(section);
+        clear_error();
+        action();
+        if (const char *error = last_error(); error && error[0])
+            metadata_warnings.push_back(std::string(section) + ": " + error);
+    };
+    // Capture the class once from the rooted component. Re-reading it before
+    // each section allowed a destroyed/recreated wrapper to mix metadata from
+    // different objects into one snapshot.
+    enumerate("Fields", [&] { reflection.fields = Inspect::fields_from_class(klass, true); });
+    enumerate("Properties", [&] { reflection.properties = Inspect::properties_from_class(klass, true); });
+    enumerate("Methods", [&] { reflection.methods = Inspect::methods_from_class(klass, true); });
+    active_metadata_stage_.clear();
 
     metadata->fields.reserve(reflection.fields.size());
     for (const Inspect::FieldInfo &field : reflection.fields) {
@@ -1473,8 +1581,20 @@ void RuntimeModel::load_component_metadata(int component_instance_id) {
     // The UI consumes immutable data captured on the game thread.
     component_reflection_[component_instance_id] = std::move(reflection);
     component->metadata = std::move(metadata);
+    component->metadata_unavailable = false;
+    component->metadata_error.clear();
+    if (!metadata_warnings.empty()) {
+        for (std::size_t index = 0; index < metadata_warnings.size(); ++index) {
+            if (index)
+                component->metadata_error += " | ";
+            component->metadata_error += metadata_warnings[index];
+        }
+    }
     refresh_live_member_values();
-    set_status("Loaded all metadata for " + component->type_name);
+    if (component->metadata_error.empty())
+        set_status("Loaded all metadata for " + component->type_name);
+    else
+        set_status("Loaded metadata for " + component->type_name + " with explicit member diagnostics");
 }
 
 void RuntimeModel::load_component_class_catalog() {
@@ -2952,25 +3072,49 @@ void RuntimeModel::refresh_object_inspector_values(bool force) {
     working_.object_inspector.component.live_values = std::move(values);
 }
 
-GameObject RuntimeModel::find_object(int instance_id) const {
-    const auto found = objects_.find(instance_id);
-    return found == objects_.end() ? GameObject{} : found->second;
-}
-
-GameObject RuntimeModel::resolve_live_game_object(int instance_id) const {
+GameObject RuntimeModel::resolve_live_game_object(int instance_id, Inspect::ObjectHandle &root) const {
     if (instance_id == 0)
         return {};
 
-    // Do not reuse objects_ here. It is a snapshot populated during the last
-    // hierarchy census, while Corepunk can retire GameObjects between UI draw
-    // and the queued Select command. A fresh Unity census only runs on clicks.
+    const auto root_candidate = [&](GameObject candidate) -> GameObject {
+        if (!candidate)
+            return {};
+        Inspect::ObjectHandle candidate_root = Inspect::PinObject(Object{candidate.handle()});
+        const Object rooted = Inspect::ResolveObjectHandle(candidate_root);
+        const GameObject live{rooted.handle()};
+        if (!candidate_root.handle || !live || !live.alive() || live.GetInstanceID() != instance_id) {
+            Inspect::FreeObjectHandle(candidate_root);
+            return {};
+        }
+        root = candidate_root;
+        return live;
+    };
+
+    // Unity exposes this internal lookup on supported players. It avoids a
+    // global Resources census and returns the current wrapper for the ID.
+    clear_error();
+    const GameObject direct{detail::InvokeStatic<void *>(UnityObjectType, "FindObjectFromInstanceID", instance_id)};
+    if (GameObject live = root_candidate(direct))
+        return live;
+    clear_error();
+
+    // Stripped players may omit the internal lookup. The fallback is used only
+    // for an explicit user command and roots the matching wrapper before it is
+    // retained by the model.
     for (const GameObject &candidate : Object::FindObjectsOfTypeAll<GameObject>()) {
         if (!candidate)
             continue;
         if (candidate.GetInstanceID() == instance_id)
-            return candidate;
+            return root_candidate(candidate);
     }
     return {};
+}
+
+GameObject RuntimeModel::resolve_selected_object() const {
+    if (!selected_handle_.handle)
+        return {};
+    const Object object = Inspect::ResolveObjectHandle(selected_handle_);
+    return GameObject{object.handle()};
 }
 
 Object RuntimeModel::resolve_component(int instance_id) const {
@@ -2978,18 +3122,29 @@ Object RuntimeModel::resolve_component(int instance_id) const {
         pinned != component_handles_.end() && pinned->second.handle) {
         return Inspect::ResolveObjectHandle(pinned->second);
     }
-    const auto found = component_objects_.find(instance_id);
-    return found == component_objects_.end() ? Object{} : found->second;
+    return {};
 }
 
-void RuntimeModel::select_object(GameObject object) {
+void RuntimeModel::select_object(GameObject object, Inspect::ObjectHandle root) {
     if (!object || !object.alive()) {
+        Inspect::FreeObjectHandle(root);
         clear_selection();
         return;
     }
     const int instance_id = object.GetInstanceID();
-    if (working_.selected_instance_id == instance_id)
+    if (working_.selected_instance_id == instance_id) {
+        Inspect::FreeObjectHandle(root);
         return;
+    }
+
+    if (!root.handle)
+        root = Inspect::PinObject(Object{object.handle()});
+    const Object rooted = Inspect::ResolveObjectHandle(root);
+    if (!root.handle || !rooted) {
+        Inspect::FreeObjectHandle(root);
+        set_status("Selection failed: GameObject could not be rooted");
+        return;
+    }
 
     if (highlight_id_ != 0)
         ModUI::Highlight::enqueue_remove(highlight_id_);
@@ -2999,7 +3154,9 @@ void RuntimeModel::select_object(GameObject object) {
     highlight_id_ = 0;
     highlight_locator_id_ = 0;
 
-    selected_ = object;
+    Inspect::FreeObjectHandle(selected_handle_);
+    selected_handle_ = root;
+    selected_ = GameObject{rooted.handle()};
     working_.selected_instance_id = instance_id;
     working_.inspector = {};
     highlight_renderers_.clear();
@@ -3368,6 +3525,7 @@ void RuntimeModel::clear_selection() {
         highlight_locator_id_ = 0;
     }
     selected_ = {};
+    Inspect::FreeObjectHandle(selected_handle_);
     clear_locked_members();
     clear_component_cache();
     highlight_renderers_.clear();
@@ -3388,8 +3546,8 @@ void RuntimeModel::discard_managed_state_after_native_fault() {
     highlight_locator_id_ = 0;
 
     selected_ = {};
-    objects_.clear();
-    component_objects_.clear();
+    selected_handle_ = {};
+    hierarchy_instance_ids_.clear();
     component_handles_.clear();
     reference_handles_.clear();
     object_inspector_history_.clear();
@@ -3399,6 +3557,7 @@ void RuntimeModel::discard_managed_state_after_native_fault() {
     locked_members_.clear();
     field_watches_.clear();
     component_reflection_.clear();
+    active_metadata_stage_.clear();
     object_inspector_reflection_ = {};
     sampled_component_members_.clear();
     sampled_object_fields_.clear();
@@ -3412,7 +3571,9 @@ void RuntimeModel::discard_managed_state_after_native_fault() {
     working_.field_watches.clear();
     working_.locked_member_keys.clear();
     working_.class_browser_instances.clear();
-    hierarchy_ = std::make_shared<const HierarchyInfo>();
+    // HierarchyInfo and its strings are native snapshot data and remain safe
+    // to render. Keeping them avoids a blank workspace while the next census
+    // rebuilds the non-owning object index.
     working_.hierarchy = hierarchy_;
 }
 
@@ -3484,6 +3645,8 @@ void RuntimeModel::publish() {
     }
     working_.strong_handle_count = component_handles_.size();
     working_.weak_handle_count = 0;
+    if (selected_handle_.handle)
+        ++(selected_handle_.weak ? working_.weak_handle_count : working_.strong_handle_count);
     for (const auto &[_, handle] : reference_handles_)
         ++(handle.weak ? working_.weak_handle_count : working_.strong_handle_count);
     for (const auto &[_, handle] : object_inspector_history_)
@@ -3504,13 +3667,22 @@ void RuntimeModel::publish_recovery_snapshot() {
     // Keep this strictly native-only.  In particular, gc_get_* and trace
     // display formatting call IL2CPP and are not safe immediately after SEH.
     working_.hierarchy = hierarchy_;
-    working_.component_class_catalog.reset();
-    working_.class_browser_catalog.reset();
-    working_.method_traces.clear();
-    working_.strong_handle_count = 0;
+    working_.strong_handle_count = component_handles_.size();
     working_.weak_handle_count = 0;
-    working_.managed_used_bytes = 0;
-    working_.managed_heap_bytes = 0;
+    const auto count_handle = [&](const Inspect::ObjectHandle &handle) {
+        if (handle.handle)
+            ++(handle.weak ? working_.weak_handle_count : working_.strong_handle_count);
+    };
+    count_handle(selected_handle_);
+    for (const auto &[_, handle] : reference_handles_)
+        count_handle(handle);
+    for (const auto &[_, handle] : object_inspector_history_)
+        count_handle(handle);
+    for (const auto &[_, handle] : class_browser_handles_)
+        count_handle(handle);
+    for (const auto &[_, handle] : class_browser_static_handles_)
+        count_handle(handle);
+    count_handle(object_inspector_handle_);
     ++working_.revision;
     published_.store(std::make_shared<const Snapshot>(working_));
 }

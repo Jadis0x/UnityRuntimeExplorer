@@ -2,11 +2,15 @@
 #include "unity_shortcuts.h"
 
 #include <array>
+#include <unordered_set>
 
 namespace URK::Unity {
 // URK_UNITY_INSPECT_BEGIN
 namespace Inspect {
 inline constexpr std::uint32_t kStaticMemberFlag = 0x0010u;
+inline constexpr std::size_t kMaxMetadataInheritanceDepth = 256;
+inline constexpr std::size_t kMaxMetadataMembers = 1u << 20;
+inline constexpr std::uint32_t kMaxMethodParameters = 1024;
 struct TypeInfo {
     const void* handle = nullptr;
     std::string namespc;
@@ -123,6 +127,9 @@ inline TypeInfo DescribeClass(const void* klass) {
     out.handle = klass;
     if (!klass) return out;
     const auto* k = static_cast<const URK::il2cpp::Class*>(klass);
+#if defined(_WIN32)
+    __try {
+#endif
     const char* ns = URK::il2cpp::class_get_namespace(k);
     const char* name = URK::il2cpp::class_get_name(k);
     out.namespc = ns ? ns : "";
@@ -131,6 +138,12 @@ inline TypeInfo DescribeClass(const void* klass) {
     out.flags = URK::il2cpp::class_get_flags(k);
     out.is_value_type = URK::il2cpp::class_is_valuetype(k);
     out.is_enum = URK::il2cpp::class_is_enum(k);
+#if defined(_WIN32)
+    } __except (1) {
+        detail::set_error("Unity Inspect DescribeClass read an invalid class record");
+        return {};
+    }
+#endif
     return out;
 }
 inline TypeInfo DescribeType(const void* type) {
@@ -244,10 +257,21 @@ inline void FreeObjectHandle(ObjectHandle& handle) {
 }
 inline std::vector<FieldInfo> fields_from_class(const URK::il2cpp::Class* klass, bool includeInherited) {
     std::vector<FieldInfo> out;
+    std::unordered_set<const void*> visited;
+    std::size_t depth = 0;
     for (const void* current = klass; current; current = includeInherited ? URK::il2cpp::class_get_parent(static_cast<const URK::il2cpp::Class*>(current)) : nullptr) {
+        if (depth++ >= kMaxMetadataInheritanceDepth || !visited.insert(current).second) {
+            detail::set_error("Unity Inspect::Fields rejected a cyclic or excessive inheritance chain");
+            break;
+        }
         const TypeInfo declaring = DescribeClass(current);
+        if (!declaring.handle) break;
         void* it = nullptr;
         while (const auto* field = URK::il2cpp::class_get_fields(static_cast<const URK::il2cpp::Class*>(current), &it)) {
+            if (out.size() >= kMaxMetadataMembers) {
+                detail::set_error("Unity Inspect::Fields rejected an excessive member count");
+                return out;
+            }
             FieldInfo info{};
             info.handle = field;
             info.declaring_type = declaring;
@@ -297,6 +321,10 @@ inline MethodInfo method_info(const URK::il2cpp::Method* method, TypeInfo declar
     info.return_type_handle = URK::il2cpp::method_get_return_type(method);
     info.return_type = type_name(info.return_type_handle);
     const std::uint32_t count = URK::il2cpp::method_get_param_count(method);
+    if (count > kMaxMethodParameters) {
+        detail::set_error("Unity Inspect::Methods rejected an excessive parameter count");
+        return info;
+    }
     info.parameters.reserve(count);
     for (std::uint32_t i = 0; i < count; ++i) {
         const void* paramType = URK::il2cpp::method_get_param(method, i);
@@ -307,11 +335,23 @@ inline MethodInfo method_info(const URK::il2cpp::Method* method, TypeInfo declar
 }
 inline std::vector<MethodInfo> methods_from_class(const URK::il2cpp::Class* klass, bool includeInherited) {
     std::vector<MethodInfo> out;
+    std::unordered_set<const void*> visited;
+    std::size_t depth = 0;
     for (const void* current = klass; current; current = includeInherited ? URK::il2cpp::class_get_parent(static_cast<const URK::il2cpp::Class*>(current)) : nullptr) {
+        if (depth++ >= kMaxMetadataInheritanceDepth || !visited.insert(current).second) {
+            detail::set_error("Unity Inspect::Methods rejected a cyclic or excessive inheritance chain");
+            break;
+        }
         const TypeInfo declaring = DescribeClass(current);
+        if (!declaring.handle) break;
         void* it = nullptr;
-        while (const auto* method = URK::il2cpp::class_get_methods(static_cast<const URK::il2cpp::Class*>(current), &it))
+        while (const auto* method = URK::il2cpp::class_get_methods(static_cast<const URK::il2cpp::Class*>(current), &it)) {
+            if (out.size() >= kMaxMetadataMembers) {
+                detail::set_error("Unity Inspect::Methods rejected an excessive member count");
+                return out;
+            }
             out.push_back(method_info(method, declaring));
+        }
     }
     return out;
 }
@@ -359,10 +399,21 @@ inline PropertyInfo property_info(const URK::il2cpp::Property* property, TypeInf
 }
 inline std::vector<PropertyInfo> properties_from_class(const URK::il2cpp::Class* klass, bool includeInherited) {
     std::vector<PropertyInfo> out;
+    std::unordered_set<const void*> visited;
+    std::size_t depth = 0;
     for (const void* current = klass; current; current = includeInherited ? URK::il2cpp::class_get_parent(static_cast<const URK::il2cpp::Class*>(current)) : nullptr) {
+        if (depth++ >= kMaxMetadataInheritanceDepth || !visited.insert(current).second) {
+            detail::set_error("Unity Inspect::Properties rejected a cyclic or excessive inheritance chain");
+            break;
+        }
         const TypeInfo declaring = DescribeClass(current);
+        if (!declaring.handle) break;
         void* it = nullptr;
         while (const auto* property = URK::il2cpp::class_get_properties(static_cast<const URK::il2cpp::Class*>(current), &it)) {
+            if (out.size() >= kMaxMetadataMembers) {
+                detail::set_error("Unity Inspect::Properties rejected an excessive member count");
+                return out;
+            }
             PropertyInfo info = property_info(property, declaring);
             if (info.handle)
                 out.push_back(std::move(info));

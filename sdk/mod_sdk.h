@@ -364,6 +364,7 @@ typedef struct URK_Il2CppApi {
     void *(*object_unbox)(void *object);
     void *(*string_new)(const char *utf8);
     int (*string_to_utf8)(void *string, char *output, size_t output_size);
+    /* Pointer-sized managed array length; do not narrow to uint32_t on 64-bit IL2CPP. */
     size_t (*array_length)(void *array);
     void *(*array_addr_with_size)(void *array, int element_size, size_t index);
     /* Append-only safe object/reference array element helper. Implementations
@@ -584,6 +585,7 @@ typedef struct URK_MonoApi {
     int (*runtime_invoke)(const void *method, void *object, void **params, void **result, void **exception,
                           uint32_t *native_exception);
     void *(*new_string)(const char *utf8);
+    /* Pointer-sized managed array length; matches the runtime ABI on 64-bit Mono. */
     size_t (*array_length)(void *array);
     void *(*array_address)(void *array, int element_size, size_t index);
     int (*object_class_name)(void *object, char *output, size_t output_size);

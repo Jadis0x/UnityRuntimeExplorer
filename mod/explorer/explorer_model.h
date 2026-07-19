@@ -39,6 +39,7 @@ struct HierarchyInfo {
     std::string source;
     std::size_t roots = 0;
     std::size_t objects = 0;
+    std::uint64_t revision = 0;
 };
 
 struct ComponentInfo {
@@ -51,6 +52,7 @@ struct ComponentInfo {
     bool enabled_supported = false;
     bool enabled = false;
     bool metadata_unavailable = false;
+    std::string metadata_error;
     struct Field {
         std::string name;
         std::string type_name;
@@ -373,13 +375,14 @@ class RuntimeModel {
     void refresh_object_inspector_values(bool force = false);
     void release_reference_handle(std::uint64_t token);
     void update_highlight();
-    URK::Unity::GameObject find_object(int instance_id) const;
     // The hierarchy stores non-owning Unity object wrappers. Resolve a fresh
     // object at selection time so a scene transition cannot turn a stale
     // hierarchy entry into an inspector target.
-    URK::Unity::GameObject resolve_live_game_object(int instance_id) const;
+    URK::Unity::GameObject resolve_live_game_object(
+        int instance_id, URK::Unity::Inspect::ObjectHandle &root) const;
+    URK::Unity::GameObject resolve_selected_object() const;
     URK::Unity::Object resolve_component(int instance_id) const;
-    void select_object(URK::Unity::GameObject object);
+    void select_object(URK::Unity::GameObject object, URK::Unity::Inspect::ObjectHandle root);
     void clear_selection();
     // After an SEH fault, do not call back into IL2CPP to release handles:
     // one of those handles may be the invalid pointer that raised the fault.
@@ -396,14 +399,15 @@ class RuntimeModel {
     std::atomic<std::shared_ptr<const Snapshot>> published_;
     Snapshot working_{};
     std::shared_ptr<const HierarchyInfo> hierarchy_;
-    std::unordered_map<int, URK::Unity::GameObject> objects_;
-    std::unordered_map<int, URK::Unity::Object> component_objects_;
+    // Membership only; hierarchy snapshots must never retain managed wrappers.
+    std::unordered_set<int> hierarchy_instance_ids_;
     // Keeps cached selected components alive.
     std::unordered_map<int, URK::Unity::Inspect::ObjectHandle> component_handles_;
     std::unordered_map<std::uint64_t, URK::Unity::Inspect::ObjectHandle> reference_handles_;
     // Object Inspector tabs retain their own managed handles.
     std::unordered_map<std::uint64_t, URK::Unity::Inspect::ObjectHandle> object_inspector_history_;
     std::uint64_t next_reference_token_ = 1;
+    std::uint64_t next_hierarchy_revision_ = 1;
     std::uint64_t next_method_result_id_ = 1;
     std::uint64_t next_field_watch_id_ = 1;
     URK::Unity::Inspect::ObjectHandle object_inspector_handle_{};
@@ -413,6 +417,7 @@ class RuntimeModel {
         std::vector<URK::Unity::Inspect::MethodInfo> methods;
     };
     std::unordered_map<int, ComponentReflection> component_reflection_;
+    std::string active_metadata_stage_;
     std::shared_ptr<const ComponentClassCatalog> component_class_catalog_;
     std::shared_ptr<const ClassBrowserCatalog> class_browser_catalog_;
     std::unordered_map<std::uint64_t, URK::Unity::Inspect::ObjectHandle> class_browser_handles_;
@@ -435,6 +440,9 @@ class RuntimeModel {
     };
     std::unordered_map<std::uint64_t, LockedMember> locked_members_;
     ComponentReflection object_inspector_reflection_;
+    // A hierarchy snapshot only contains non-owning pointers. Keep the active
+    // managed GameObject wrapper rooted independently from that snapshot.
+    URK::Unity::Inspect::ObjectHandle selected_handle_{};
     URK::Unity::GameObject selected_{};
     std::vector<URK::Unity::Renderer> highlight_renderers_;
     // Cache active cameras instead of relying on Camera.main.

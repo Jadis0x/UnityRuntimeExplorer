@@ -213,13 +213,22 @@ void render_hierarchy(const HierarchyInfo &hierarchy, int selected_instance_id) 
     const std::string_view filter(search_buffer().data());
     NodeMatchSet *matches = nullptr;
     if (!filter.empty()) {
+        static std::uint64_t cached_hierarchy_revision = 0;
+        static std::string cached_filter;
+        static bool cached_include_inactive = true;
         NodeMatchSet &cached_matches = hierarchy_filter_matches();
-        cached_matches.clear();
-        if (cached_matches.bucket_count() < hierarchy.objects)
-            cached_matches.reserve(hierarchy.objects);
-        for (const SceneNode &scene : hierarchy.scenes)
-            for (const HierarchyNode &root : scene.roots)
-                collect_matching_nodes(root, filter, include_inactive, cached_matches);
+        if (cached_hierarchy_revision != hierarchy.revision || cached_filter != filter ||
+            cached_include_inactive != include_inactive) {
+            cached_matches.clear();
+            if (cached_matches.bucket_count() < hierarchy.objects)
+                cached_matches.reserve(hierarchy.objects);
+            for (const SceneNode &scene : hierarchy.scenes)
+                for (const HierarchyNode &root : scene.roots)
+                    collect_matching_nodes(root, filter, include_inactive, cached_matches);
+            cached_hierarchy_revision = hierarchy.revision;
+            cached_filter = filter;
+            cached_include_inactive = include_inactive;
+        }
         matches = &cached_matches;
     }
     for (const SceneNode &scene : hierarchy.scenes) {
@@ -1719,9 +1728,17 @@ void render_components(const InspectorInfo &info, const Snapshot &snapshot, int 
             } else {
                 const ComponentInfo::Metadata &metadata = *component.metadata;
                 const ComponentInfo::LiveValues *live = component.live_values.get();
-                if (component.metadata_unavailable)
-                    ImGui::TextDisabled(
-                        "Reflection unavailable for this component (invalid IL2CPP metadata was blocked).");
+                if (component.metadata_unavailable) {
+                    ImGui::TextColored(ImVec4(1.0f, 0.48f, 0.34f, 1.0f), "%s",
+                                       component.metadata_error.empty()
+                                           ? "Reflection failed for this component."
+                                           : component.metadata_error.c_str());
+                    if (ImGui::SmallButton("Retry metadata load"))
+                        enqueue_simple(CommandKind::LoadComponentMetadata, component.instance_id);
+                } else if (!component.metadata_error.empty()) {
+                    ImGui::TextColored(ImVec4(1.0f, 0.72f, 0.32f, 1.0f), "Metadata diagnostics: %s",
+                                       component.metadata_error.c_str());
+                }
                 std::array<char, 128> &filter_buffer = component_filter(component.instance_id);
                 if (!fixed_filter) {
                     ImGui::SetNextItemWidth(-1.0f);
@@ -2781,7 +2798,6 @@ void render() {
     static ImVec2 inspector_window_size{};
     static int previous_selection_id = 0;
     static std::uint64_t previous_object_token = 0;
-    static std::size_t previous_diagnostic_count = 0;
     static std::size_t previous_trace_count = 0;
     static std::size_t previous_field_watch_count = 0;
     if (snapshot->selected_instance_id != previous_selection_id) {
@@ -2796,9 +2812,6 @@ void render() {
     if (snapshot->object_inspector.valid && snapshot->object_inspector.token != previous_object_token)
         show_object_inspector = true;
     previous_object_token = snapshot->object_inspector.valid ? snapshot->object_inspector.token : 0;
-    if (snapshot->diagnostics.size() > previous_diagnostic_count)
-        show_diagnostics = true;
-    previous_diagnostic_count = snapshot->diagnostics.size();
     if (snapshot->method_traces.size() > previous_trace_count)
         show_method_traces = true;
     previous_trace_count = snapshot->method_traces.size();
