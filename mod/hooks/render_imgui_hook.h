@@ -2204,31 +2204,41 @@ inline bool uninstall() {
   g_shutting_down.store(true, std::memory_order_release);
   unregister_install_callback();
   g_menu_toggle_count.store(0, std::memory_order_release);
+  bool all_hooks_detached = true;
   if (g_wgl_swap_buffers_hooked) {
-    URK::hooks::detach_ex(reinterpret_cast<void**>(&g_wgl_swap_buffers), reinterpret_cast<void*>(&detour_wgl_swap_buffers));
-    g_wgl_swap_buffers_hooked = false;
-    log("OpenGL wglSwapBuffers hook detached.");
+    if (URK::hooks::detach_ex(reinterpret_cast<void**>(&g_wgl_swap_buffers), reinterpret_cast<void*>(&detour_wgl_swap_buffers))) {
+      g_wgl_swap_buffers_hooked = false;
+      log("OpenGL wglSwapBuffers hook detached.");
+    } else all_hooks_detached = false;
   }
   if (g_execute_command_lists_hooked) {
-    URK::hooks::detach_ex(reinterpret_cast<void**>(&g_execute_command_lists),
-                          reinterpret_cast<void*>(&detour_execute_command_lists));
-    g_execute_command_lists_hooked = false;
-    log("DX12 ExecuteCommandLists hook detached.");
+    if (URK::hooks::detach_ex(reinterpret_cast<void**>(&g_execute_command_lists),
+                              reinterpret_cast<void*>(&detour_execute_command_lists))) {
+      g_execute_command_lists_hooked = false;
+      log("DX12 ExecuteCommandLists hook detached.");
+    } else all_hooks_detached = false;
   }
   if (g_resize_hooked) {
-    URK::hooks::detach_ex(reinterpret_cast<void**>(&g_resize_buffers), reinterpret_cast<void*>(&detour_resize_buffers));
-    g_resize_hooked = false;
-    log("DXGI ResizeBuffers hook detached.");
+    if (URK::hooks::detach_ex(reinterpret_cast<void**>(&g_resize_buffers), reinterpret_cast<void*>(&detour_resize_buffers))) {
+      g_resize_hooked = false;
+      log("DXGI ResizeBuffers hook detached.");
+    } else all_hooks_detached = false;
   }
   if (g_present_hooked) {
-    URK::hooks::detach_ex(reinterpret_cast<void**>(&g_present), reinterpret_cast<void*>(&detour_present));
-    g_present_hooked = false;
-    log("DXGI Present hook detached.");
+    if (URK::hooks::detach_ex(reinterpret_cast<void**>(&g_present), reinterpret_cast<void*>(&detour_present))) {
+      g_present_hooked = false;
+      log("DXGI Present hook detached.");
+    } else all_hooks_detached = false;
   }
   if (g_present1_hooked) {
-    URK::hooks::detach_ex(reinterpret_cast<void**>(&g_present1), reinterpret_cast<void*>(&detour_present1));
-    g_present1_hooked = false;
-    log("DXGI Present1 hook detached.");
+    if (URK::hooks::detach_ex(reinterpret_cast<void**>(&g_present1), reinterpret_cast<void*>(&detour_present1))) {
+      g_present1_hooked = false;
+      log("DXGI Present1 hook detached.");
+    } else all_hooks_detached = false;
+  }
+  if (!all_hooks_detached) {
+    log("Render hook detach was incomplete; skipping ImGui teardown while the loader retains the module.");
+    return false;
   }
 
   const DWORD current_thread = GetCurrentThreadId();

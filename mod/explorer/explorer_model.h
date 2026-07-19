@@ -374,13 +374,21 @@ class RuntimeModel {
     void release_reference_handle(std::uint64_t token);
     void update_highlight();
     URK::Unity::GameObject find_object(int instance_id) const;
+    // The hierarchy stores non-owning Unity object wrappers. Resolve a fresh
+    // object at selection time so a scene transition cannot turn a stale
+    // hierarchy entry into an inspector target.
+    URK::Unity::GameObject resolve_live_game_object(int instance_id) const;
     URK::Unity::Object resolve_component(int instance_id) const;
     void select_object(URK::Unity::GameObject object);
     void clear_selection();
+    // After an SEH fault, do not call back into IL2CPP to release handles:
+    // one of those handles may be the invalid pointer that raised the fault.
+    void discard_managed_state_after_native_fault();
     void set_status(std::string message);
     void record_value_error(std::string context, const URK::Unity::Inspect::ValueInfo &value);
     void capture_last_error(std::string_view action);
     void publish();
+    void publish_recovery_snapshot();
 
     mutable std::mutex command_mutex_;
     std::vector<Command> commands_;

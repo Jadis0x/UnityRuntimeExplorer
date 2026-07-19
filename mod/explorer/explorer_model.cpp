@@ -546,21 +546,26 @@ void RuntimeModel::notify_native_fault() {
 
 void RuntimeModel::tick() {
     if (native_faulted_.exchange(false, std::memory_order_acq_rel)) {
-        // Rebuild reflection state after a native fault.
-        clear_selection();
-        clear_object_inspector();
+        // An invalid managed pointer may also make gchandle_free unsafe.  Drop
+        // the native copies first, then wait for the current Unity transition
+        // to settle before asking IL2CPP for a new hierarchy.
+        discard_managed_state_after_native_fault();
         {
             std::lock_guard<std::mutex> lock(command_mutex_);
             commands_.clear();
         }
         set_status("Explorer recovered from an invalid IL2CPP metadata pointer; select the component again.");
-        request_refresh();
-        publish();
+        refresh_requested_.store(false, std::memory_order_release);
+        event_refresh_pending_ = true;
+        event_refresh_due_ = Clock::now() + std::chrono::milliseconds(750);
+        publish_recovery_snapshot();
         return;
     }
     // Apply retained values before processing this frame's commands.
     apply_locked_members();
     process_commands();
+    if (native_faulted_.load(std::memory_order_acquire))
+        return;
 
     const Clock::time_point now = Clock::now();
     if (event_refresh_pending_ && now >= event_refresh_due_) {
@@ -706,8 +711,11 @@ void RuntimeModel::process_commands() {
             clear_error();
             set_status("Explorer blocked a native access violation while processing a command.");
             ModLog::warn("Explorer command kind=%d blocked a native access violation", static_cast<int>(command.kind));
-            publish();
-            continue;
+            // Do not continue this tick: publishing, refreshing, or freeing a
+            // stale handle can immediately repeat the same fault. The next
+            // tick uses the native-only recovery path.
+            notify_native_fault();
+            return;
         }
 #else
         process_command(command);
@@ -731,7 +739,10 @@ void RuntimeModel::process_command(const Command &command) {
         command.kind == CommandKind::CloseObjectInspectorTab ||
         command.kind == CommandKind::SetLiveData;
     const bool event_command = command.kind == CommandKind::ObjectDestroyRequested;
-    GameObject object = component_command || event_command ? GameObject{} : find_object(command.instance_id);
+    GameObject object = component_command || event_command
+                            ? GameObject{}
+                            : (command.kind == CommandKind::Select ? resolve_live_game_object(command.instance_id)
+                                                                     : find_object(command.instance_id));
     if (!object && command.kind != CommandKind::Refresh && command.kind != CommandKind::ClearSelection &&
         command.kind != CommandKind::SceneHint && command.kind != CommandKind::ClearDiagnostics && !component_command &&
         !event_command) {
@@ -991,7 +1002,12 @@ void RuntimeModel::process_command(const Command &command) {
     }
 
     refresh_inspector(full_inspector_refresh);
-    update_highlight();
+    // A selection already validates and snapshots the GameObject.  Defer the
+    // optional global camera/renderer census to a later refresh: it is the
+    // broadest Unity traversal in this path and must not make a valid
+    // hierarchy selection fail on games that destroy objects mid-frame.
+    if (command.kind != CommandKind::Select)
+        update_highlight();
     publish();
 }
 
@@ -2941,6 +2957,22 @@ GameObject RuntimeModel::find_object(int instance_id) const {
     return found == objects_.end() ? GameObject{} : found->second;
 }
 
+GameObject RuntimeModel::resolve_live_game_object(int instance_id) const {
+    if (instance_id == 0)
+        return {};
+
+    // Do not reuse objects_ here. It is a snapshot populated during the last
+    // hierarchy census, while Corepunk can retire GameObjects between UI draw
+    // and the queued Select command. A fresh Unity census only runs on clicks.
+    for (const GameObject &candidate : Object::FindObjectsOfTypeAll<GameObject>()) {
+        if (!candidate)
+            continue;
+        if (candidate.GetInstanceID() == instance_id)
+            return candidate;
+    }
+    return {};
+}
+
 Object RuntimeModel::resolve_component(int instance_id) const {
     if (const auto pinned = component_handles_.find(instance_id);
         pinned != component_handles_.end() && pinned->second.handle) {
@@ -2971,7 +3003,6 @@ void RuntimeModel::select_object(GameObject object) {
     working_.selected_instance_id = instance_id;
     working_.inspector = {};
     highlight_renderers_.clear();
-    update_highlight();
 }
 
 void RuntimeModel::update_highlight() {
@@ -3344,6 +3375,47 @@ void RuntimeModel::clear_selection() {
     working_.inspector = {};
 }
 
+void RuntimeModel::discard_managed_state_after_native_fault() {
+    // This path intentionally leaks only the affected IL2CPP GC handles. The
+    // process is still running after an access violation, so calling the
+    // corresponding free API can dereference the same stale metadata/object
+    // record and turn a recoverable fault into an endless main-thread loop.
+    if (highlight_id_ != 0)
+        ModUI::Highlight::enqueue_remove(highlight_id_);
+    if (highlight_locator_id_ != 0)
+        ModUI::Highlight::enqueue_remove(highlight_locator_id_);
+    highlight_id_ = 0;
+    highlight_locator_id_ = 0;
+
+    selected_ = {};
+    objects_.clear();
+    component_objects_.clear();
+    component_handles_.clear();
+    reference_handles_.clear();
+    object_inspector_history_.clear();
+    object_inspector_handle_ = {};
+    class_browser_handles_.clear();
+    class_browser_static_handles_.clear();
+    locked_members_.clear();
+    field_watches_.clear();
+    component_reflection_.clear();
+    object_inspector_reflection_ = {};
+    sampled_component_members_.clear();
+    sampled_object_fields_.clear();
+    sampled_object_properties_.clear();
+    highlight_renderers_.clear();
+    highlight_cameras_.clear();
+    working_.selected_instance_id = 0;
+    working_.inspector = {};
+    working_.object_inspector = {};
+    working_.method_results.clear();
+    working_.field_watches.clear();
+    working_.locked_member_keys.clear();
+    working_.class_browser_instances.clear();
+    hierarchy_ = std::make_shared<const HierarchyInfo>();
+    working_.hierarchy = hierarchy_;
+}
+
 void RuntimeModel::set_status(std::string message) {
     const bool error = status_is_error(message);
     working_.status = std::move(message);
@@ -3424,6 +3496,21 @@ void RuntimeModel::publish() {
         ++(object_inspector_handle_.weak ? working_.weak_handle_count : working_.strong_handle_count);
     working_.managed_used_bytes = URK::il2cpp::gc_get_used_size();
     working_.managed_heap_bytes = URK::il2cpp::gc_get_heap_size();
+    ++working_.revision;
+    published_.store(std::make_shared<const Snapshot>(working_));
+}
+
+void RuntimeModel::publish_recovery_snapshot() {
+    // Keep this strictly native-only.  In particular, gc_get_* and trace
+    // display formatting call IL2CPP and are not safe immediately after SEH.
+    working_.hierarchy = hierarchy_;
+    working_.component_class_catalog.reset();
+    working_.class_browser_catalog.reset();
+    working_.method_traces.clear();
+    working_.strong_handle_count = 0;
+    working_.weak_handle_count = 0;
+    working_.managed_used_bytes = 0;
+    working_.managed_heap_bytes = 0;
     ++working_.revision;
     published_.store(std::make_shared<const Snapshot>(working_));
 }
