@@ -3,6 +3,8 @@
 A live, in-game Hierarchy and Inspector for Unity games running through
 [URKit](https://github.com/Jadis0x/URKit).
 
+![Showcase](showcase/ss1.png)
+
 The current release supports **Windows x64 IL2CPP games**. Mono support is
 planned for a future release.
 
