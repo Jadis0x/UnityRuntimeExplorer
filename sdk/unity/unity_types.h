@@ -395,10 +395,29 @@ struct Backend {
     static std::int32_t class_value_size(const void* klass, std::uint32_t* align) { return URK::il2cpp::class_value_size(klass, align); }
     static bool has_array_set_ref() { return URK::il2cpp::has_array_set_ref(); }
     static bool array_set_ref(void* array, std::size_t index, void* value) { return URK::il2cpp::array_set_ref(static_cast<URK::il2cpp::Array*>(array), index, value); }
-    static std::uint32_t gchandle_new(void* object, int pinned) { return URK::il2cpp::gchandle_new(object, pinned); }
-    static std::uint32_t gchandle_new_weakref(void* object, int trackResurrection) { return URK::il2cpp::gchandle_new_weakref(object, trackResurrection); }
-    static void* gchandle_get_target(std::uint32_t handle) { return URK::il2cpp::gchandle_get_target(handle); }
-    static void gchandle_free(std::uint32_t handle) { URK::il2cpp::gchandle_free(handle); }
+    static URK::il2cpp::GCHandle gchandle_new(
+        void* object,
+        int pinned) {
+        return URK::il2cpp::gchandle_new(object, pinned);
+    }
+
+    static URK::il2cpp::GCHandle gchandle_new_weakref(
+        void* object,
+        int trackResurrection) {
+        return URK::il2cpp::gchandle_new_weakref(
+            object,
+            trackResurrection);
+    }
+
+    static void* gchandle_get_target(
+        URK::il2cpp::GCHandle handle) {
+        return URK::il2cpp::gchandle_get_target(handle);
+    }
+
+    static void gchandle_free(
+        URK::il2cpp::GCHandle handle) {
+        URK::il2cpp::gchandle_free(handle);
+    }
     static void* type_object_for_class(std::string_view image, std::string_view ns, std::string_view name) { const void* k=find_class(image, ns, name); if (!k) return nullptr; auto* t = URK::il2cpp::class_get_type(static_cast<const URK::il2cpp::Class*>(k)); return t ? URK::il2cpp::type_get_object(t) : nullptr; }
         static void* method_get_object(const void* method, const void* refClass) { return URK::il2cpp::method_get_object(static_cast<const URK::il2cpp::Method*>(method), static_cast<const URK::il2cpp::Class*>(refClass)); }
     static void* value_box(const void* klass, void* data) { return URK::il2cpp::value_box(static_cast<const URK::il2cpp::Class*>(klass), data); }
@@ -442,7 +461,8 @@ template<class T> class RootedObjectArray {
         items_.clear();
         if (!root_)
             return;
-        const std::uint32_t root = std::exchange(root_, 0);
+        const URK::il2cpp::GCHandle root =
+            std::exchange(root_, URK::il2cpp::GCHandle{});
 #if defined(_WIN32)
         __try {
             Backend::gchandle_free(root);
@@ -488,7 +508,7 @@ template<class T> class RootedObjectArray {
 
   private:
     std::vector<T> items_;
-    std::uint32_t root_ = 0;
+    URK::il2cpp::GCHandle root_ = 0;
 };
 inline void append_backend_error() { const char* e = Backend::backend_last_error(); if (e && e[0]) { if (!error_slot().empty()) error_slot() += "; backend: "; error_slot() += e; } }
 inline std::string managed_string_to_utf8(void* value) {

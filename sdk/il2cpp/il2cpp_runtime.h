@@ -1,5 +1,12 @@
 #pragma once
 
+#if defined(_WIN32)
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <Windows.h>
+#endif
+
 #include "../runtime_api.h"
 
 #include <cstddef>
@@ -20,6 +27,8 @@ using Object = void;
 using String = void;
 using Array = void;
 using Thread = void;
+using GCHandle = std::uintptr_t;
+static_assert(sizeof(GCHandle) == sizeof(void*));
 
 inline const URK_Il2CppApi *&ApiSlot() {
   static const URK_Il2CppApi *api = nullptr;
@@ -1136,31 +1145,133 @@ inline std::int64_t gc_get_heap_size() {
              ? a->gc_get_heap_size()
              : 0;
 }
-inline std::uint32_t gchandle_new(void *object, int pinned) {
-  const auto *a = api();
-  return available() && URK_IL2CPP_HAS(gchandle_new) && a->gchandle_new
-             ? a->gchandle_new(object, pinned)
-             : 0;
+#if defined(_WIN32)
+namespace detail {
+
+inline HMODULE game_assembly_module() {
+    if (const URK::ModContext* ctx = URK::context();
+        ctx &&
+        ctx->size >=
+            offsetof(URK_ModContext, gameAssemblyModuleBase) +
+            sizeof(ctx->gameAssemblyModuleBase) &&
+        ctx->gameAssemblyModuleBase) {
+        return reinterpret_cast<HMODULE>(ctx->gameAssemblyModuleBase);
+    }
+
+    return GetModuleHandleW(L"GameAssembly.dll");
 }
-inline std::uint32_t gchandle_new_weakref(void *object,
-                                          int track_resurrection) {
-  const auto *a = api();
-  return available() && URK_IL2CPP_HAS(gchandle_new_weakref) &&
-                 a->gchandle_new_weakref
-             ? a->gchandle_new_weakref(object, track_resurrection)
-             : 0;
+
+template <typename Fn>
+inline Fn game_assembly_export(const char* name) {
+    const HMODULE module = game_assembly_module();
+
+    return module && name
+        ? reinterpret_cast<Fn>(GetProcAddress(module, name))
+        : nullptr;
 }
-inline void *gchandle_get_target(std::uint32_t gchandle) {
-  const auto *a = api();
-  return available() && URK_IL2CPP_HAS(gchandle_get_target) &&
-                 a->gchandle_get_target
-             ? a->gchandle_get_target(gchandle)
-             : nullptr;
+
+using GcHandleNewFn = GCHandle (*)(void*, bool);
+using GcHandleGetTargetFn = void* (*)(GCHandle);
+using GcHandleFreeFn = void (*)(GCHandle);
+
+} // namespace detail
+#endif
+
+inline GCHandle gchandle_new(void* object, int pinned) {
+#if defined(_WIN32)
+    const auto direct =
+        detail::game_assembly_export<detail::GcHandleNewFn>(
+            "il2cpp_gchandle_new");
+
+    if (direct)
+        return direct(object, pinned != 0);
+#endif
+
+    const auto* a = api();
+
+    return available() &&
+                   URK_IL2CPP_HAS(gchandle_new) &&
+                   a->gchandle_new
+        ? static_cast<GCHandle>(a->gchandle_new(object, pinned))
+        : 0;
 }
-inline void gchandle_free(std::uint32_t gchandle) {
-  const auto *a = api();
-  if (available() && URK_IL2CPP_HAS(gchandle_free) && a->gchandle_free)
-    a->gchandle_free(gchandle);
+
+inline GCHandle gchandle_new_weakref(
+    void* object,
+    int track_resurrection) {
+#if defined(_WIN32)
+    const auto direct =
+        detail::game_assembly_export<detail::GcHandleNewFn>(
+            "il2cpp_gchandle_new_weakref");
+
+    if (direct)
+        return direct(object, track_resurrection != 0);
+#endif
+
+    const auto* a = api();
+
+    return available() &&
+                   URK_IL2CPP_HAS(gchandle_new_weakref) &&
+                   a->gchandle_new_weakref
+        ? static_cast<GCHandle>(
+              a->gchandle_new_weakref(
+                  object,
+                  track_resurrection))
+        : 0;
+}
+
+inline void* gchandle_get_target(GCHandle gchandle) {
+    if (!gchandle)
+        return nullptr;
+
+#if defined(_WIN32)
+    const auto direct =
+        detail::game_assembly_export<detail::GcHandleGetTargetFn>(
+            "il2cpp_gchandle_get_target");
+
+    if (direct)
+        return direct(gchandle);
+#endif
+
+    if (gchandle > static_cast<GCHandle>(0xFFFFFFFFu))
+        return nullptr;
+
+    const auto* a = api();
+
+    return available() &&
+                   URK_IL2CPP_HAS(gchandle_get_target) &&
+                   a->gchandle_get_target
+        ? a->gchandle_get_target(
+              static_cast<std::uint32_t>(gchandle))
+        : nullptr;
+}
+
+inline void gchandle_free(GCHandle gchandle) {
+    if (!gchandle)
+        return;
+
+#if defined(_WIN32)
+    const auto direct =
+        detail::game_assembly_export<detail::GcHandleFreeFn>(
+            "il2cpp_gchandle_free");
+
+    if (direct) {
+        direct(gchandle);
+        return;
+    }
+#endif
+
+    if (gchandle > static_cast<GCHandle>(0xFFFFFFFFu))
+        return;
+
+    const auto* a = api();
+
+    if (available() &&
+        URK_IL2CPP_HAS(gchandle_free) &&
+        a->gchandle_free) {
+        a->gchandle_free(
+            static_cast<std::uint32_t>(gchandle));
+    }
 }
 inline char *thread_get_name(const void *thread, std::uint32_t *length) {
   const auto *a = api();

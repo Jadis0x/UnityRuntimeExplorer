@@ -486,6 +486,8 @@ class RuntimeModel {
     std::atomic<std::uintptr_t> native_fault_address_{0};
     std::atomic<std::uintptr_t> native_fault_instruction_{0};
     Clock::time_point event_refresh_due_{};
+
+    URK::Unity::detail::RootedObjectArray<URK::Unity::GameObject> rooted_hierarchy_candidates_;
 };
 
 } // namespace Explorer

@@ -107,7 +107,7 @@ struct ObjectRefInfo {
     bool expandable = false;
 };
 struct ObjectHandle {
-    std::uint32_t handle = 0;
+    URK::il2cpp::GCHandle handle = 0;
     bool weak = false;
     bool pinned = false;
 };
@@ -262,7 +262,7 @@ inline Object ResolveObjectHandle(const ObjectHandle& handle) {
 inline void FreeObjectHandle(ObjectHandle& handle) {
     detail::clear_error();
     if (!handle.handle) return;
-    const std::uint32_t raw_handle = handle.handle;
+    const URK::il2cpp::GCHandle raw_handle = handle.handle;
     // Consume ownership before calling the backend. If a damaged runtime table
     // faults while freeing this one handle, retrying it every recovery tick is
     // worse than an observable, bounded one-handle leak.

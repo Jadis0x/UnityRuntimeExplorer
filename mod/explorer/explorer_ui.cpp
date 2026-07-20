@@ -154,10 +154,21 @@ void enqueue_simple(CommandKind kind, int instance_id) {
 }
 
 void enqueue_hierarchy_command(CommandKind kind, const HierarchyNode &node, std::uint64_t revision) {
-    Command command{.kind = kind, .instance_id = node.instance_id};
-    command.hierarchy_revision = revision;
-    command.expected_object_address = node.object_address;
+    Command command{
+         .kind = kind,
+         .instance_id = node.instance_id
+    };
+
+
+    if (kind == CommandKind::DeleteObject ||
+        kind == CommandKind::DuplicateObject) {
+        command.hierarchy_revision = revision;
+    }
+
+    // command.expected_object_address = node.object_address;
+
     RuntimeModel::instance().enqueue(std::move(command));
+
 }
 
 void render_context_menu(const HierarchyNode &node, std::uint64_t revision) {
@@ -2179,9 +2190,7 @@ void render_inspector(const Snapshot &snapshot) {
                 ++it;
             }
         }
-        if (select_after_close > 0)
-            enqueue_simple(CommandKind::Select, select_after_close);
-        else if (select_after_close < 0)
+        if (select_after_close != 0)
             enqueue_simple(CommandKind::ClearSelection, 0);
         tabs.activate_instance_id = 0;
         ImGui::EndTabBar();
@@ -2377,7 +2386,13 @@ void render_object_inspector(const Snapshot &snapshot) {
     ImGui::BeginChild("##object-reference-tab-strip", ImVec2(0.0f, 31.0f), false,
                       ImGuiWindowFlags_HorizontalScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
     for (const ObjectReferenceTabState::Tab &tab : tabs.tabs) {
-        ImGui::PushID(static_cast<int>(tab.token));
+        ImGui::PushID(
+            static_cast<int>(
+                static_cast<std::uint32_t>(tab.token >> 32)));
+
+        ImGui::PushID(
+            static_cast<int>(
+                static_cast<std::uint32_t>(tab.token)));
         const bool selected = tabs.selected_token == tab.token;
         ImGui::PushStyleColor(ImGuiCol_Button,
                               selected ? ImVec4(0.55f, 0.32f, 0.82f, 1.0f) : ImVec4(0.25f, 0.22f, 0.32f, 1.0f));
@@ -2390,9 +2405,10 @@ void render_object_inspector(const Snapshot &snapshot) {
         }
         ImGui::PopStyleColor(2);
         ImGui::SameLine(0.0f, 2.0f);
-        if (ImGui::SmallButton("x"))
+        if (ImGui::SmallButton("x##close-object-tab"))
             close_token = tab.token;
         ImGui::SameLine(0.0f, 5.0f);
+        ImGui::PopID();
         ImGui::PopID();
     }
     ImGui::EndChild();
@@ -2697,6 +2713,7 @@ void render_class_browser(const Snapshot &snapshot) {
                     ImGui::SetClipboardText(field.pointer_text.c_str());
             }
             ImGui::PopID();
+            ImGui::PopID();
         }
         ImGui::EndChild();
     }
@@ -2710,7 +2727,13 @@ void render_class_browser(const Snapshot &snapshot) {
                             snapshot.class_browser_scan_truncated ? " (scan cap reached)" : "");
         ImGui::BeginChild("##class-browser-instances", ImVec2(0.0f, 150.0f), true);
         for (const ClassBrowserInstanceInfo &instance : snapshot.class_browser_instances) {
-            ImGui::PushID(static_cast<int>(instance.token));
+            ImGui::PushID(
+                static_cast<int>(
+                    static_cast<std::uint32_t>(instance.token >> 32)));
+
+            ImGui::PushID(
+                static_cast<int>(
+                    static_cast<std::uint32_t>(instance.token)));
             ImGui::TextUnformatted(instance.name.c_str());
             if (!instance.source.empty()) {
                 ImGui::SameLine();
