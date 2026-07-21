@@ -36,6 +36,7 @@ namespace Explorer {
 		constexpr auto kFieldWatchInterval = std::chrono::milliseconds(250);
 		constexpr auto kTracePublishInterval = std::chrono::milliseconds(250);
 		constexpr auto kEventRefreshDebounce = std::chrono::milliseconds(180);
+		constexpr auto kCameraFocusTransition = std::chrono::milliseconds(320);
 		constexpr int kMaxSceneCount = 128;
 		constexpr int kMaxHierarchyDepth = 256;
 		constexpr std::size_t kMaxCensusCandidates = 250000;
@@ -43,6 +44,57 @@ namespace Explorer {
 		constexpr std::size_t kMaxHighlightRenderers = 48;
 		constexpr int kHideAndDontSaveMask = 1 | 4 | 8 | 16 | 32;
 		constexpr TypeRef kSceneType{ "", "UnityEngine.SceneManagement", "Scene" };
+
+		float quaternion_dot(const Quaternion& left, const Quaternion& right) {
+			return left.x * right.x + left.y * right.y + left.z * right.z + left.w * right.w;
+		}
+
+		Quaternion quaternion_normalize(Quaternion value) {
+			const float length = std::sqrt(quaternion_dot(value, value));
+			if (!std::isfinite(length) || length <= 0.000001f)
+				return Quaternion{};
+			const float inverse = 1.0f / length;
+			value.x *= inverse;
+			value.y *= inverse;
+			value.z *= inverse;
+			value.w *= inverse;
+			return value;
+		}
+
+		Quaternion quaternion_slerp(Quaternion start, Quaternion end, float amount) {
+			start = quaternion_normalize(start);
+			end = quaternion_normalize(end);
+			float cosine = quaternion_dot(start, end);
+			if (cosine < 0.0f) {
+				end.x = -end.x;
+				end.y = -end.y;
+				end.z = -end.z;
+				end.w = -end.w;
+				cosine = -cosine;
+			}
+			cosine = std::clamp(cosine, -1.0f, 1.0f);
+			if (cosine > 0.9995f) {
+				Quaternion result{
+					start.x + amount * (end.x - start.x),
+					start.y + amount * (end.y - start.y),
+					start.z + amount * (end.z - start.z),
+					start.w + amount * (end.w - start.w),
+				};
+				return quaternion_normalize(result);
+			}
+			const float angle = std::acos(cosine);
+			const float sine = std::sin(angle);
+			if (std::abs(sine) <= 0.000001f)
+				return start;
+			const float start_weight = std::sin((1.0f - amount) * angle) / sine;
+			const float end_weight = std::sin(amount * angle) / sine;
+			return quaternion_normalize(Quaternion{
+				start.x * start_weight + end.x * end_weight,
+				start.y * start_weight + end.y * end_weight,
+				start.z * start_weight + end.z * end_weight,
+				start.w * start_weight + end.w * end_weight,
+			});
+		}
 
 #if defined(_WIN32)
 		struct NativeFaultRecord {
@@ -677,6 +729,7 @@ namespace Explorer {
 			return;
 
 		const Clock::time_point now = Clock::now();
+		update_camera_transition(now);
 		if (event_refresh_pending_ && now >= event_refresh_due_) {
 			event_refresh_pending_ = false;
 			request_refresh();
@@ -745,6 +798,7 @@ namespace Explorer {
 		class_browser_static_handles_.clear();
 		clear_highlight_renderer_cache();
 		clear_highlight_camera_cache();
+		highlight_max_distance_ = 0.0f;
 		hierarchy_ = std::make_shared<const HierarchyInfo>();
 		working_ = {};
 		working_.hierarchy = hierarchy_;
@@ -773,6 +827,12 @@ namespace Explorer {
 				});
 			if (already_queued)
 				return;
+		}
+
+		if (command.kind == CommandKind::SetHighlightDistance) {
+			std::erase_if(commands_, [](const Command& pending) {
+				return pending.kind == CommandKind::SetHighlightDistance;
+			});
 		}
 
 		if (command.kind == CommandKind::Select ||
@@ -957,13 +1017,14 @@ namespace Explorer {
 			command.kind == CommandKind::ClearFieldWatch || command.kind == CommandKind::CloseFieldWatch ||
 			command.kind == CommandKind::InspectReference || command.kind == CommandKind::InspectRawReference ||
 			command.kind == CommandKind::CloseObjectInspectorTab ||
-			command.kind == CommandKind::SetLiveData;
+			command.kind == CommandKind::SetLiveData ||
+			command.kind == CommandKind::SetHighlightDistance;
 		const bool event_command = command.kind == CommandKind::ObjectDestroyRequested;
 		ScopedObjectRoot command_root;
 		GameObject object{};
 		const bool needs_object = !component_command && !event_command && command.kind != CommandKind::Refresh &&
 			command.kind != CommandKind::ClearSelection && command.kind != CommandKind::SceneHint &&
-			command.kind != CommandKind::ClearDiagnostics;
+			command.kind != CommandKind::ClearDiagnostics && command.kind != CommandKind::RestoreCamera;
 
 		if (needs_object) {
 			if (command.instance_id == working_.selected_instance_id)
@@ -981,7 +1042,8 @@ namespace Explorer {
 		}
 
 		if (!object && command.kind != CommandKind::Refresh && command.kind != CommandKind::ClearSelection &&
-			command.kind != CommandKind::SceneHint && command.kind != CommandKind::ClearDiagnostics && !component_command &&
+			command.kind != CommandKind::SceneHint && command.kind != CommandKind::ClearDiagnostics &&
+			command.kind != CommandKind::RestoreCamera && !component_command &&
 			!event_command) {
 			set_status("Object is no longer available");
 			request_refresh();
@@ -995,6 +1057,14 @@ namespace Explorer {
 			select_object(object, command_root.release());
 			full_inspector_refresh = true;
 			break;
+		case CommandKind::FocusSelected:
+			focus_selected_camera(object);
+			publish();
+			return;
+		case CommandKind::RestoreCamera:
+			restore_focused_camera();
+			publish();
+			return;
 		case CommandKind::ClearSelection:
 			clear_selection();
 			break;
@@ -1170,6 +1240,16 @@ namespace Explorer {
 				refresh_object_inspector_values();
 			}
 			set_status(live_data_ ? "Live Data enabled" : "Live Data paused");
+			publish();
+			return;
+		case CommandKind::SetHighlightDistance:
+			highlight_max_distance_ = std::clamp(command.float_value, 0.0f, 100000.0f);
+			next_highlight_refresh_ = Clock::now();
+			if (selected_)
+				update_highlight();
+			set_status(highlight_max_distance_ > 0.0f
+				? "Highlight max distance set to " + std::to_string(static_cast<int>(highlight_max_distance_))
+				: "Highlight max distance disabled");
 			publish();
 			return;
 		case CommandKind::SetFieldValue:
@@ -1609,10 +1689,22 @@ namespace Explorer {
 		}
 
 		const Transform transform = selected_.transform();
+		info.camera_distance_valid = false;
 		if (transform) {
 			info.local_position = transform.localPosition();
 			info.local_rotation = transform.GetProperty<Vector3>("localEulerAngles");
 			info.local_scale = transform.localScale();
+			Camera distance_camera = Camera::main();
+			if (!safe_object_alive(distance_camera) || !distance_camera.enabled())
+				distance_camera = Camera::current();
+			const Transform camera_transform = distance_camera ? distance_camera.transform() : Transform{};
+			if (safe_object_alive(camera_transform)) {
+				const float distance = Vector3::distance(transform.position(), camera_transform.position());
+				if (std::isfinite(distance)) {
+					info.camera_distance = distance;
+					info.camera_distance_valid = true;
+				}
+			}
 		}
 		working_.inspector = std::move(info);
 	}
@@ -3095,6 +3187,25 @@ namespace Explorer {
 			return;
 		}
 		const Inspect::TypeInfo type = Inspect::TypeOf(object);
+		if (type.full_name == "UnityEngine.GameObject") {
+			// GameObjects have a dedicated hierarchy/Inspector flow.  Sending one
+			// through the generic Object Inspector only reflects the GameObject
+			// class itself, which hides the referenced instance's name, components,
+			// and scene context.
+			Inspect::ObjectHandle selection_root = Inspect::PinObject(object);
+			if (!selection_root.handle) {
+				set_status("Could not root referenced GameObject");
+				return;
+			}
+			const GameObject game_object{ object.handle() };
+			select_object(game_object, selection_root);
+			if (selected_.handle() == object.handle()) {
+				refresh_inspector(true);
+				update_highlight();
+				set_status("Selected referenced GameObject");
+			}
+			return;
+		}
 		Inspect::ObjectHandle next_handle = type.is_value_type ? Inspect::PinObject(object) : Inspect::WeakObject(object);
 		if (!next_handle.handle) {
 			set_status("Could not track referenced object");
@@ -3428,6 +3539,10 @@ namespace Explorer {
 			Inspect::FreeObjectHandle(root);
 			return;
 		}
+		// A new selection ends a temporary camera focus so the previous camera
+		// pose is not carried into an unrelated object.
+		if (camera_focus_active_)
+			restore_focused_camera();
 
 		if (!root.handle) {
 #if defined(_WIN32)
@@ -3462,18 +3577,156 @@ namespace Explorer {
 		clear_highlight_renderer_cache();
 	}
 
+	void RuntimeModel::update_camera_transition(Clock::time_point now) {
+		if (!camera_transition_active_)
+			return;
+		if (!camera_focus_active_ || !focused_camera_handle_.handle) {
+			camera_transition_active_ = false;
+			return;
+		}
+		const Camera camera{ Inspect::ResolveObjectHandle(focused_camera_handle_).handle() };
+		const Transform camera_transform = camera.transform();
+		if (!safe_object_alive(camera_transform)) {
+			camera_transition_active_ = false;
+			return;
+		}
+		const float elapsed = std::chrono::duration<float>(now - camera_transition_started_).count();
+		const float duration = std::chrono::duration<float>(kCameraFocusTransition).count();
+		const float linear_amount = duration > 0.0f ? std::clamp(elapsed / duration, 0.0f, 1.0f) : 1.0f;
+		const float amount = linear_amount * linear_amount * (3.0f - 2.0f * linear_amount);
+		camera_transform.set_localPosition(camera_transition_start_position);
+		camera_transform.set_localRotation(
+			quaternion_slerp(camera_transition_start_rotation, camera_transition_target_rotation, amount));
+		if (linear_amount >= 1.0f)
+			camera_transition_active_ = false;
+	}
+
+	void RuntimeModel::focus_selected_camera(GameObject object) {
+		if (!safe_object_alive(object)) {
+			set_status("Camera focus failed: object is no longer available");
+			return;
+		}
+		const Transform target_transform = object.transform();
+		if (!safe_object_alive(target_transform)) {
+			set_status("Camera focus failed: object has no Transform");
+			return;
+		}
+
+		// Keep focus tied to the primary gameplay camera so Return camera has a
+		// well-defined meaning. Camera.current is only a fallback for games that
+		// do not expose an enabled tagged main camera.
+		Camera camera = Camera::main();
+		if (!safe_object_alive(camera) || !camera.enabled())
+			camera = Camera::current();
+		if (!safe_object_alive(camera) || !camera.enabled()) {
+			set_status("Camera focus failed: no enabled camera was found");
+			return;
+		}
+		const Transform camera_transform = camera.transform();
+		if (!safe_object_alive(camera_transform)) {
+			set_status("Camera focus failed: camera Transform is unavailable");
+			return;
+		}
+
+		if (camera_focus_active_)
+			restore_focused_camera();
+		focused_camera_handle_ = Inspect::PinObject(Object{ camera.handle() });
+		if (!focused_camera_handle_.handle) {
+			set_status("Camera focus failed: camera could not be rooted");
+			return;
+		}
+		const Camera rooted_camera{ Inspect::ResolveObjectHandle(focused_camera_handle_).handle() };
+		const Transform rooted_transform = rooted_camera.transform();
+		if (!safe_object_alive(rooted_transform)) {
+			Inspect::FreeObjectHandle(focused_camera_handle_);
+			focused_camera_handle_ = {};
+			set_status("Camera focus failed: camera Transform is unavailable");
+			return;
+		}
+		saved_camera_position = rooted_transform.position();
+		saved_camera_rotation = rooted_transform.rotation();
+		saved_camera_local_position = rooted_transform.localPosition();
+		saved_camera_local_rotation = rooted_transform.localRotation();
+		camera_transition_start_position = saved_camera_local_position;
+		camera_transition_start_rotation = saved_camera_local_rotation;
+		rooted_transform.LookAt(target_transform.position());
+		if (const char* error = last_error(); error && error[0]) {
+			const std::string message = std::string("Camera focus failed: ") + error;
+			clear_error();
+			Inspect::FreeObjectHandle(focused_camera_handle_);
+			focused_camera_handle_ = {};
+			set_status(message);
+			return;
+		}
+		camera_transition_target_rotation = rooted_transform.localRotation();
+		rooted_transform.set_localPosition(camera_transition_start_position);
+		rooted_transform.set_localRotation(camera_transition_start_rotation);
+		if (const char* error = last_error(); error && error[0]) {
+			const std::string message = std::string("Camera focus transition failed: ") + error;
+			clear_error();
+			Inspect::FreeObjectHandle(focused_camera_handle_);
+			focused_camera_handle_ = {};
+			set_status(message);
+			return;
+		}
+		camera_focus_active_ = true;
+		working_.camera_focus_active = true;
+		camera_transition_started_ = Clock::now();
+		camera_transition_active_ = true;
+		set_status("Camera focused on " + object.name() + " (use Return camera to restore it)");
+	}
+
+	void RuntimeModel::restore_focused_camera() {
+		if (!camera_focus_active_ && !focused_camera_handle_.handle)
+			return;
+		camera_transition_active_ = false;
+		bool restored = false;
+		if (focused_camera_handle_.handle) {
+			const Camera camera{ Inspect::ResolveObjectHandle(focused_camera_handle_).handle() };
+			const Transform camera_transform = camera.transform();
+			if (safe_object_alive(camera_transform)) {
+				// Restore the rig-local pose. Restoring only world position/rotation
+				// breaks cameras parented under a player or camera rig because their
+				// controller drives localRotation every frame.
+				camera_transform.set_localPosition(saved_camera_local_position);
+				camera_transform.set_localRotation(saved_camera_local_rotation);
+				const char* local_error = last_error();
+				if (local_error && local_error[0]) {
+					clear_error();
+					camera_transform.set_position(saved_camera_position);
+					camera_transform.set_rotation(saved_camera_rotation);
+				}
+				const char* restore_error = last_error();
+				restored = !(restore_error && restore_error[0]);
+				clear_error();
+			}
+			Inspect::FreeObjectHandle(focused_camera_handle_);
+			focused_camera_handle_ = {};
+		}
+		camera_focus_active_ = false;
+		working_.camera_focus_active = false;
+		set_status(restored ? "Camera restored" : "Camera focus ended; the original camera was unavailable");
+	}
+
 	void RuntimeModel::update_highlight() {
 		if (!safe_object_alive(selected_))
 			return;
 
 		ModUI::Highlight::Style style{};
-		style.color = IM_COL32(255, 196, 64, 245);
+		style.color = IM_COL32(80, 220, 255, 255);
+		style.fill_color = IM_COL32(40, 190, 255, 42);
+		style.label_color = IM_COL32(255, 255, 255, 255);
+		style.label_bg_color = IM_COL32(7, 16, 24, 238);
+		style.label_border_color = IM_COL32(80, 220, 255, 255);
+		style.shadow_color = IM_COL32(0, 0, 0, 220);
 		style.corner_box = true;
-		style.filled = false;
-		style.thickness = 1.5f;
-		style.corner_length = 10.0f;
+		style.filled = true;
+		style.shadow = true;
+		style.thickness = 2.5f;
+		style.corner_length = 14.0f;
 		style.draw_label = true;
 		style.label_above_box = true;
+		style.max_distance = highlight_max_distance_;
 		// Use renderer bounds when available.
 		style.offscreen_indicator = false;
 		const std::string label = selected_.name();
@@ -3501,9 +3754,13 @@ namespace Explorer {
 			next_highlight_camera_refresh_ = camera_now + kHighlightCameraRefreshInterval;
 		}
 
-		// Select an active camera that can see the object.
+		Camera main_camera{};
+		std::vector<Vector3> camera_samples;
 		if (!camera && !is_overlay_canvas) {
-			std::vector<Vector3> camera_samples;
+			main_camera = Camera::main();
+			if (!safe_object_alive(main_camera) || !main_camera.enabled())
+				main_camera = Camera{};
+
 			camera_samples.reserve(9);
 			if (selected_transform)
 				camera_samples.push_back(selected_transform.position());
@@ -3516,43 +3773,66 @@ namespace Explorer {
 					break;
 			}
 
-			int best_visible_samples = -1;
-			int best_front_samples = -1;
-			float best_center_distance = std::numeric_limits<float>::max();
-			for (const Inspect::ObjectHandle& camera_handle : highlight_cameras_) {
-				const Camera candidate{ Inspect::ResolveObjectHandle(camera_handle).handle() };
-				if (!safe_object_alive(candidate))
-					continue;
+			// Prefer the tagged main camera only when it can actually see the
+			// target.  A main camera may be a disabled/transitioning view while a
+			// gameplay camera is rendering the frame, which otherwise projects the
+			// highlight far away from the selected object.
+			if (main_camera) {
 				int visible_samples = 0;
-				int front_samples = 0;
-				float center_distance = 0.0f;
 				for (const Vector3& sample : camera_samples) {
-					const Vector3 viewport = candidate.WorldToViewportPoint(sample);
-					if (!std::isfinite(viewport.x) || !std::isfinite(viewport.y) || !std::isfinite(viewport.z))
-						continue;
-					if (viewport.z > 0.01f) {
-						++front_samples;
-						const float dx = viewport.x - 0.5f;
-						const float dy = viewport.y - 0.5f;
-						center_distance += dx * dx + dy * dy;
-						if (viewport.x >= 0.0f && viewport.x <= 1.0f &&
-							viewport.y >= 0.0f && viewport.y <= 1.0f)
-							++visible_samples;
-					}
+					const Vector3 viewport = main_camera.WorldToViewportPoint(sample);
+					if (std::isfinite(viewport.x) && std::isfinite(viewport.y) &&
+						std::isfinite(viewport.z) && viewport.z > 0.01f &&
+						viewport.x >= 0.0f && viewport.x <= 1.0f &&
+						viewport.y >= 0.0f && viewport.y <= 1.0f)
+						++visible_samples;
 				}
-				if (visible_samples > best_visible_samples ||
-					(visible_samples == best_visible_samples && front_samples > best_front_samples) ||
-					(visible_samples == best_visible_samples && front_samples == best_front_samples &&
-						center_distance < best_center_distance)) {
-					camera = candidate;
-					best_visible_samples = visible_samples;
-					best_front_samples = front_samples;
-					best_center_distance = center_distance;
+				if (visible_samples > 0)
+					camera = main_camera;
+			}
+
+			// If the main camera cannot see the target, fall back to the active
+			// camera with the most visible samples.  This covers split-screen,
+			// camera stacks, and games that do not tag their gameplay camera.
+			if (!camera) {
+				int best_visible_samples = -1;
+				int best_front_samples = -1;
+				float best_center_distance = std::numeric_limits<float>::max();
+				for (const Inspect::ObjectHandle& camera_handle : highlight_cameras_) {
+					const Camera candidate{ Inspect::ResolveObjectHandle(camera_handle).handle() };
+					if (!safe_object_alive(candidate))
+						continue;
+					int visible_samples = 0;
+					int front_samples = 0;
+					float center_distance = 0.0f;
+					for (const Vector3& sample : camera_samples) {
+						const Vector3 viewport = candidate.WorldToViewportPoint(sample);
+						if (!std::isfinite(viewport.x) || !std::isfinite(viewport.y) || !std::isfinite(viewport.z))
+							continue;
+						if (viewport.z > 0.01f) {
+							++front_samples;
+							const float dx = viewport.x - 0.5f;
+							const float dy = viewport.y - 0.5f;
+							center_distance += dx * dx + dy * dy;
+							if (viewport.x >= 0.0f && viewport.x <= 1.0f &&
+								viewport.y >= 0.0f && viewport.y <= 1.0f)
+								++visible_samples;
+						}
+					}
+					if (visible_samples > best_visible_samples ||
+						(visible_samples == best_visible_samples && front_samples > best_front_samples) ||
+						(visible_samples == best_visible_samples && front_samples == best_front_samples &&
+							center_distance < best_center_distance)) {
+						camera = candidate;
+						best_visible_samples = visible_samples;
+						best_front_samples = front_samples;
+						best_center_distance = center_distance;
+					}
 				}
 			}
 		}
 		if (!camera)
-			camera = Camera::main();
+			camera = main_camera ? main_camera : Camera::main();
 		const int unity_screen_width = Screen::width();
 		const int unity_screen_height = Screen::height();
 		const float screen_width = static_cast<float>(unity_screen_width);
@@ -3572,12 +3852,27 @@ namespace Explorer {
 			};
 
 		const Vector3 selected_position = selected_transform ? selected_transform.position() : Vector3{};
+		if (highlight_max_distance_ > 0.0f && camera) {
+			const Transform camera_transform = camera.transform();
+			if (camera_transform) {
+				const float camera_distance = Vector3::distance(selected_position, camera_transform.position());
+				if (std::isfinite(camera_distance) && camera_distance > highlight_max_distance_) {
+					if (highlight_id_ != 0) {
+						ModUI::Highlight::enqueue_remove(highlight_id_);
+						highlight_id_ = 0;
+					}
+					if (highlight_locator_id_ != 0) {
+						ModUI::Highlight::enqueue_remove(highlight_locator_id_);
+						highlight_locator_id_ = 0;
+					}
+					return;
+				}
+			}
+		}
 		float min_x = 0.0f;
 		float min_y = 0.0f;
 		float max_x = 0.0f;
 		float max_y = 0.0f;
-		float best_distance_squared = std::numeric_limits<float>::max();
-		float best_area = std::numeric_limits<float>::max();
 		bool projected = false;
 		// Project RectTransform corners rather than its pivot position.
 		const auto project_rect_transform = [&] {
@@ -3625,20 +3920,18 @@ namespace Explorer {
 			max_y = rect_max_y;
 			return true;
 			};
-		projected = project_rect_transform();
-		// Choose the smallest valid projection from nearby renderers.
+		const bool rect_projected = project_rect_transform();
+		projected = rect_projected;
+		// Union every projected renderer under the selected GameObject.  Picking
+		// only the nearest renderer makes parent objects appear highlighted at a
+		// seemingly arbitrary child, especially when the active camera changes.
 		for (const Inspect::ObjectHandle& renderer_handle : highlight_renderers_) {
 			const Renderer renderer{ Inspect::ResolveObjectHandle(renderer_handle).handle() };
-			if (projected || !camera)
+			if (rect_projected || !camera)
 				break;
 			if (!safe_object_alive(renderer))
 				continue;
 			const Bounds bounds = renderer.bounds();
-			const Vector3 center = bounds.center;
-			const Vector3 center_screen = camera.WorldToScreenPoint(center);
-			// Use the anchor fallback when bounds are behind the camera.
-			if (!valid_screen_point(center_screen))
-				continue;
 			const Vector3 min = bounds.min();
 			const Vector3 max = bounds.max();
 			const Vector3 corners[] = {
@@ -3669,20 +3962,18 @@ namespace Explorer {
 			}
 			if (!renderer_projected)
 				continue;
-			const float dx = center.x - selected_position.x;
-			const float dy = center.y - selected_position.y;
-			const float dz = center.z - selected_position.z;
-			const float distance_squared = dx * dx + dy * dy + dz * dz;
-			const float area = (renderer_max_x - renderer_min_x) * (renderer_max_y - renderer_min_y);
-			if (!projected || distance_squared < best_distance_squared ||
-				(distance_squared == best_distance_squared && area < best_area)) {
+			if (!projected) {
 				min_x = renderer_min_x;
 				min_y = renderer_min_y;
 				max_x = renderer_max_x;
 				max_y = renderer_max_y;
-				best_distance_squared = distance_squared;
-				best_area = area;
 				projected = true;
+			}
+			else {
+				min_x = std::min(min_x, renderer_min_x);
+				min_y = std::min(min_y, renderer_min_y);
+				max_x = std::max(max_x, renderer_max_x);
+				max_y = std::max(max_y, renderer_max_y);
 			}
 		}
 
@@ -3839,6 +4130,8 @@ namespace Explorer {
 	}
 
 	void RuntimeModel::clear_selection() {
+		if (camera_focus_active_)
+			restore_focused_camera();
 		if (highlight_id_ != 0) {
 			ModUI::Highlight::enqueue_remove(highlight_id_);
 			highlight_id_ = 0;
@@ -3854,6 +4147,7 @@ namespace Explorer {
 		clear_highlight_renderer_cache();
 		working_.selected_instance_id = 0;
 		working_.inspector = {};
+		working_.camera_focus_active = false;
 	}
 
 	void RuntimeModel::discard_managed_state_after_native_fault() {
@@ -3865,6 +4159,10 @@ namespace Explorer {
 			ModUI::Highlight::enqueue_remove(highlight_locator_id_);
 		highlight_id_ = 0;
 		highlight_locator_id_ = 0;
+		Inspect::FreeObjectHandle(focused_camera_handle_);
+		focused_camera_handle_ = {};
+		camera_focus_active_ = false;
+		camera_transition_active_ = false;
 
 		selected_ = {};
 		Inspect::FreeObjectHandle(selected_handle_);
@@ -3889,6 +4187,7 @@ namespace Explorer {
 		clear_highlight_camera_cache();
 		working_.selected_instance_id = 0;
 		working_.inspector = {};
+		working_.camera_focus_active = false;
 		working_.object_inspector = {};
 		working_.method_results.clear();
 		working_.field_watches.clear();

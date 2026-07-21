@@ -193,6 +193,8 @@ struct InspectorInfo {
     URK::Unity::Vector3 local_position{};
     URK::Unity::Vector3 local_rotation{};
     URK::Unity::Vector3 local_scale{1.0f, 1.0f, 1.0f};
+    float camera_distance = 0.0f;
+    bool camera_distance_valid = false;
     std::vector<ComponentInfo> components;
 };
 
@@ -243,6 +245,7 @@ struct Snapshot {
     InspectorInfo inspector;
     ObjectInspectorInfo object_inspector;
     bool live_data = false;
+    bool camera_focus_active = false;
     int selected_instance_id = 0;
     std::string status;
     std::vector<std::string> diagnostics;
@@ -304,6 +307,9 @@ enum class CommandKind {
     SceneHint = 37,
     ObjectDestroyRequested = 38,
     ClearDiagnostics = 39,
+    SetHighlightDistance = 40,
+    FocusSelected = 41,
+    RestoreCamera = 42,
 };
 
 struct Command {
@@ -326,6 +332,7 @@ struct Command {
     bool object_inspector_target = false;
     bool lock_value = false;
     bool unlock_value = false;
+    float float_value = 0.0f;
     URK::Unity::Vector3 vector_value{};
     std::string text;
     std::string image;
@@ -389,6 +396,9 @@ class RuntimeModel {
     void refresh_object_inspector_values(bool force = false);
     void release_reference_handle(std::uint64_t token);
     void update_highlight();
+    void update_camera_transition(Clock::time_point now);
+    void focus_selected_camera(URK::Unity::GameObject object);
+    void restore_focused_camera();
     void clear_highlight_renderer_cache();
     void clear_highlight_camera_cache();
     // The hierarchy stores non-owning Unity object wrappers. Resolve a fresh
@@ -469,6 +479,19 @@ class RuntimeModel {
     std::vector<URK::Unity::Inspect::ObjectHandle> highlight_cameras_;
     std::uint32_t highlight_id_ = 0;
     std::uint32_t highlight_locator_id_ = 0;
+    // Zero means unlimited highlight distance.
+    float highlight_max_distance_ = 0.0f;
+    URK::Unity::Inspect::ObjectHandle focused_camera_handle_{};
+    URK::Unity::Vector3 saved_camera_position{};
+    URK::Unity::Quaternion saved_camera_rotation{};
+    URK::Unity::Vector3 saved_camera_local_position{};
+    URK::Unity::Quaternion saved_camera_local_rotation{};
+    bool camera_focus_active_ = false;
+    bool camera_transition_active_ = false;
+    Clock::time_point camera_transition_started_{};
+    URK::Unity::Vector3 camera_transition_start_position{};
+    URK::Unity::Quaternion camera_transition_start_rotation{};
+    URK::Unity::Quaternion camera_transition_target_rotation{};
     int active_scene_handle_hint_ = 0;
     std::string active_scene_name_hint_;
     std::string logged_hierarchy_signature_;

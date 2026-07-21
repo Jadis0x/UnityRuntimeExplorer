@@ -208,8 +208,11 @@ void render_node(const HierarchyNode &node, int selected_instance_id, const Node
     if (!node.active)
         ImGui::PopStyleColor();
 
-    if (ImGui::IsItemClicked(ImGuiMouseButton_Left))
-        enqueue_hierarchy_command(CommandKind::Select, node, revision);
+	if (ImGui::IsItemHovered() && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
+		enqueue_hierarchy_command(CommandKind::FocusSelected, node, revision);
+	}
+	else if (ImGui::IsItemClicked(ImGuiMouseButton_Left))
+		enqueue_hierarchy_command(CommandKind::Select, node, revision);
     render_context_menu(node, revision);
 
     if (open && !node.children.empty()) {
@@ -541,10 +544,11 @@ void render_member_lock(CommandKind kind, int component_id, int member_index, co
 
 void request_object_reference_tab(std::uint64_t token);
 
-void enqueue_reference_inspection(std::uint64_t token) {
+void enqueue_reference_inspection(std::uint64_t token, bool request_object_tab = true) {
     if (token == 0)
         return;
-    request_object_reference_tab(token);
+    if (request_object_tab)
+        request_object_reference_tab(token);
     Command command{};
     command.kind = CommandKind::InspectReference;
     command.reference_token = token;
@@ -575,8 +579,10 @@ void enqueue_member_sample(CommandKind value_kind, int component_id, int member_
 void render_reference_button(const ComponentInfo::LiveValues::Reference *reference) {
     if (!reference || reference->is_null || reference->token == 0)
         return;
-    if (ImGui::SmallButton("Inspect"))
-        enqueue_reference_inspection(reference->token);
+    const bool is_game_object = reference->type_name == "UnityEngine.GameObject" ||
+                                reference->type_name == "GameObject";
+    if (ImGui::SmallButton(is_game_object ? "Select" : "Inspect"))
+        enqueue_reference_inspection(reference->token, !is_game_object);
     if (ImGui::BeginPopupContextItem("##reference-actions")) {
         ImGui::TextDisabled("%s", reference->type_name.c_str());
         if (ImGui::MenuItem("Copy address"))
@@ -1587,6 +1593,10 @@ void request_object_reference_tab(std::uint64_t token) {
     if (token == 0)
         return;
     ObjectReferenceTabState &state = object_reference_tabs();
+    // An explicit Inspect click is a new open request.  Do not let the
+    // previous close action suppress the same reference token forever.
+    state.closed_tokens.erase(token);
+    state.requested_tokens.erase(token);
     state.pending_activation_token = token;
     const auto found = std::find_if(state.tabs.begin(), state.tabs.end(),
                                     [token](const ObjectReferenceTabState::Tab &tab) { return tab.token == token; });
@@ -2078,6 +2088,22 @@ void render_current_inspector(const Snapshot &snapshot) {
     ImGui::TextDisabled("Selected GameObject:");
     ImGui::SameLine();
     ImGui::TextColored(ImVec4(0.45f, 0.82f, 0.96f, 1.0f), "%s", info.name.c_str());
+    ImGui::SameLine();
+    if (info.camera_distance_valid)
+        ImGui::TextColored(ImVec4(0.58f, 0.88f, 0.70f, 1.0f), "%.1f units away", info.camera_distance);
+    else
+        ImGui::TextDisabled("distance unavailable");
+    if (ImGui::SmallButton("Focus camera"))
+        enqueue_simple(CommandKind::FocusSelected, info.instance_id);
+    ImGui::SameLine();
+    ImGui::BeginDisabled(!snapshot.camera_focus_active);
+    if (ImGui::SmallButton("Return camera"))
+        enqueue_simple(CommandKind::RestoreCamera, 0);
+    ImGui::EndDisabled();
+    if (snapshot.camera_focus_active) {
+        ImGui::SameLine();
+        ImGui::TextDisabled("temporary focus");
+    }
     // Component tabs use a separate accent from GameObject tabs.
     ImGui::PushStyleColor(ImGuiCol_Tab, ImVec4(0.20f, 0.26f, 0.24f, 1.0f));
     ImGui::PushStyleColor(ImGuiCol_TabHovered, ImVec4(0.26f, 0.47f, 0.38f, 1.0f));
@@ -2147,6 +2173,16 @@ void render_inspector(const Snapshot &snapshot) {
         remember_object_tab(snapshot.inspector);
     else
         tabs.last_seen_instance_id = 0;
+
+    // A click on the empty Hierarchy area intentionally clears the selection.
+    // The tab history is kept so objects can be revisited, but an empty
+    // selection is not an asynchronous load.  Rendering the tab bar here
+    // would make every remembered tab look stuck on "Loading..." until a new
+    // GameObject is selected.
+    if (!snapshot.inspector.valid) {
+        render_current_inspector(snapshot);
+        return;
+    }
 
     if (tabs.tabs.empty()) {
         render_current_inspector(snapshot);
@@ -2760,34 +2796,57 @@ void render_class_browser(const Snapshot &snapshot) {
 
 int push_explorer_theme(float opacity) {
     const auto color = [opacity](float r, float g, float b, float alpha) { return ImVec4(r, g, b, alpha * opacity); };
-    ImGui::PushStyleColor(ImGuiCol_WindowBg, color(0.22f, 0.22f, 0.22f, 0.98f));
-    ImGui::PushStyleColor(ImGuiCol_ChildBg, color(0.18f, 0.18f, 0.18f, 0.96f));
-    ImGui::PushStyleColor(ImGuiCol_PopupBg, color(0.24f, 0.24f, 0.24f, 0.99f));
-    ImGui::PushStyleColor(ImGuiCol_TitleBg, color(0.16f, 0.16f, 0.16f, 1.0f));
-    ImGui::PushStyleColor(ImGuiCol_TitleBgActive, color(0.19f, 0.27f, 0.34f, 1.0f));
-    ImGui::PushStyleColor(ImGuiCol_FrameBg, color(0.28f, 0.28f, 0.28f, 1.0f));
-    ImGui::PushStyleColor(ImGuiCol_FrameBgHovered, color(0.36f, 0.36f, 0.36f, 1.0f));
-    ImGui::PushStyleColor(ImGuiCol_Header, color(0.24f, 0.39f, 0.55f, 0.92f));
-    ImGui::PushStyleColor(ImGuiCol_HeaderHovered, color(0.30f, 0.49f, 0.68f, 1.0f));
-    ImGui::PushStyleColor(ImGuiCol_Button, color(0.31f, 0.31f, 0.31f, 1.0f));
-    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, color(0.41f, 0.41f, 0.41f, 1.0f));
-    ImGui::PushStyleColor(ImGuiCol_Separator, color(0.12f, 0.12f, 0.12f, 1.0f));
-    ImGui::PushStyleColor(ImGuiCol_TableRowBg, color(0.20f, 0.20f, 0.20f, 0.60f));
-    ImGui::PushStyleColor(ImGuiCol_TableRowBgAlt, color(0.25f, 0.25f, 0.25f, 0.60f));
-    ImGui::PushStyleColor(ImGuiCol_TextDisabled, ImVec4(0.62f, 0.62f, 0.62f, 1.0f));
-    ImGui::PushStyleColor(ImGuiCol_CheckMark, ImVec4(0.36f, 0.68f, 0.94f, 1.0f));
-    ImGui::PushStyleColor(ImGuiCol_ScrollbarBg, color(0.12f, 0.12f, 0.12f, 0.75f));
-    ImGui::PushStyleColor(ImGuiCol_ScrollbarGrab, color(0.38f, 0.38f, 0.38f, 0.95f));
-    ImGui::PushStyleColor(ImGuiCol_ScrollbarGrabHovered, color(0.49f, 0.49f, 0.49f, 1.0f));
+    // Use a blue/graphite palette so surfaces, controls and selection states
+    // have distinct levels instead of collapsing into one gray block.
+    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.88f, 0.93f, 0.96f, 1.0f));
+    ImGui::PushStyleColor(ImGuiCol_WindowBg, color(0.055f, 0.075f, 0.095f, 0.98f));
+    ImGui::PushStyleColor(ImGuiCol_ChildBg, color(0.070f, 0.095f, 0.120f, 0.96f));
+    ImGui::PushStyleColor(ImGuiCol_PopupBg, color(0.085f, 0.115f, 0.145f, 0.99f));
+    ImGui::PushStyleColor(ImGuiCol_Border, color(0.17f, 0.29f, 0.35f, 0.80f));
+    ImGui::PushStyleColor(ImGuiCol_BorderShadow, color(0.015f, 0.025f, 0.035f, 0.55f));
+    ImGui::PushStyleColor(ImGuiCol_TitleBg, color(0.035f, 0.055f, 0.075f, 1.0f));
+    ImGui::PushStyleColor(ImGuiCol_TitleBgActive, color(0.075f, 0.20f, 0.275f, 1.0f));
+    ImGui::PushStyleColor(ImGuiCol_FrameBg, color(0.115f, 0.155f, 0.195f, 1.0f));
+    ImGui::PushStyleColor(ImGuiCol_FrameBgHovered, color(0.17f, 0.245f, 0.285f, 1.0f));
+    ImGui::PushStyleColor(ImGuiCol_FrameBgActive, color(0.19f, 0.32f, 0.36f, 1.0f));
+    ImGui::PushStyleColor(ImGuiCol_Header, color(0.10f, 0.29f, 0.38f, 0.92f));
+    ImGui::PushStyleColor(ImGuiCol_HeaderHovered, color(0.15f, 0.40f, 0.49f, 1.0f));
+    ImGui::PushStyleColor(ImGuiCol_HeaderActive, color(0.18f, 0.47f, 0.54f, 1.0f));
+    ImGui::PushStyleColor(ImGuiCol_Button, color(0.10f, 0.20f, 0.265f, 1.0f));
+    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, color(0.16f, 0.35f, 0.43f, 1.0f));
+    ImGui::PushStyleColor(ImGuiCol_ButtonActive, color(0.12f, 0.42f, 0.50f, 1.0f));
+    ImGui::PushStyleColor(ImGuiCol_Separator, color(0.16f, 0.28f, 0.34f, 1.0f));
+    ImGui::PushStyleColor(ImGuiCol_SeparatorHovered, color(0.28f, 0.55f, 0.62f, 1.0f));
+    ImGui::PushStyleColor(ImGuiCol_SeparatorActive, color(0.34f, 0.68f, 0.72f, 1.0f));
+    ImGui::PushStyleColor(ImGuiCol_TableRowBg, color(0.070f, 0.105f, 0.135f, 0.72f));
+    ImGui::PushStyleColor(ImGuiCol_TableRowBgAlt, color(0.095f, 0.145f, 0.175f, 0.72f));
+    ImGui::PushStyleColor(ImGuiCol_TableHeaderBg, color(0.08f, 0.18f, 0.23f, 0.92f));
+    ImGui::PushStyleColor(ImGuiCol_TextDisabled, ImVec4(0.52f, 0.63f, 0.69f, 1.0f));
+    ImGui::PushStyleColor(ImGuiCol_CheckMark, ImVec4(0.35f, 0.86f, 0.76f, 1.0f));
+    ImGui::PushStyleColor(ImGuiCol_TextSelectedBg, color(0.12f, 0.43f, 0.52f, 0.72f));
+    ImGui::PushStyleColor(ImGuiCol_ScrollbarBg, color(0.035f, 0.060f, 0.080f, 0.80f));
+    ImGui::PushStyleColor(ImGuiCol_ScrollbarGrab, color(0.25f, 0.40f, 0.46f, 0.95f));
+    ImGui::PushStyleColor(ImGuiCol_ScrollbarGrabHovered, color(0.34f, 0.57f, 0.63f, 1.0f));
+    ImGui::PushStyleColor(ImGuiCol_ScrollbarGrabActive, color(0.40f, 0.68f, 0.72f, 1.0f));
     ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 1.0f);
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 1.0f);
-    ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, 1.0f);
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(8.0f, 6.0f));
-    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(5.0f, 2.0f));
-    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(5.0f, 3.0f));
-    ImGui::PushStyleVar(ImGuiStyleVar_CellPadding, ImVec2(4.0f, 2.0f));
-    ImGui::PushStyleVar(ImGuiStyleVar_IndentSpacing, 14.0f);
-    return 19;
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 4.0f);
+    ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, 2.0f);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 1.0f);
+    ImGui::PushStyleVar(ImGuiStyleVar_ChildBorderSize, 1.0f);
+    ImGui::PushStyleVar(ImGuiStyleVar_FrameBorderSize, 1.0f);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(9.0f, 7.0f));
+    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(6.0f, 3.0f));
+    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(6.0f, 4.0f));
+    ImGui::PushStyleVar(ImGuiStyleVar_CellPadding, ImVec2(5.0f, 3.0f));
+    ImGui::PushStyleVar(ImGuiStyleVar_IndentSpacing, 16.0f);
+    return 30;
+}
+
+int push_panel_accent(const ImVec4& accent) {
+    ImGui::PushStyleColor(ImGuiCol_TitleBg,
+                          ImVec4(accent.x * 0.28f, accent.y * 0.28f, accent.z * 0.28f, 1.0f));
+    ImGui::PushStyleColor(ImGuiCol_TitleBgActive, accent);
+    return 2;
 }
 
 void render_diagnostics(const Snapshot &snapshot) {
@@ -2818,6 +2877,7 @@ void render() {
     const ImVec2 work_pos = viewport ? viewport->WorkPos : ImVec2(20.0f, 20.0f);
     const ImVec2 work_size = viewport ? viewport->WorkSize : ImVec2(1280.0f, 760.0f);
     static float opacity = 0.92f;
+    static float highlight_max_distance = 0.0f;
     static bool show_hierarchy = true;
     static bool show_inspector = true;
     static bool show_object_inspector = false;
@@ -2831,7 +2891,8 @@ void render() {
     static std::uint64_t previous_object_token = 0;
     static std::size_t previous_trace_count = 0;
     static std::size_t previous_field_watch_count = 0;
-    if (snapshot->selected_instance_id != previous_selection_id) {
+    const bool selection_changed = snapshot->selected_instance_id != previous_selection_id;
+    if (selection_changed) {
         // Editor state belongs to the previous selection.
         member_buffers().clear();
         method_boolean_arguments().clear();
@@ -2839,6 +2900,10 @@ void render() {
         component_inheritance_filters().clear();
         component_buffers() = {};
         previous_selection_id = snapshot->selected_instance_id;
+        // Selecting from the Hierarchy is also an explicit request to inspect
+        // that GameObject, even if the user previously closed the Inspector.
+        if (snapshot->selected_instance_id != 0)
+            show_inspector = true;
     }
     if (snapshot->object_inspector.valid && snapshot->object_inspector.token != previous_object_token)
         show_object_inspector = true;
@@ -2905,6 +2970,7 @@ void render() {
         ImGui::SameLine();
         workspace_link_button("Support", ModConfig::social, ImVec4(0.46f, 0.29f, 0.18f, 1.0f));
         if (ImGui::BeginPopup("##workspace-options")) {
+            ImGui::SeparatorText("Overlay");
             bool live_data = snapshot->live_data;
             if (ImGui::Checkbox("Live Data", &live_data)) {
                 Command command{.kind = CommandKind::SetLiveData};
@@ -2913,7 +2979,25 @@ void render() {
             }
             ImGui::SetNextItemWidth(180.0f);
             ImGui::SliderFloat("Opacity", &opacity, 0.35f, 1.0f, "%.2f");
+            ImGui::SeparatorText("Selection Highlight");
+            ImGui::SetNextItemWidth(220.0f);
+            if (ImGui::DragFloat("Max distance", &highlight_max_distance, 10.0f, 0.0f, 100000.0f, "%.0f")) {
+                highlight_max_distance = std::clamp(highlight_max_distance, 0.0f, 100000.0f);
+                Command command{.kind = CommandKind::SetHighlightDistance};
+                command.float_value = highlight_max_distance;
+                RuntimeModel::instance().enqueue(std::move(command));
+            }
+            ImGui::SameLine();
+            ImGui::TextDisabled("0 = unlimited");
+            ImGui::TextDisabled("Measured from the active game camera.");
             ImGui::EndPopup();
+        }
+        if (snapshot->camera_focus_active) {
+            ImGui::SameLine();
+            if (ImGui::SmallButton("Return camera"))
+                enqueue_simple(CommandKind::RestoreCamera, 0);
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Restore the camera pose saved before focusing");
         }
     }
     ImGui::End();
@@ -2922,6 +3006,7 @@ void render() {
         ImGui::SetNextWindowPos(ImVec2(work_pos.x + 12.0f, work_pos.y + 120.0f), ImGuiCond_FirstUseEver);
         ImGui::SetNextWindowSize(ImVec2(std::max(300.0f, work_size.x * 0.26f), std::max(420.0f, work_size.y * 0.72f)),
                                  ImGuiCond_FirstUseEver);
+        const int panel_colors = push_panel_accent(ImVec4(0.12f, 0.62f, 0.62f, 1.0f));
         if (ImGui::Begin("Hierarchy##urk-hierarchy", &show_hierarchy, ImGuiWindowFlags_NoCollapse)) {
             ImGui::TextColored(ImVec4(0.42f, 0.88f, 0.82f, 1.0f), "%zu objects", hierarchy->objects);
             ImGui::SameLine();
@@ -2929,6 +3014,7 @@ void render() {
             render_hierarchy(*hierarchy, snapshot->selected_instance_id);
         }
         ImGui::End();
+        ImGui::PopStyleColor(panel_colors);
     }
 
     if (show_inspector) {
@@ -2943,11 +3029,13 @@ void render() {
         const std::string title = snapshot->inspector.valid
                                       ? "Inspector - " + snapshot->inspector.name + "###urk-inspector"
                                       : "Inspector###urk-inspector";
+        const int panel_colors = push_panel_accent(ImVec4(0.12f, 0.43f, 0.82f, 1.0f));
         if (ImGui::Begin(title.c_str(), &show_inspector, ImGuiWindowFlags_NoCollapse)) {
             render_inspector(*snapshot);
             inspector_window_size = ImGui::GetWindowSize();
         }
         ImGui::End();
+        ImGui::PopStyleColor(panel_colors);
     }
 
     if (show_object_inspector) {
@@ -2957,18 +3045,22 @@ void render() {
         const std::string title = snapshot->object_inspector.valid
                                       ? "Object Inspector - " + snapshot->object_inspector.type_name + "###urk-object"
                                       : "Object Inspector###urk-object";
+        const int panel_colors = push_panel_accent(ImVec4(0.55f, 0.28f, 0.82f, 1.0f));
         if (ImGui::Begin(title.c_str(), &show_object_inspector, ImGuiWindowFlags_NoCollapse))
             render_object_inspector(*snapshot);
         ImGui::End();
+        ImGui::PopStyleColor(panel_colors);
     }
 
     if (show_class_browser) {
         ImGui::SetNextWindowPos(ImVec2(work_pos.x + work_size.x * 0.20f, work_pos.y + 150.0f), ImGuiCond_FirstUseEver);
         ImGui::SetNextWindowSize(ImVec2(std::max(520.0f, work_size.x * 0.42f), std::max(520.0f, work_size.y * 0.74f)),
                                  ImGuiCond_FirstUseEver);
+        const int panel_colors = push_panel_accent(ImVec4(0.72f, 0.48f, 0.18f, 1.0f));
         if (ImGui::Begin("Class Browser###urk-class-browser", &show_class_browser, ImGuiWindowFlags_NoCollapse))
             render_class_browser(*snapshot);
         ImGui::End();
+        ImGui::PopStyleColor(panel_colors);
     }
 
     if (show_method_traces) {
@@ -2976,9 +3068,11 @@ void render() {
         ImGui::SetNextWindowSize(ImVec2(std::max(680.0f, work_size.x * 0.58f), std::max(420.0f, work_size.y * 0.62f)),
                                  ImGuiCond_FirstUseEver);
         const std::string title = "Method Traces (" + std::to_string(snapshot->method_traces.size()) + ")###urk-method-traces";
+        const int panel_colors = push_panel_accent(ImVec4(0.86f, 0.46f, 0.20f, 1.0f));
         if (ImGui::Begin(title.c_str(), &show_method_traces, ImGuiWindowFlags_NoCollapse))
             render_method_traces(*snapshot);
         ImGui::End();
+        ImGui::PopStyleColor(panel_colors);
     }
 
     if (show_field_watches) {
@@ -2987,9 +3081,11 @@ void render() {
                                  ImGuiCond_FirstUseEver);
         const std::string title =
             "Field Watches (" + std::to_string(snapshot->field_watches.size()) + ")###urk-field-watches";
+        const int panel_colors = push_panel_accent(ImVec4(0.24f, 0.68f, 0.46f, 1.0f));
         if (ImGui::Begin(title.c_str(), &show_field_watches, ImGuiWindowFlags_NoCollapse))
             render_field_watches(*snapshot);
         ImGui::End();
+        ImGui::PopStyleColor(panel_colors);
     }
 
     if (show_diagnostics) {
@@ -2997,6 +3093,7 @@ void render() {
         ImGui::SetNextWindowSize(ImVec2(std::min(760.0f, work_size.x - 60.0f), 230.0f), ImGuiCond_FirstUseEver);
         const std::string title =
             "Activity Log (" + std::to_string(snapshot->diagnostics.size()) + ")###urk-diagnostics";
+        const int panel_colors = push_panel_accent(ImVec4(0.72f, 0.26f, 0.22f, 1.0f));
         if (ImGui::Begin(title.c_str(), &show_diagnostics)) {
             ImGui::TextDisabled("Latest activity");
             ImGui::TextWrapped("%s", snapshot->status.empty() ? "Ready" : snapshot->status.c_str());
@@ -3010,9 +3107,10 @@ void render() {
             render_diagnostics(*snapshot);
         }
         ImGui::End();
+        ImGui::PopStyleColor(panel_colors);
     }
 
-    ImGui::PopStyleVar(8);
+    ImGui::PopStyleVar(11);
     ImGui::PopStyleColor(pushed_colors);
 }
 

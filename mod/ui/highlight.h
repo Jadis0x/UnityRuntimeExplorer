@@ -73,6 +73,7 @@ enum class DebugState : std::uint8_t {
     Indicator,
     Offscreen,
     TooClose,
+    TooFar,
     InvalidRect,
     MissingTransform,
     DeadTransform,
@@ -102,6 +103,8 @@ struct Style {
     float indicator_center_gap = 16.0f;
     float indicator_center_dot_radius = 4.0f;
     float hide_within_distance = 0.0f;
+    // Zero disables the maximum-distance filter.
+    float max_distance = 0.0f;
     float reference_distance = 12.0f;
     float min_scale = 0.48f;
     float max_scale = 1.18f;
@@ -671,6 +674,13 @@ private:
 
         const ProjectionResult& projection = entry.last_projection;
 
+        if (entry.style.max_distance > 0.0f &&
+            projection.distance > entry.style.max_distance) {
+            note_state(entry, DebugState::TooFar, &projection,
+                "target is beyond the configured maximum highlight distance");
+            return ResolveState::Skipped;
+        }
+
         if (projection.on_screen &&
             entry.style.hide_within_distance > 0.0f &&
             projection.distance > 0.0f &&
@@ -1071,6 +1081,7 @@ private:
         case DebugState::Indicator: return "indicator";
         case DebugState::Offscreen: return "offscreen";
         case DebugState::TooClose: return "too_close";
+        case DebugState::TooFar: return "too_far";
         case DebugState::InvalidRect: return "invalid_rect";
         case DebugState::MissingTransform: return "missing_transform";
         case DebugState::DeadTransform: return "dead_transform";

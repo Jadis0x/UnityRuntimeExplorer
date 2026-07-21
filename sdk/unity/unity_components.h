@@ -59,6 +59,8 @@ struct Transform : Component {
     void set_position(Vector3 v) const { SetProperty("position", v); }
     Vector3 localPosition() const { return GetProperty<Vector3>("localPosition"); }
     void set_localPosition(Vector3 v) const { SetProperty("localPosition", v); }
+    Quaternion localRotation() const { return GetProperty<Quaternion>("localRotation"); }
+    void set_localRotation(Quaternion q) const { SetProperty("localRotation", q); }
     Vector3 eulerAngles() const { return GetProperty<Vector3>("eulerAngles"); }
     void set_eulerAngles(Vector3 v) const { SetProperty("eulerAngles", v); }
     Quaternion rotation() const { return GetProperty<Quaternion>("rotation"); }
@@ -68,6 +70,7 @@ struct Transform : Component {
     Vector3 forward() const { return GetProperty<Vector3>("forward"); }
     Vector3 right() const { return GetProperty<Vector3>("right"); }
     Vector3 up() const { return GetProperty<Vector3>("up"); }
+    void LookAt(Vector3 worldPosition) const { CallExact<void>("LookAt", {"UnityEngine.Vector3"}, worldPosition); }
     Vector3 lossyScale() const { return GetProperty<Vector3>("lossyScale"); }
     Transform parent() const { return GetProperty<Transform>("parent"); }
     void set_parent(Transform value) const { SetProperty("parent", value); }
