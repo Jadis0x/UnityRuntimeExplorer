@@ -752,8 +752,6 @@ namespace Explorer {
 		active_scene_name_hint_.clear();
 		logged_hierarchy_signature_.clear();
 
-		rooted_hierarchy_candidates_ = {};
-
 		publish();
 	}
 
@@ -1478,7 +1476,6 @@ namespace Explorer {
 				clear_selection();
 		}
 
-		rooted_hierarchy_candidates_ = std::move(state.candidates); // GC root devam ediyor
 		hierarchy_census_.reset();
 		return true;
 	}
@@ -3393,8 +3390,10 @@ namespace Explorer {
 			return candidate;
 			};
 
-		for (const GameObject& candidate :
-			rooted_hierarchy_candidates_) {
+		// Do not retain the complete FindObjectsOfTypeAll result after a census.
+		// Pin only the clicked object and release this temporary managed array.
+		const auto candidates = Object::FindObjectsOfTypeAllRooted<GameObject>();
+		for (const GameObject& candidate : candidates) {
 
 			if (candidate_instance_id(candidate) == instance_id)
 				return root_candidate(candidate);
@@ -3895,8 +3894,6 @@ namespace Explorer {
 		working_.field_watches.clear();
 		working_.locked_member_keys.clear();
 		working_.class_browser_instances.clear();
-
-		rooted_hierarchy_candidates_ = {};
 
 		// HierarchyInfo and its strings are native snapshot data and remain safe
 		// to render. Keeping them avoids a blank workspace while the next census

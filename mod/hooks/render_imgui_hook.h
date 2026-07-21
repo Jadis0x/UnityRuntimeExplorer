@@ -779,6 +779,16 @@ namespace ModRenderHook {
 
 	inline void queue_input_event(const InputEvent& event) {
 		std::lock_guard lock(g_input_mutex);
+		// A stalled or replaced Present chain must never turn queued Win32 input
+		// into unbounded process memory. The next successful frame resynchronizes
+		// ImGui from the current physical mouse state.
+		if (g_input_events.size() >= 512) {
+			g_input_events.clear();
+			InputEvent reset{};
+			reset.kind = InputEventKind::release_all_input;
+			reset.hwnd = event.hwnd;
+			g_input_events.push_back(reset);
+		}
 		if (event.kind == InputEventKind::mouse_position && !g_input_events.empty() &&
 			g_input_events.back().kind == InputEventKind::mouse_position) {
 			g_input_events.back() = event;
@@ -824,6 +834,29 @@ namespace ModRenderHook {
 		if (release_capture && GetCapture() == hwnd)
 			ReleaseCapture();
 		queue_release_all_mouse(hwnd);
+	}
+
+	inline void poll_window_mouse_state(HWND hwnd) {
+		if (!hwnd || !IsWindow(hwnd) || GetForegroundWindow() != hwnd ||
+			!g_menu_visible.load(std::memory_order_acquire))
+			return;
+
+		POINT position{};
+		if (GetCursorPos(&position) && ScreenToClient(hwnd, &position)) {
+			g_virtual_mouse_position = position;
+			g_virtual_mouse_position_valid = true;
+			queue_mouse_position(hwnd, position.x, position.y);
+		}
+
+		static constexpr int virtual_keys[5] = {
+			VK_LBUTTON, VK_RBUTTON, VK_MBUTTON, VK_XBUTTON1, VK_XBUTTON2};
+		for (int button = 0; button < 5; ++button) {
+			const bool down = (GetAsyncKeyState(virtual_keys[button]) & 0x8000) != 0;
+			if (g_wndproc_mouse_down[button] == down)
+				continue;
+			g_wndproc_mouse_down[button] = down;
+			queue_mouse_button(hwnd, button, down);
+		}
 	}
 
 	inline void apply_window_input_transition(HWND hwnd, WNDPROC old_wndproc, bool open) {
@@ -913,6 +946,7 @@ namespace ModRenderHook {
 	}
 
 	inline void drain_input_events() {
+		poll_window_mouse_state(g_hwnd);
 		std::deque<InputEvent> events;
 		{
 			std::lock_guard lock(g_input_mutex);

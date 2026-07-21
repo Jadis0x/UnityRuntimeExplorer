@@ -2876,7 +2876,7 @@ void render() {
 
     ImGui::SetNextWindowPos(ImVec2(work_pos.x + 12.0f, work_pos.y + 12.0f), ImGuiCond_FirstUseEver);
     ImGui::SetNextWindowSize(ImVec2(std::min(900.0f, work_size.x - 24.0f), 96.0f), ImGuiCond_FirstUseEver);
-    if (ImGui::Begin("URK Explorer Workspace", nullptr, ImGuiWindowFlags_NoCollapse)) {
+    if (ImGui::Begin("URK Explorer Workspace", &ModConfig::show_menu, ImGuiWindowFlags_NoCollapse)) {
         ImGui::TextColored(ImVec4(0.46f, 0.74f, 0.96f, 1.0f), "%s", ModConfig::display_name);
         ImGui::SameLine();
         ImGui::TextDisabled("IL2CPP Runtime Explorer  |  %s  |  v%s", ModConfig::author, ModConfig::version);

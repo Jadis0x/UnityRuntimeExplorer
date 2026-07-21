@@ -8,7 +8,7 @@ extern "C" {
 
 #define URK_SDK_VERSION 28
 #define URK_MONO_API_VERSION 7
-#define URK_RUNTIME_API_VERSION 7
+#define URK_RUNTIME_API_VERSION 8
 #define URK_IL2CPP_API_VERSION 6
 #define URK_NETWORK_API_VERSION 1
 
@@ -193,9 +193,12 @@ typedef struct URK_RuntimeApi {
     int (*scene_current)(URK_SceneInfo *scene);
     /*
      * Acquires or releases one cursor-ownership reference for a native menu.
-     * While any reference is active, the loader exposes and unlocks the cursor
-     * and suppresses Unity mouse-button polling. The last release restores the
-     * previous state. Returns zero without changing state when unavailable.
+     * References are isolated by the calling native module, so an unmatched
+     * release cannot affect another mod. Any leases left by an unloading mod
+     * are released automatically. While any reference is active, the loader
+     * exposes and unlocks the cursor and suppresses Unity mouse-button polling.
+     * The last release restores the previous state. Returns zero without
+     * changing state when unavailable.
      */
     int (*menu_cursor_set_open)(int open);
     /*
@@ -232,6 +235,12 @@ typedef struct URK_RuntimeApi {
     int (*window_message_register)(void *window, URK_WindowMessageCallback callback);
     int (*window_message_unregister)(void *window, URK_WindowMessageCallback callback);
     intptr_t (*window_message_call_original)(void *window, uint32_t message, uintptr_t wparam, intptr_t lparam);
+    /*
+     * Owner-explicit cursor lease entry. owner_address must point inside the
+     * calling mod image. This v8 entry avoids return-address inference under
+     * aggressive tail-call optimization.
+     */
+    int (*menu_cursor_set_open_owned)(const void *owner_address, int open);
 } URK_RuntimeApi;
 
 typedef struct URK_Il2CppManagedMethodDesc {
@@ -584,6 +593,9 @@ static_assert(offsetof(URK_RuntimeApi, window_message_register) > offsetof(URK_R
 static_assert(offsetof(URK_RuntimeApi, window_message_call_original) >
                   offsetof(URK_RuntimeApi, window_message_unregister),
               "URK_RuntimeApi window message helper order changed unexpectedly.");
+static_assert(offsetof(URK_RuntimeApi, menu_cursor_set_open_owned) >
+                  offsetof(URK_RuntimeApi, window_message_call_original),
+              "URK_RuntimeApi owner-explicit cursor helper must stay appended.");
 static_assert(offsetof(URK_ObjectDestroyRequest, typeName) > offsetof(URK_ObjectDestroyRequest, name),
               "URK_ObjectDestroyRequest fields must remain append-only.");
 static_assert(offsetof(URK_Il2CppApi, size) > offsetof(URK_Il2CppApi, version),
