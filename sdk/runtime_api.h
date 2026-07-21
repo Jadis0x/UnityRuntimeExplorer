@@ -19,6 +19,7 @@ using NetworkRequest = ::URK_NetworkRequest;
 using NetworkResponse = ::URK_NetworkResponse;
 using NetworkResultFlags = ::URK_NetworkResultFlags;
 using RuntimeApi = ::URK_RuntimeApi;
+using WindowMessageCallback = ::URK_WindowMessageCallback;
 using RuntimeBackend = ::URK_RuntimeBackend;
 using RuntimeCapabilityFlags = ::URK_RuntimeCapabilityFlags;
 using RuntimeModuleKind = ::URK_RuntimeModuleKind;
@@ -169,6 +170,31 @@ inline bool steam_id64(char *output, std::size_t output_size) {
                                sizeof(ctx->runtime->steam_id64)) &&
          ctx->runtime->steam_id64 &&
          ctx->runtime->steam_id64(output, output_size) != 0;
+}
+inline bool window_message_dispatch_available() {
+  const auto *ctx = context();
+  return runtime_api_has_field(offsetof(RuntimeApi, window_message_call_original) +
+                               sizeof(ctx->runtime->window_message_call_original)) &&
+         ctx->runtime->window_message_register &&
+         ctx->runtime->window_message_unregister &&
+         ctx->runtime->window_message_call_original;
+}
+inline bool window_message_register(void *window, WindowMessageCallback callback) {
+  const auto *ctx = context();
+  return window_message_dispatch_available() && window && callback &&
+         ctx->runtime->window_message_register(window, callback) != 0;
+}
+inline bool window_message_unregister(void *window, WindowMessageCallback callback) {
+  const auto *ctx = context();
+  return window_message_dispatch_available() && window && callback &&
+         ctx->runtime->window_message_unregister(window, callback) != 0;
+}
+inline std::intptr_t window_message_call_original(void *window, std::uint32_t message,
+                                                  std::uintptr_t wparam, std::intptr_t lparam) {
+  const auto *ctx = context();
+  return window_message_dispatch_available()
+             ? ctx->runtime->window_message_call_original(window, message, wparam, lparam)
+             : 0;
 }
 inline bool current_scene(SceneInfo *scene) {
   if (!scene)

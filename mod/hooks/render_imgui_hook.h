@@ -112,6 +112,9 @@ namespace ModRenderHook {
 	inline WglSwapBuffersFn g_wgl_swap_buffers = nullptr;
 	inline HWND g_hwnd = nullptr;
 	inline WNDPROC g_old_wndproc = nullptr;
+	inline bool g_window_message_registered = false;
+	inline thread_local bool g_broker_callback_active = false;
+	inline thread_local bool g_broker_callback_handled = false;
 	inline ID3D11Device* g_device = nullptr;
 	inline ID3D11DeviceContext* g_context = nullptr;
 	inline ID3D11RenderTargetView* g_render_target = nullptr;
@@ -210,6 +213,9 @@ namespace ModRenderHook {
 	};
 
 	inline LRESULT CALLBACK wndproc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam);
+	inline std::intptr_t window_message_callback(void* window, std::uint32_t message,
+	                                             std::uintptr_t wparam, std::intptr_t lparam,
+	                                             int* handled);
 	inline void install_on_main_thread();
 
 	inline void log(const char* text) {
@@ -568,13 +574,47 @@ namespace ModRenderHook {
 		g_dx12_format = DXGI_FORMAT_UNKNOWN;
 	}
 
+	inline bool install_window_message_handler() {
+		if (!g_hwnd) return false;
+		if (URK::window_message_dispatch_available()) {
+			if (!URK::window_message_register(g_hwnd, &window_message_callback))
+				return false;
+			g_window_message_registered = true;
+			g_old_wndproc = nullptr;
+			return true;
+		}
+		SetLastError(ERROR_SUCCESS);
+		const LONG_PTR previous = SetWindowLongPtr(
+			g_hwnd, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(&wndproc));
+		if (!previous && GetLastError() != ERROR_SUCCESS)
+			return false;
+		g_old_wndproc = reinterpret_cast<WNDPROC>(previous);
+		return true;
+	}
+
 	inline void restore_wndproc() {
-		if (!g_hwnd || !g_old_wndproc) return;
+		if (!g_hwnd) return;
+		if (g_window_message_registered) {
+			if (!URK::window_message_unregister(g_hwnd, &window_message_callback))
+				log("Loader window-message callback unregister failed.");
+			g_window_message_registered = false;
+			return;
+		}
+		if (!g_old_wndproc) return;
 		const LONG_PTR current = GetWindowLongPtr(g_hwnd, GWLP_WNDPROC);
 		if (current == reinterpret_cast<LONG_PTR>(&wndproc)) {
 			SetWindowLongPtr(g_hwnd, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(g_old_wndproc));
 		}
 		g_old_wndproc = nullptr;
+	}
+
+	inline LRESULT call_previous_window_proc(HWND hwnd, WNDPROC old_wndproc,
+	                                         UINT message, WPARAM wparam, LPARAM lparam) {
+		if (g_window_message_registered)
+			return static_cast<LRESULT>(URK::window_message_call_original(
+				hwnd, message, wparam, lparam));
+		return old_wndproc ? CallWindowProc(old_wndproc, hwnd, message, wparam, lparam)
+		                   : DefWindowProc(hwnd, message, wparam, lparam);
 	}
 
 	inline bool create_render_target(IDXGISwapChain* swap_chain) {
@@ -799,9 +839,9 @@ namespace ModRenderHook {
 				// that one-shot path instead of fabricating per-key transitions, which
 				// does not reset the IL2CPP Input System's raw keyboard state.
 				clear_game_input();
-				if (old_wndproc && GetFocus() == hwnd) {
-					CallWindowProc(old_wndproc, hwnd, WM_CANCELMODE, 0, 0);
-					CallWindowProc(old_wndproc, hwnd, WM_KILLFOCUS, 0, 0);
+			if ((old_wndproc || g_window_message_registered) && GetFocus() == hwnd) {
+				call_previous_window_proc(hwnd, old_wndproc, WM_CANCELMODE, 0, 0);
+				call_previous_window_proc(hwnd, old_wndproc, WM_KILLFOCUS, 0, 0);
 					g_game_focus_suspended = true;
 				}
 			}
@@ -813,8 +853,8 @@ namespace ModRenderHook {
 					g_menu_released_keyboard[key] = true;
 					game.down = false;
 					const UINT message = game.system ? WM_SYSKEYUP : WM_KEYUP;
-					CallWindowProc(old_wndproc, hwnd, message, static_cast<WPARAM>(key),
-						keyboard_transition_lparam(game.lparam, false));
+				call_previous_window_proc(hwnd, old_wndproc, message, static_cast<WPARAM>(key),
+				                          keyboard_transition_lparam(game.lparam, false));
 				}
 
 				g_menu_released_mouse.fill(false);
@@ -824,8 +864,8 @@ namespace ModRenderHook {
 					g_menu_released_mouse[button] = true;
 					const LPARAM position = game.lparam;
 					game.down = false;
-					CallWindowProc(old_wndproc, hwnd, mouse_button_message(button, false),
-						mouse_transition_wparam(button, g_game_mouse), position);
+				call_previous_window_proc(hwnd, old_wndproc, mouse_button_message(button, false),
+				                          mouse_transition_wparam(button, g_game_mouse), position);
 				}
 			}
 		}
@@ -834,8 +874,8 @@ namespace ModRenderHook {
 				// Do not synthesize key or mouse presses while restoring game focus.
 				// Unity resumes from its cleared state and accepts only real input.
 				clear_game_input();
-				if (g_game_focus_suspended && old_wndproc && GetFocus() == hwnd)
-					CallWindowProc(old_wndproc, hwnd, WM_SETFOCUS, 0, 0);
+			if (g_game_focus_suspended && (old_wndproc || g_window_message_registered) && GetFocus() == hwnd)
+				call_previous_window_proc(hwnd, old_wndproc, WM_SETFOCUS, 0, 0);
 				g_game_focus_suspended = false;
 			}
 			else {
@@ -845,8 +885,8 @@ namespace ModRenderHook {
 					if (physical.down) {
 						g_game_keyboard[key] = physical;
 						const UINT message = physical.system ? WM_SYSKEYDOWN : WM_KEYDOWN;
-						CallWindowProc(old_wndproc, hwnd, message, static_cast<WPARAM>(key),
-							keyboard_transition_lparam(physical.lparam, true));
+					call_previous_window_proc(hwnd, old_wndproc, message, static_cast<WPARAM>(key),
+					                          keyboard_transition_lparam(physical.lparam, true));
 					}
 					g_menu_released_keyboard[key] = false;
 				}
@@ -856,8 +896,8 @@ namespace ModRenderHook {
 					const MouseButtonState& physical = g_physical_mouse[button];
 					if (physical.down) {
 						g_game_mouse[button] = physical;
-						CallWindowProc(old_wndproc, hwnd, mouse_button_message(button, true),
-							mouse_transition_wparam(button, g_game_mouse), physical.lparam);
+					call_previous_window_proc(hwnd, old_wndproc, mouse_button_message(button, true),
+					                          mouse_transition_wparam(button, g_game_mouse), physical.lparam);
 					}
 					g_menu_released_mouse[button] = false;
 				}
@@ -1136,12 +1176,12 @@ namespace ModRenderHook {
 	}
 
 	inline void relay_input_to_previous(HWND hwnd, WNDPROC old_wndproc,
-		const InputRelay& input) {
-		if (!old_wndproc) return;
+	                                  const InputRelay& input) {
+		if (!old_wndproc && !g_window_message_registered) return;
 		const UINT relay_message = input_relay_message();
 		if (!relay_message) return;
-		CallWindowProc(old_wndproc, hwnd, relay_message, 0,
-			reinterpret_cast<LPARAM>(&input));
+		call_previous_window_proc(hwnd, old_wndproc, relay_message, 0,
+		                          reinterpret_cast<LPARAM>(&input));
 	}
 
 	inline bool queue_raw_mouse_input(HWND hwnd, LPARAM lparam) {
@@ -1224,6 +1264,8 @@ namespace ModRenderHook {
 	}
 
 	inline LRESULT CALLBACK wndproc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam) {
+		if (g_broker_callback_active)
+			g_broker_callback_handled = false;
 		WNDPROC old_wndproc = g_old_wndproc;
 		InputRelay relayed_input{};
 		const UINT relay_message = input_relay_message();
@@ -1232,6 +1274,7 @@ namespace ModRenderHook {
 			const auto* input = reinterpret_cast<const InputRelay*>(lparam);
 			if (!readable_range(input, sizeof(*input))) {
 				log("Received an invalid ImGui input relay payload.");
+				g_broker_callback_handled = true;
 				return FALSE;
 			}
 			relayed_input = *input;
@@ -1246,6 +1289,7 @@ namespace ModRenderHook {
 
 		const UINT cursor_message = menu_cursor_message();
 		if (cursor_message && message == cursor_message) {
+			g_broker_callback_handled = true;
 			const bool open = wparam != 0;
 			if (set_native_cursor_open(hwnd, open)) {
 				g_native_cursor_applied.store(open ? 1 : 0, std::memory_order_release);
@@ -1260,6 +1304,7 @@ namespace ModRenderHook {
 		const UINT input_message = menu_input_message();
 		if (input_message && message == input_message) {
 			apply_window_input_transition(hwnd, old_wndproc, wparam != 0);
+			g_broker_callback_handled = true;
 			return TRUE;
 		}
 
@@ -1369,12 +1414,24 @@ namespace ModRenderHook {
 		if (relayed || consumed) {
 			const InputRelay input{ message, wparam, lparam };
 			relay_input_to_previous(hwnd, old_wndproc, input);
+			g_broker_callback_handled = true;
 			return TRUE;
 		}
 
 		track_game_input(message, wparam, lparam);
-		return old_wndproc ? CallWindowProc(old_wndproc, hwnd, message, wparam, lparam)
-			: DefWindowProc(hwnd, message, wparam, lparam);
+		if (g_broker_callback_active)
+			return FALSE;
+		return call_previous_window_proc(hwnd, old_wndproc, message, wparam, lparam);
+	}
+
+	inline std::intptr_t window_message_callback(void* window, std::uint32_t message,
+	                                             std::uintptr_t wparam, std::intptr_t lparam,
+	                                             int* handled) {
+		g_broker_callback_active = true;
+		const LRESULT result = wndproc(static_cast<HWND>(window), message, wparam, lparam);
+		g_broker_callback_active = false;
+		if (handled) *handled = g_broker_callback_handled ? 1 : 0;
+		return static_cast<std::intptr_t>(result);
 	}
 
 	inline bool init_dx11_imgui(IDXGISwapChain* swap_chain) {
@@ -1440,10 +1497,8 @@ namespace ModRenderHook {
 			return false;
 		}
 
-		SetLastError(ERROR_SUCCESS);
-		const LONG_PTR previous = SetWindowLongPtr(g_hwnd, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(&wndproc));
-		if (!previous && GetLastError() != ERROR_SUCCESS) {
-			log("WndProc replacement failed; UI disabled.");
+		if (!install_window_message_handler()) {
+			log("Window-message handler installation failed; UI disabled.");
 			ImGui_ImplDX11_Shutdown();
 			ImGui_ImplWin32_Shutdown();
 			ImGui::DestroyContext();
@@ -1452,7 +1507,6 @@ namespace ModRenderHook {
 			return false;
 		}
 
-		g_old_wndproc = reinterpret_cast<WNDPROC>(previous);
 		swap_chain->AddRef();
 		g_active_swap_chain = swap_chain;
 		g_backend = GraphicsBackend::dx11;
@@ -1578,15 +1632,12 @@ namespace ModRenderHook {
 			release_dx12_objects();
 			return false;
 		}
-		SetLastError(ERROR_SUCCESS);
-		const LONG_PTR previous = SetWindowLongPtr(g_hwnd, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(&wndproc));
-		if (!previous && GetLastError() != ERROR_SUCCESS) {
-			log("WndProc replacement failed; UI disabled.");
+		if (!install_window_message_handler()) {
+			log("Window-message handler installation failed; UI disabled.");
 			ImGui_ImplDX12_Shutdown(); ImGui_ImplWin32_Shutdown(); ImGui::DestroyContext();
 			release_dx12_objects(); g_hwnd = nullptr;
 			return false;
 		}
-		g_old_wndproc = reinterpret_cast<WNDPROC>(previous);
 		swap_chain->AddRef();
 		g_active_swap_chain = swap_chain;
 		g_backend = GraphicsBackend::dx12;
@@ -1810,14 +1861,11 @@ namespace ModRenderHook {
 			ImGui_ImplWin32_Shutdown(); ImGui::DestroyContext(); g_hwnd = nullptr;
 			return false;
 		}
-		SetLastError(ERROR_SUCCESS);
-		const LONG_PTR previous = SetWindowLongPtr(g_hwnd, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(&wndproc));
-		if (!previous && GetLastError() != ERROR_SUCCESS) {
-			log("WndProc replacement failed; UI disabled.");
+		if (!install_window_message_handler()) {
+			log("Window-message handler installation failed; UI disabled.");
 			ImGui_ImplOpenGL3_Shutdown(); ImGui_ImplWin32_Shutdown(); ImGui::DestroyContext(); g_hwnd = nullptr;
 			return false;
 		}
-		g_old_wndproc = reinterpret_cast<WNDPROC>(previous);
 		g_backend = GraphicsBackend::opengl;
 		g_imgui_ready = true;
 		sync_menu_state();

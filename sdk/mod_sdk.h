@@ -8,7 +8,7 @@ extern "C" {
 
 #define URK_SDK_VERSION 28
 #define URK_MONO_API_VERSION 7
-#define URK_RUNTIME_API_VERSION 6
+#define URK_RUNTIME_API_VERSION 7
 #define URK_IL2CPP_API_VERSION 6
 #define URK_NETWORK_API_VERSION 1
 
@@ -172,6 +172,14 @@ typedef struct URK_ObjectDestroyRequest {
 
 typedef void (*URK_OnObjectDestroyRequestedFn)(const URK_ObjectDestroyRequest *request);
 
+/*
+ * Receives a native window message through the loader-owned dispatcher. Set
+ * handled to non-zero to keep the message away from the game's original
+ * window procedure. The return value becomes the dispatch result when handled.
+ */
+typedef intptr_t (*URK_WindowMessageCallback)(void *window, uint32_t message, uintptr_t wparam, intptr_t lparam,
+                                              int *handled);
+
 typedef struct URK_RuntimeApi {
     int version;
     uint32_t size;
@@ -215,6 +223,15 @@ typedef struct URK_RuntimeApi {
      * empty string when Steam is unavailable or not initialized yet.
      */
     int (*steam_id64)(char *output, size_t output_size);
+    /*
+     * Registers a module-owned callback without replacing GWLP_WNDPROC in the
+     * mod itself. Multiple mods may register for the same window. The loader
+     * removes any remaining callbacks before their owning module is unloaded.
+     * These append-only v7 entries must be size-checked before use.
+     */
+    int (*window_message_register)(void *window, URK_WindowMessageCallback callback);
+    int (*window_message_unregister)(void *window, URK_WindowMessageCallback callback);
+    intptr_t (*window_message_call_original)(void *window, uint32_t message, uintptr_t wparam, intptr_t lparam);
 } URK_RuntimeApi;
 
 typedef struct URK_Il2CppManagedMethodDesc {
@@ -562,6 +579,11 @@ static_assert(offsetof(URK_RuntimeApi, graphics_device_type) > offsetof(URK_Runt
               "URK_RuntimeApi graphics device helper must stay appended.");
 static_assert(offsetof(URK_RuntimeApi, steam_id64) > offsetof(URK_RuntimeApi, graphics_device_type),
               "URK_RuntimeApi Steam identity helper must stay appended.");
+static_assert(offsetof(URK_RuntimeApi, window_message_register) > offsetof(URK_RuntimeApi, steam_id64),
+              "URK_RuntimeApi window message helpers must stay appended.");
+static_assert(offsetof(URK_RuntimeApi, window_message_call_original) >
+                  offsetof(URK_RuntimeApi, window_message_unregister),
+              "URK_RuntimeApi window message helper order changed unexpectedly.");
 static_assert(offsetof(URK_ObjectDestroyRequest, typeName) > offsetof(URK_ObjectDestroyRequest, name),
               "URK_ObjectDestroyRequest fields must remain append-only.");
 static_assert(offsetof(URK_Il2CppApi, size) > offsetof(URK_Il2CppApi, version),
