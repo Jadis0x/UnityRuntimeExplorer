@@ -2796,34 +2796,33 @@ void render_class_browser(const Snapshot &snapshot) {
 
 int push_explorer_theme(float opacity) {
     const auto color = [opacity](float r, float g, float b, float alpha) { return ImVec4(r, g, b, alpha * opacity); };
-    // Use a blue/graphite palette so surfaces, controls and selection states
-    // have distinct levels instead of collapsing into one gray block.
-    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.88f, 0.93f, 0.96f, 1.0f));
-    ImGui::PushStyleColor(ImGuiCol_WindowBg, color(0.055f, 0.075f, 0.095f, 0.98f));
-    ImGui::PushStyleColor(ImGuiCol_ChildBg, color(0.070f, 0.095f, 0.120f, 0.96f));
-    ImGui::PushStyleColor(ImGuiCol_PopupBg, color(0.085f, 0.115f, 0.145f, 0.99f));
-    ImGui::PushStyleColor(ImGuiCol_Border, color(0.17f, 0.29f, 0.35f, 0.80f));
+
+    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.93f, 0.96f, 0.99f, 1.0f));
+    ImGui::PushStyleColor(ImGuiCol_WindowBg, color(0.030f, 0.045f, 0.065f, 0.99f));
+    ImGui::PushStyleColor(ImGuiCol_ChildBg, color(0.045f, 0.065f, 0.090f, 0.99f));
+    ImGui::PushStyleColor(ImGuiCol_PopupBg, color(0.055f, 0.080f, 0.110f, 1.0f));
+    ImGui::PushStyleColor(ImGuiCol_Border, color(0.25f, 0.38f, 0.50f, 0.96f));
     ImGui::PushStyleColor(ImGuiCol_BorderShadow, color(0.015f, 0.025f, 0.035f, 0.55f));
-    ImGui::PushStyleColor(ImGuiCol_TitleBg, color(0.035f, 0.055f, 0.075f, 1.0f));
-    ImGui::PushStyleColor(ImGuiCol_TitleBgActive, color(0.075f, 0.20f, 0.275f, 1.0f));
-    ImGui::PushStyleColor(ImGuiCol_FrameBg, color(0.115f, 0.155f, 0.195f, 1.0f));
-    ImGui::PushStyleColor(ImGuiCol_FrameBgHovered, color(0.17f, 0.245f, 0.285f, 1.0f));
-    ImGui::PushStyleColor(ImGuiCol_FrameBgActive, color(0.19f, 0.32f, 0.36f, 1.0f));
-    ImGui::PushStyleColor(ImGuiCol_Header, color(0.10f, 0.29f, 0.38f, 0.92f));
-    ImGui::PushStyleColor(ImGuiCol_HeaderHovered, color(0.15f, 0.40f, 0.49f, 1.0f));
-    ImGui::PushStyleColor(ImGuiCol_HeaderActive, color(0.18f, 0.47f, 0.54f, 1.0f));
-    ImGui::PushStyleColor(ImGuiCol_Button, color(0.10f, 0.20f, 0.265f, 1.0f));
-    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, color(0.16f, 0.35f, 0.43f, 1.0f));
-    ImGui::PushStyleColor(ImGuiCol_ButtonActive, color(0.12f, 0.42f, 0.50f, 1.0f));
-    ImGui::PushStyleColor(ImGuiCol_Separator, color(0.16f, 0.28f, 0.34f, 1.0f));
-    ImGui::PushStyleColor(ImGuiCol_SeparatorHovered, color(0.28f, 0.55f, 0.62f, 1.0f));
-    ImGui::PushStyleColor(ImGuiCol_SeparatorActive, color(0.34f, 0.68f, 0.72f, 1.0f));
-    ImGui::PushStyleColor(ImGuiCol_TableRowBg, color(0.070f, 0.105f, 0.135f, 0.72f));
-    ImGui::PushStyleColor(ImGuiCol_TableRowBgAlt, color(0.095f, 0.145f, 0.175f, 0.72f));
-    ImGui::PushStyleColor(ImGuiCol_TableHeaderBg, color(0.08f, 0.18f, 0.23f, 0.92f));
-    ImGui::PushStyleColor(ImGuiCol_TextDisabled, ImVec4(0.52f, 0.63f, 0.69f, 1.0f));
+    ImGui::PushStyleColor(ImGuiCol_TitleBg, color(0.020f, 0.035f, 0.055f, 1.0f));
+    ImGui::PushStyleColor(ImGuiCol_TitleBgActive, color(0.07f, 0.23f, 0.36f, 1.0f));
+    ImGui::PushStyleColor(ImGuiCol_FrameBg, color(0.075f, 0.105f, 0.145f, 1.0f));
+    ImGui::PushStyleColor(ImGuiCol_FrameBgHovered, color(0.14f, 0.23f, 0.32f, 1.0f));
+    ImGui::PushStyleColor(ImGuiCol_FrameBgActive, color(0.18f, 0.36f, 0.48f, 1.0f));
+    ImGui::PushStyleColor(ImGuiCol_Header, color(0.08f, 0.27f, 0.40f, 0.98f));
+    ImGui::PushStyleColor(ImGuiCol_HeaderHovered, color(0.15f, 0.43f, 0.60f, 1.0f));
+    ImGui::PushStyleColor(ImGuiCol_HeaderActive, color(0.20f, 0.56f, 0.72f, 1.0f));
+    ImGui::PushStyleColor(ImGuiCol_Button, color(0.07f, 0.17f, 0.26f, 1.0f));
+    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, color(0.14f, 0.35f, 0.52f, 1.0f));
+    ImGui::PushStyleColor(ImGuiCol_ButtonActive, color(0.18f, 0.48f, 0.66f, 1.0f));
+    ImGui::PushStyleColor(ImGuiCol_Separator, color(0.20f, 0.34f, 0.46f, 1.0f));
+    ImGui::PushStyleColor(ImGuiCol_SeparatorHovered, color(0.35f, 0.65f, 0.80f, 1.0f));
+    ImGui::PushStyleColor(ImGuiCol_SeparatorActive, color(0.45f, 0.80f, 0.92f, 1.0f));
+    ImGui::PushStyleColor(ImGuiCol_TableRowBg, color(0.040f, 0.065f, 0.095f, 0.94f));
+    ImGui::PushStyleColor(ImGuiCol_TableRowBgAlt, color(0.075f, 0.105f, 0.145f, 0.94f));
+    ImGui::PushStyleColor(ImGuiCol_TableHeaderBg, color(0.075f, 0.20f, 0.30f, 1.0f));
+    ImGui::PushStyleColor(ImGuiCol_TextDisabled, ImVec4(0.62f, 0.72f, 0.80f, 1.0f));
     ImGui::PushStyleColor(ImGuiCol_CheckMark, ImVec4(0.35f, 0.86f, 0.76f, 1.0f));
-    ImGui::PushStyleColor(ImGuiCol_TextSelectedBg, color(0.12f, 0.43f, 0.52f, 0.72f));
+    ImGui::PushStyleColor(ImGuiCol_TextSelectedBg, color(0.12f, 0.50f, 0.72f, 0.90f));
     ImGui::PushStyleColor(ImGuiCol_ScrollbarBg, color(0.035f, 0.060f, 0.080f, 0.80f));
     ImGui::PushStyleColor(ImGuiCol_ScrollbarGrab, color(0.25f, 0.40f, 0.46f, 0.95f));
     ImGui::PushStyleColor(ImGuiCol_ScrollbarGrabHovered, color(0.34f, 0.57f, 0.63f, 1.0f));
@@ -2843,10 +2842,30 @@ int push_explorer_theme(float opacity) {
 }
 
 int push_panel_accent(const ImVec4& accent) {
-    ImGui::PushStyleColor(ImGuiCol_TitleBg,
-                          ImVec4(accent.x * 0.28f, accent.y * 0.28f, accent.z * 0.28f, 1.0f));
+    const ImVec4 window_bg(0.025f + accent.x * 0.045f,
+                           0.035f + accent.y * 0.045f,
+                           0.055f + accent.z * 0.045f, 0.99f);
+    const ImVec4 child_bg(0.040f + accent.x * 0.035f,
+                          0.055f + accent.y * 0.035f,
+                          0.080f + accent.z * 0.035f, 0.99f);
+    const ImVec4 title_bg(accent.x * 0.18f, accent.y * 0.18f, accent.z * 0.18f, 1.0f);
+    ImGui::PushStyleColor(ImGuiCol_WindowBg, window_bg);
+    ImGui::PushStyleColor(ImGuiCol_ChildBg, child_bg);
+    ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(accent.x, accent.y, accent.z, 0.88f));
+    ImGui::PushStyleColor(ImGuiCol_Separator, ImVec4(accent.x, accent.y, accent.z, 0.70f));
+    ImGui::PushStyleColor(ImGuiCol_TitleBg, title_bg);
     ImGui::PushStyleColor(ImGuiCol_TitleBgActive, accent);
-    return 2;
+    return 6;
+}
+
+void draw_panel_accent_bar(const ImVec4& accent) {
+    ImDrawList* draw_list = ImGui::GetWindowDrawList();
+    if (!draw_list)
+        return;
+    const ImVec2 position = ImGui::GetWindowPos();
+    const ImVec2 size = ImGui::GetWindowSize();
+    draw_list->AddRectFilled(position, ImVec2(position.x + 4.0f, position.y + size.y),
+                              ImGui::GetColorU32(accent));
 }
 
 void render_diagnostics(const Snapshot &snapshot) {
@@ -2876,7 +2895,7 @@ void render() {
     const auto hierarchy = snapshot->hierarchy ? snapshot->hierarchy : empty_hierarchy;
     const ImVec2 work_pos = viewport ? viewport->WorkPos : ImVec2(20.0f, 20.0f);
     const ImVec2 work_size = viewport ? viewport->WorkSize : ImVec2(1280.0f, 760.0f);
-    static float opacity = 0.92f;
+    static float opacity = 0.98f;
     static float highlight_max_distance = 0.0f;
     static bool show_hierarchy = true;
     static bool show_inspector = true;
@@ -3008,6 +3027,7 @@ void render() {
                                  ImGuiCond_FirstUseEver);
         const int panel_colors = push_panel_accent(ImVec4(0.12f, 0.62f, 0.62f, 1.0f));
         if (ImGui::Begin("Hierarchy##urk-hierarchy", &show_hierarchy, ImGuiWindowFlags_NoCollapse)) {
+            draw_panel_accent_bar(ImVec4(0.12f, 0.62f, 0.62f, 1.0f));
             ImGui::TextColored(ImVec4(0.42f, 0.88f, 0.82f, 1.0f), "%zu objects", hierarchy->objects);
             ImGui::SameLine();
             ImGui::TextDisabled("in %zu roots", hierarchy->roots);
@@ -3031,6 +3051,7 @@ void render() {
                                       : "Inspector###urk-inspector";
         const int panel_colors = push_panel_accent(ImVec4(0.12f, 0.43f, 0.82f, 1.0f));
         if (ImGui::Begin(title.c_str(), &show_inspector, ImGuiWindowFlags_NoCollapse)) {
+            draw_panel_accent_bar(ImVec4(0.12f, 0.43f, 0.82f, 1.0f));
             render_inspector(*snapshot);
             inspector_window_size = ImGui::GetWindowSize();
         }
@@ -3046,8 +3067,10 @@ void render() {
                                       ? "Object Inspector - " + snapshot->object_inspector.type_name + "###urk-object"
                                       : "Object Inspector###urk-object";
         const int panel_colors = push_panel_accent(ImVec4(0.55f, 0.28f, 0.82f, 1.0f));
-        if (ImGui::Begin(title.c_str(), &show_object_inspector, ImGuiWindowFlags_NoCollapse))
+        if (ImGui::Begin(title.c_str(), &show_object_inspector, ImGuiWindowFlags_NoCollapse)) {
+            draw_panel_accent_bar(ImVec4(0.55f, 0.28f, 0.82f, 1.0f));
             render_object_inspector(*snapshot);
+        }
         ImGui::End();
         ImGui::PopStyleColor(panel_colors);
     }
@@ -3057,8 +3080,10 @@ void render() {
         ImGui::SetNextWindowSize(ImVec2(std::max(520.0f, work_size.x * 0.42f), std::max(520.0f, work_size.y * 0.74f)),
                                  ImGuiCond_FirstUseEver);
         const int panel_colors = push_panel_accent(ImVec4(0.72f, 0.48f, 0.18f, 1.0f));
-        if (ImGui::Begin("Class Browser###urk-class-browser", &show_class_browser, ImGuiWindowFlags_NoCollapse))
+        if (ImGui::Begin("Class Browser###urk-class-browser", &show_class_browser, ImGuiWindowFlags_NoCollapse)) {
+            draw_panel_accent_bar(ImVec4(0.72f, 0.48f, 0.18f, 1.0f));
             render_class_browser(*snapshot);
+        }
         ImGui::End();
         ImGui::PopStyleColor(panel_colors);
     }
@@ -3069,8 +3094,10 @@ void render() {
                                  ImGuiCond_FirstUseEver);
         const std::string title = "Method Traces (" + std::to_string(snapshot->method_traces.size()) + ")###urk-method-traces";
         const int panel_colors = push_panel_accent(ImVec4(0.86f, 0.46f, 0.20f, 1.0f));
-        if (ImGui::Begin(title.c_str(), &show_method_traces, ImGuiWindowFlags_NoCollapse))
+        if (ImGui::Begin(title.c_str(), &show_method_traces, ImGuiWindowFlags_NoCollapse)) {
+            draw_panel_accent_bar(ImVec4(0.86f, 0.46f, 0.20f, 1.0f));
             render_method_traces(*snapshot);
+        }
         ImGui::End();
         ImGui::PopStyleColor(panel_colors);
     }
@@ -3082,8 +3109,10 @@ void render() {
         const std::string title =
             "Field Watches (" + std::to_string(snapshot->field_watches.size()) + ")###urk-field-watches";
         const int panel_colors = push_panel_accent(ImVec4(0.24f, 0.68f, 0.46f, 1.0f));
-        if (ImGui::Begin(title.c_str(), &show_field_watches, ImGuiWindowFlags_NoCollapse))
+        if (ImGui::Begin(title.c_str(), &show_field_watches, ImGuiWindowFlags_NoCollapse)) {
+            draw_panel_accent_bar(ImVec4(0.24f, 0.68f, 0.46f, 1.0f));
             render_field_watches(*snapshot);
+        }
         ImGui::End();
         ImGui::PopStyleColor(panel_colors);
     }
@@ -3095,6 +3124,7 @@ void render() {
             "Activity Log (" + std::to_string(snapshot->diagnostics.size()) + ")###urk-diagnostics";
         const int panel_colors = push_panel_accent(ImVec4(0.72f, 0.26f, 0.22f, 1.0f));
         if (ImGui::Begin(title.c_str(), &show_diagnostics)) {
+            draw_panel_accent_bar(ImVec4(0.72f, 0.26f, 0.22f, 1.0f));
             ImGui::TextDisabled("Latest activity");
             ImGui::TextWrapped("%s", snapshot->status.empty() ? "Ready" : snapshot->status.c_str());
             ImGui::Separator();
