@@ -47,29 +47,42 @@ the available metadata instead of attempting an unsafe read, write, or call.
 
 - Windows 10 or later, 64-bit.
 - A Unity game built with IL2CPP.
-- [URKit v0.1.0 or later](https://github.com/Jadis0x/URKit) installed next to
-  the game executable.
-- A URKit proxy DLL that is compatible with the target game.
+- [URKit v0.1.1 or later](https://github.com/Jadis0x/URKit).
+- Either the normal URKit proxy workflow or the optional `URKitInjector.dll`
+  workflow.
 
-The proxy is important. A proxy that works with one game or Unity version may
-not work with another one. This project currently does not support Mono games.
+UnityRuntimeExplorer is a URKit loader plugin; it is not a standalone DLL and
+must not be injected directly into the game. A matching proxy is required only
+when using URKit's normal proxy/`Mods`-folder workflow. With `URKitInjector.dll`,
+URKit can load the plugin externally without a proxy or a `Mods` folder. This
+project currently supports IL2CPP games only.
 
 ## Installation
 
-First install URKit and make sure it loads correctly without this mod.
+Install URKit first. Choose one of the two supported loading workflows below.
 
-Then:
+Recommended `Mods`-folder workflow:
 
 1. Create a `Mods` folder next to the game's executable.
-2. Copy `URK_Il2cpp_UnityRuntimeExplorer.dll` into that folder.
-3. Start the game.
-4. Press **F7** to open or close the Explorer menu.
+2. Place exactly one matching URKit proxy next to the game's executable. The
+   proxy filename must be one that the game's executable imports; do not rename
+   it or place all proxy variants in the folder.
+3. Copy `URK_Il2cpp_UnityRuntimeExplorer.dll` into the game's `Mods` folder.
+4. Start the game through the normal URKit-supported launch path.
+5. Press **F7** to open or close the Explorer menu.
 
-If nothing appears, check `URKit_logs.log` next to the game executable. Recent
-URKit updates also support injecting/loading the plugin into the target game,
-so the Explorer no longer has to be installed only through the original
-`Mods`-folder workflow. It still requires URKit and a proxy that matches the
-target game.
+Optional proxy-free injector workflow:
+
+1. Inject `URKitInjector.dll` into the supported Windows x64 game.
+2. When prompted, select the URKit configuration `.ini` and
+   `URK_Il2cpp_UnityRuntimeExplorer.dll`.
+3. Do not inject `URK_Il2cpp_UnityRuntimeExplorer.dll` directly; it must be
+   loaded by URKitInjector as a URKit plugin.
+
+If nothing appears, check `URKit_logs.log` next to the game executable first.
+For the proxy workflow, verify the proxy filename and placement. For the
+injector workflow, verify the selected `.ini` and plugin DLL. The Explorer DLL
+alone cannot initialize itself in a Unity process.
 
 ## Building from source
 
