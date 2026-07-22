@@ -3677,7 +3677,7 @@ void render() {
             ImGui::TextDisabled("Measured from the active game camera.");
             ImGui::SeparatorText("Camera Focus");
             bool camera_focus_top_down = snapshot->camera_focus_top_down;
-            if (ImGui::Checkbox("Top-down view", &camera_focus_top_down)) {
+            if (ImGui::Checkbox("Force top-down view", &camera_focus_top_down)) {
                 Command command{.kind = CommandKind::SetCameraFocusTopDown};
                 command.bool_value = camera_focus_top_down;
                 RuntimeModel::instance().enqueue(std::move(command));
@@ -3702,8 +3702,8 @@ void render() {
                 }
             }
             ImGui::TextDisabled(camera_focus_top_down
-                ? "Height is vertical; tilt keeps a slight approach angle. Both apply immediately while following."
-                : "Distance kept from the target after Focus camera; applies immediately while following.");
+                ? "Overrides the game angle with vertical height and perspective tilt."
+                : "Preserves the active camera angle (FPS, third-person, or isometric). Distance applies live.");
             ImGui::EndPopup();
         }
         if (snapshot->camera_focus_active) {

@@ -864,7 +864,7 @@ namespace Explorer {
 		highlight_max_distance_ = 0.0f;
 		camera_focus_distance_ = 8.0f;
 		camera_focus_tilt_ = 3.0f;
-		camera_focus_top_down_ = true;
+		camera_focus_top_down_ = false;
 		hierarchy_ = std::make_shared<const HierarchyInfo>();
 		working_ = {};
 		working_.hierarchy = hierarchy_;
@@ -1137,6 +1137,14 @@ namespace Explorer {
 			full_inspector_refresh = true;
 			break;
 		case CommandKind::FocusSelected:
+			// A hierarchy double-click is both a selection and a focus action.
+			// Keeping the old Inspector selection made the highlight point at one
+			// object while the camera followed another.
+			if (object.GetInstanceID() != working_.selected_instance_id) {
+				select_object(object, command_root.release());
+				refresh_inspector(true);
+				update_highlight();
+			}
 			focus_selected_camera(object);
 			publish();
 			return;
@@ -1360,7 +1368,7 @@ namespace Explorer {
 			return;
 		case CommandKind::SetCameraFocusDistance: {
 			camera_focus_distance_ = std::clamp(command.float_value, 1.0f, 100.0f);
-			// Keep the follow camera above the target to avoid terrain and large meshes.
+			// Apply zoom along the active focus direction.
 			const float offset_length = camera_focus_offset.magnitude();
 			if (camera_focus_active_) {
 				if (camera_focus_top_down_)
@@ -1372,7 +1380,8 @@ namespace Explorer {
 				// Validate both rooted objects before changing a transform.
 				update_camera_transition(Clock::now());
 			}
-			set_status("Camera focus height set to " + std::to_string(camera_focus_distance_) + " units");
+			set_status(std::string(camera_focus_top_down_ ? "Camera focus height set to " : "Camera focus distance set to ") +
+				std::to_string(camera_focus_distance_) + " units");
 			publish();
 			return;
 		}
@@ -1383,11 +1392,11 @@ namespace Explorer {
 					camera_focus_offset = camera_focus_heading * camera_focus_tilt_ +
 						Vector3{ 0.0f, camera_focus_distance_, 0.0f };
 				else
-					camera_focus_offset = camera_focus_heading * camera_focus_distance_;
+					camera_focus_offset = camera_focus_view_direction * camera_focus_distance_;
 				camera_transition_active_ = false;
 				update_camera_transition(Clock::now());
 			}
-			set_status(camera_focus_top_down_ ? "Camera focus changed to top-down" : "Camera focus changed to side view");
+			set_status(camera_focus_top_down_ ? "Camera focus changed to top-down" : "Camera focus now preserves the game view angle");
 			publish();
 			return;
 		case CommandKind::SetCameraFocusTilt:
@@ -3906,13 +3915,49 @@ namespace Explorer {
 			set_status("Camera focus failed: object has no Transform");
 			return;
 		}
+		const Vector3 target_position = target_transform.position();
 
-		// Keep focus tied to the primary gameplay camera so Return camera has a
-		// well-defined meaning. Camera.current is only a fallback for games that
-		// do not expose an enabled tagged main camera.
+		// Prefer the tagged gameplay camera. Untagged games frequently have no
+		// useful Camera.current on this worker thread, so select the largest enabled
+		// camera that can see the target before falling back to Camera.current.
+		// Keep the discovery array alive until the chosen camera is pinned below.
+		const auto focus_camera_candidates = Object::FindObjectsOfTypeRooted<Camera>();
 		Camera camera = Camera::main();
-		if (!safe_object_alive(camera) || !camera.enabled())
-			camera = Camera::current();
+		if (!safe_object_alive(camera) || !camera.enabled()) {
+			camera = {};
+			double best_score = -1.0;
+			const double screen_area = static_cast<double>(std::max(1, Screen::width())) *
+				static_cast<double>(std::max(1, Screen::height()));
+			for (const Camera& candidate : focus_camera_candidates) {
+				if (!safe_object_alive(candidate) || !candidate.enabled())
+					continue;
+				clear_error();
+				const int pixel_width = candidate.pixelWidth();
+				const int pixel_height = candidate.pixelHeight();
+				const Vector3 viewport = candidate.WorldToViewportPoint(target_position);
+				if (const char* error = last_error(); error && error[0]) {
+					clear_error();
+					continue;
+				}
+				const double pixel_area = static_cast<double>(std::max(1, pixel_width)) *
+					static_cast<double>(std::max(1, pixel_height));
+				const bool finite_projection = std::isfinite(viewport.x) && std::isfinite(viewport.y) &&
+					std::isfinite(viewport.z);
+				const bool in_front = finite_projection && viewport.z > 0.01f;
+				const bool visible = in_front && viewport.x >= 0.0f && viewport.x <= 1.0f &&
+					viewport.y >= 0.0f && viewport.y <= 1.0f;
+				// Render area dominates so a minimap cannot steal focus merely because
+				// the target happens to be visible in it.
+				const double score = pixel_area * 10.0 + (in_front ? screen_area : 0.0) +
+					(visible ? screen_area * 2.0 : 0.0);
+				if (score > best_score) {
+					best_score = score;
+					camera = candidate;
+				}
+			}
+			if (!safe_object_alive(camera) || !camera.enabled())
+				camera = Camera::current();
+		}
 		if (!safe_object_alive(camera) || !camera.enabled()) {
 			set_status("Camera focus failed: no enabled camera was found");
 			return;
@@ -3951,18 +3996,22 @@ namespace Explorer {
 		saved_camera_rotation = rooted_transform.rotation();
 		saved_camera_local_position = rooted_transform.localPosition();
 		saved_camera_local_rotation = rooted_transform.localRotation();
-		const Vector3 target_position = target_transform.position();
-		Vector3 offset = saved_camera_position - target_position;
-		float offset_length = offset.magnitude();
-		if (!std::isfinite(offset_length) || offset_length <= 0.001f) {
-			offset = -rooted_transform.forward();
-			offset_length = offset.magnitude();
+		// The vector from an arbitrary target to the current camera says where
+		// the target happens to be, not where the camera looks. Using it caused
+		// side-on/sky views for off-screen objects. Preserve the camera's actual
+		// viewing direction so FPS and isometric games both retain their angle.
+		Vector3 view_direction = -rooted_transform.forward();
+		float view_direction_length = view_direction.magnitude();
+		if (!std::isfinite(view_direction_length) || view_direction_length <= 0.001f) {
+			view_direction = saved_camera_position - target_position;
+			view_direction_length = view_direction.magnitude();
 		}
-		if (!std::isfinite(offset_length) || offset_length <= 0.001f) {
-			offset = { 0.0f, 0.0f, -1.0f };
-			offset_length = 1.0f;
+		if (!std::isfinite(view_direction_length) || view_direction_length <= 0.001f) {
+			view_direction = { 0.0f, 0.0f, -1.0f };
+			view_direction_length = 1.0f;
 		}
-		Vector3 horizontal_offset{ offset.x, 0.0f, offset.z };
+		camera_focus_view_direction = view_direction / view_direction_length;
+		Vector3 horizontal_offset{ camera_focus_view_direction.x, 0.0f, camera_focus_view_direction.z };
 		float horizontal_length = horizontal_offset.magnitude();
 		if (!std::isfinite(horizontal_length) || horizontal_length <= 0.001f) {
 			const Vector3 forward = rooted_transform.forward();
@@ -3980,7 +4029,7 @@ namespace Explorer {
 		// retained horizontal offset gives the view a useful perspective angle.
 		camera_focus_offset = camera_focus_top_down_
 			? camera_focus_heading * camera_focus_tilt_ + Vector3{ 0.0f, camera_focus_distance_, 0.0f }
-			: offset / offset_length * camera_focus_distance_;
+			: camera_focus_view_direction * camera_focus_distance_;
 		camera_transition_start_position = saved_camera_position;
 		camera_transition_target_position = target_position + camera_focus_offset;
 		camera_transition_start_rotation = saved_camera_local_rotation;
@@ -4067,13 +4116,15 @@ namespace Explorer {
 
 		ModUI::Highlight::Style style{};
 		style.color = IM_COL32(50, 235, 255, 255);
-		style.fill_color = IM_COL32(40, 190, 255, 72);
+		style.fill_color = IM_COL32(40, 190, 255, 36);
 		style.label_color = IM_COL32(255, 255, 255, 255);
 		style.label_bg_color = IM_COL32(7, 16, 24, 238);
 		style.label_border_color = IM_COL32(80, 220, 255, 255);
 		style.shadow_color = IM_COL32(0, 0, 0, 220);
 		style.corner_box = true;
-		style.filled = true;
+		// An outline remains unambiguous without tinting the whole game when a
+		// third-party renderer reports pathological bounds.
+		style.filled = false;
 		style.shadow = true;
 		style.thickness = 3.5f;
 		style.corner_length = 18.0f;
@@ -4435,6 +4486,14 @@ namespace Explorer {
 			}
 			};
 
+		// Never carry a screen-dominating renderer rectangle into the draw list.
+		// If the pivot is not projectable, discard the rectangle and use the
+		// off-screen locator below. Previously the failed fallback left the old
+		// giant bounds intact, producing the solid blue screen in the report.
+		if (projected &&
+			(max_x - min_x > screen_width * 0.65f || max_y - min_y > screen_height * 0.65f)) {
+			projected = use_transform_anchor();
+		}
 		if (!projected || max_x < 0.0f || max_y < 0.0f || min_x > screen_width || min_y > screen_height) {
 			if (highlight_id_ != 0) {
 				ModUI::Highlight::enqueue_remove(highlight_id_);
@@ -4447,12 +4506,6 @@ namespace Explorer {
 
 		constexpr float kPadding = 3.0f;
 		constexpr float kMinimumSize = 14.0f;
-		// Fall back to an anchor for invalid or screen-dominating bounds. A normal
-		// object may be close, but a single selection should never obscure most of
-		// the game view because one child renderer has an oversized AABB.
-		if (max_x - min_x > screen_width * 0.65f || max_y - min_y > screen_height * 0.65f) {
-			use_transform_anchor();
-		}
 		min_x -= kPadding;
 		min_y -= kPadding;
 		max_x += kPadding;

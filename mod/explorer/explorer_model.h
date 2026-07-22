@@ -286,7 +286,7 @@ struct Snapshot {
     // widely between games and object scales.
     float camera_focus_distance = 8.0f;
     float camera_focus_tilt = 3.0f;
-    bool camera_focus_top_down = true;
+    bool camera_focus_top_down = false;
     bool camera_focus_active = false;
     int selected_instance_id = 0;
     std::string status;
@@ -536,11 +536,11 @@ class RuntimeModel {
     bool highlight_enabled_ = true;
     // Zero means unlimited highlight distance.
     float highlight_max_distance_ = 0.0f;
-    // Follow from above by default. World-space Y avoids terrain clipping
-    // caused by preserving the player's side-on camera direction.
+    // Preserve the active game's view angle by default. An explicit top-down
+    // override remains available for scenes that need it.
     float camera_focus_distance_ = 8.0f;
     float camera_focus_tilt_ = 3.0f;
-    bool camera_focus_top_down_ = true;
+    bool camera_focus_top_down_ = false;
     URK::Unity::Inspect::ObjectHandle focused_camera_handle_{};
     URK::Unity::Inspect::ObjectHandle focused_target_handle_{};
     URK::Unity::Vector3 saved_camera_position{};
@@ -553,6 +553,10 @@ class RuntimeModel {
     URK::Unity::Vector3 camera_transition_start_position{};
     URK::Unity::Vector3 camera_transition_target_position{};
     URK::Unity::Vector3 camera_focus_offset{};
+    // Direction from the focus point back toward the camera, derived from the
+    // camera itself rather than the target's arbitrary position in the scene.
+    // This preserves FPS, third-person, and isometric camera angles alike.
+    URK::Unity::Vector3 camera_focus_view_direction{ 0.0f, 0.0f, -1.0f };
     // Normalized horizontal direction from the target toward the original
     // camera pose; retained while the target moves.
     URK::Unity::Vector3 camera_focus_heading{ 0.0f, 0.0f, -1.0f };
