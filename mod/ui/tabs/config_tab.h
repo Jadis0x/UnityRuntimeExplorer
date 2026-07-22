@@ -53,7 +53,11 @@ namespace ModUI::Tabs::Config {
 
     inline void render() {
         char hotkey[32]{};
-        std::snprintf(hotkey, sizeof(hotkey), "0x%02X", ModConfig::menu_toggle_key);
+        if (ModConfig::menu_toggle_key == VK_F7) {
+            std::snprintf(hotkey, sizeof(hotkey), "F7 (0x%02X)", ModConfig::menu_toggle_key);
+        } else {
+            std::snprintf(hotkey, sizeof(hotkey), "0x%02X", ModConfig::menu_toggle_key);
+        }
         render_controls(hotkey);
         if (ModConfig::enable_localization) {
             ImGui::Dummy(ImVec2(0.0f, 12.0f));

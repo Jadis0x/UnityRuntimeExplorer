@@ -179,6 +179,7 @@ class Manager {
         AddScreenRect,
         MarkDirty,
         MarkAllDirty,
+        SetLabel,
         SetWorldPoint,
         SetScreenRect,
         Remove,
@@ -450,6 +451,14 @@ public:
         enqueue(std::move(command));
     }
 
+    void enqueue_set_label(HighlightId id, const char* label) {
+        PendingCommand command{};
+        command.kind = PendingKind::SetLabel;
+        command.id = id;
+        command.label = safe_label(label);
+        enqueue(std::move(command));
+    }
+
     void enqueue_set_world_point(HighlightId id, Vector3 world) {
         PendingCommand command{};
         command.kind = PendingKind::SetWorldPoint;
@@ -628,6 +637,9 @@ private:
             case PendingKind::MarkAllDirty:
                 mark_all_dirty();
                 break;
+            case PendingKind::SetLabel:
+                set_label(command.id, command.label.c_str());
+                break;
             case PendingKind::SetWorldPoint:
                 set_world_point(command.id, command.world);
                 break;
@@ -664,9 +676,44 @@ private:
                                     entry.style.label_above_box ? draw.min.y : draw.max.y);
                 configure_label(draw, entry, anchor);
             }
+            // Draw a centre-to-edge locator when this rectangle is off-screen.
+            if (entry.style.offscreen_indicator) {
+                const ImVec2 target((draw.min.x + draw.max.x) * 0.5f,
+                                    (draw.min.y + draw.max.y) * 0.5f);
+                const ImVec2 display = ImGui::GetIO().DisplaySize;
+                const ImVec2 center(display.x * 0.5f, display.y * 0.5f);
+                const float dx = target.x - center.x;
+                const float dy = target.y - center.y;
+                const float length = std::sqrt(dx * dx + dy * dy);
+                if (length > 0.001f) {
+                    const ImVec2 direction(dx / length, dy / length);
+                    ImVec2 from(center.x + direction.x * entry.style.indicator_center_gap,
+                                center.y + direction.y * entry.style.indicator_center_gap);
+                    const float marker_radius = std::max(draw.max.x - draw.min.x,
+                                                         draw.max.y - draw.min.y) * 0.5f;
+                    ImVec2 to(target.x - direction.x * (marker_radius + 5.0f),
+                              target.y - direction.y * (marker_radius + 5.0f));
+                    const float line_length = std::sqrt((to.x - from.x) * (to.x - from.x) +
+                                                        (to.y - from.y) * (to.y - from.y));
+                    if (entry.style.indicator_length > 0.0f && line_length > entry.style.indicator_length) {
+                        to = ImVec2(from.x + direction.x * entry.style.indicator_length,
+                                    from.y + direction.y * entry.style.indicator_length);
+                    }
+                    const ImVec2 arrow_base(to.x - direction.x * entry.style.indicator_head_size,
+                                             to.y - direction.y * entry.style.indicator_head_size);
+                    const ImVec2 normal(-direction.y, direction.x);
+                    draw.indicator = true;
+                    draw.line_from = from;
+                    draw.line_to = to;
+                    draw.arrow_left = ImVec2(arrow_base.x + normal.x * (entry.style.indicator_head_size * 0.62f),
+                                             arrow_base.y + normal.y * (entry.style.indicator_head_size * 0.62f));
+                    draw.arrow_right = ImVec2(arrow_base.x - normal.x * (entry.style.indicator_head_size * 0.62f),
+                                              arrow_base.y - normal.y * (entry.style.indicator_head_size * 0.62f));
+                }
+            }
             note_state(entry, draw.rect ? DebugState::Rect : DebugState::Label);
             reset_failure(entry);
-            return (draw.rect || draw.label) ? ResolveState::Drawn : ResolveState::Skipped;
+            return (draw.rect || draw.indicator || draw.label) ? ResolveState::Drawn : ResolveState::Skipped;
         }
 
         if (!entry.has_projection)
@@ -1317,6 +1364,10 @@ inline void enqueue_mark_dirty(HighlightId id) {
 
 inline void enqueue_mark_all_dirty() {
     manager().enqueue_mark_all_dirty();
+}
+
+inline void enqueue_set_label(HighlightId id, const char* label) {
+    manager().enqueue_set_label(id, label);
 }
 
 inline void enqueue_set_world_point(HighlightId id, Vector3 world) {

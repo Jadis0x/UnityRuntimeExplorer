@@ -218,6 +218,14 @@ inline bool set_menu_cursor_open(bool open) {
          ctx->runtime->menu_cursor_set_open &&
          ctx->runtime->menu_cursor_set_open(open ? 1 : 0) != 0;
 }
+inline bool set_menu_mouse_capture(bool capture) {
+  const auto *ctx = context();
+  static const unsigned char owner_token = 0;
+  return runtime_api_has_field(offsetof(RuntimeApi, menu_mouse_capture_set_owned) +
+                               sizeof(ctx->runtime->menu_mouse_capture_set_owned)) &&
+         ctx->runtime->menu_mouse_capture_set_owned &&
+         ctx->runtime->menu_mouse_capture_set_owned(&owner_token, capture ? 1 : 0) != 0;
+}
 inline bool cursor_state_get(CursorState *state) {
   if (!state)
     return false;

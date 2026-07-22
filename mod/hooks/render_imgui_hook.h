@@ -159,6 +159,10 @@ namespace ModRenderHook {
 	inline std::array<bool, 5> g_menu_released_mouse{};
 	inline std::atomic_uint g_menu_toggle_count{ 0 };
 	inline std::atomic_bool g_menu_visible{ false };
+	// Updated after each ImGui frame so the game keeps input outside Explorer controls.
+	inline std::atomic_bool g_imgui_wants_mouse{ false };
+	inline std::atomic_bool g_imgui_wants_keyboard{ false };
+	inline std::atomic_int g_runtime_mouse_capture_requested{ -1 };
 	inline std::atomic_int g_menu_input_requested{ -1 };
 	inline std::atomic_int g_menu_input_applied{ -1 };
 	inline std::atomic_ullong g_menu_input_request_tick{ 0 };
@@ -508,11 +512,12 @@ namespace ModRenderHook {
 		const float font_size = ImGui::GetFontSize();
 		char text[512]{};
 		std::snprintf(text, sizeof(text),
-			"%s font source=%s (%s) CJK=%s size=%.1fpx oversample=3x2 sampler=%s.",
+			"%s font source=%s (%s) CJK=%s Devanagari=%s size=%.1fpx oversample=3x2 sampler=%s.",
 			renderer_name ? renderer_name : "ImGui",
 			ModUI::Theme::loaded_font_name(),
 			ModUI::Theme::using_ttf_font() ? "TTF" : "ImGui default",
 			ModUI::Theme::cjk_font_support(),
+			ModUI::Theme::devanagari_font_support(),
 			font_size,
 			sampler_filter ? sampler_filter : "linear");
 		log(text);
@@ -866,81 +871,12 @@ namespace ModRenderHook {
 			return;
 		}
 
-		if (open) {
-			if (ModConfig::is_il2cpp_backend) {
-				// Unity clears its input-device state on focus loss. Reuse
-				// that one-shot path instead of fabricating per-key transitions, which
-				// does not reset the IL2CPP Input System's raw keyboard state.
-				clear_game_input();
-			if ((old_wndproc || g_window_message_registered) && GetFocus() == hwnd) {
-				call_previous_window_proc(hwnd, old_wndproc, WM_CANCELMODE, 0, 0);
-				call_previous_window_proc(hwnd, old_wndproc, WM_KILLFOCUS, 0, 0);
-					g_game_focus_suspended = true;
-				}
-			}
-			else {
-				g_menu_released_keyboard.fill(false);
-				for (std::size_t key = 0; key < g_game_keyboard.size(); ++key) {
-					KeyboardButtonState& game = g_game_keyboard[key];
-					if (!game.down) continue;
-					g_menu_released_keyboard[key] = true;
-					game.down = false;
-					const UINT message = game.system ? WM_SYSKEYUP : WM_KEYUP;
-				call_previous_window_proc(hwnd, old_wndproc, message, static_cast<WPARAM>(key),
-				                          keyboard_transition_lparam(game.lparam, false));
-				}
-
-				g_menu_released_mouse.fill(false);
-				for (int button = 0; button < static_cast<int>(g_game_mouse.size()); ++button) {
-					MouseButtonState& game = g_game_mouse[button];
-					if (!game.down) continue;
-					g_menu_released_mouse[button] = true;
-					const LPARAM position = game.lparam;
-					game.down = false;
-				call_previous_window_proc(hwnd, old_wndproc, mouse_button_message(button, false),
-				                          mouse_transition_wparam(button, g_game_mouse), position);
-				}
-			}
-		}
-		else {
-			if (ModConfig::is_il2cpp_backend) {
-				// Do not synthesize key or mouse presses while restoring game focus.
-				// Unity resumes from its cleared state and accepts only real input.
-				clear_game_input();
-			if (g_game_focus_suspended && (old_wndproc || g_window_message_registered) && GetFocus() == hwnd)
-				call_previous_window_proc(hwnd, old_wndproc, WM_SETFOCUS, 0, 0);
-				g_game_focus_suspended = false;
-			}
-			else {
-				for (std::size_t key = 0; key < g_menu_released_keyboard.size(); ++key) {
-					if (!g_menu_released_keyboard[key]) continue;
-					const KeyboardButtonState& physical = g_physical_keyboard[key];
-					if (physical.down) {
-						g_game_keyboard[key] = physical;
-						const UINT message = physical.system ? WM_SYSKEYDOWN : WM_KEYDOWN;
-					call_previous_window_proc(hwnd, old_wndproc, message, static_cast<WPARAM>(key),
-					                          keyboard_transition_lparam(physical.lparam, true));
-					}
-					g_menu_released_keyboard[key] = false;
-				}
-
-				for (int button = 0; button < static_cast<int>(g_menu_released_mouse.size()); ++button) {
-					if (!g_menu_released_mouse[button]) continue;
-					const MouseButtonState& physical = g_physical_mouse[button];
-					if (physical.down) {
-						g_game_mouse[button] = physical;
-					call_previous_window_proc(hwnd, old_wndproc, mouse_button_message(button, true),
-					                          mouse_transition_wparam(button, g_game_mouse), physical.lparam);
-					}
-					g_menu_released_mouse[button] = false;
-				}
-			}
-		}
-
 		g_menu_input_open = open;
 		g_menu_visible.store(open, std::memory_order_release);
 		g_menu_input_applied.store(open ? 1 : 0, std::memory_order_release);
-
+		g_imgui_wants_mouse.store(false, std::memory_order_release);
+		g_imgui_wants_keyboard.store(false, std::memory_order_release);
+		// Keep game focus; the WndProc consumes input only when ImGui needs it.
 		clear_window_mouse_buttons(hwnd, true);
 		queue_release_all_input(hwnd);
 	}
@@ -990,6 +926,17 @@ namespace ModRenderHook {
 				break;
 			}
 		}
+	}
+
+	inline void publish_imgui_capture_state() {
+		const ImGuiIO& io = ImGui::GetIO();
+		const bool capture_mouse = io.WantCaptureMouse;
+		g_imgui_wants_mouse.store(capture_mouse, std::memory_order_release);
+		g_imgui_wants_keyboard.store(io.WantCaptureKeyboard, std::memory_order_release);
+		const int desired = capture_mouse ? 1 : 0;
+		if (g_runtime_mouse_capture_requested.load(std::memory_order_acquire) != desired &&
+			URK::set_menu_mouse_capture(capture_mouse))
+			g_runtime_mouse_capture_requested.store(desired, std::memory_order_release);
 	}
 
 	inline void log_cursor_error(const char* operation) {
@@ -1143,8 +1090,8 @@ namespace ModRenderHook {
 		if (g_menu_input_applied.load(std::memory_order_acquire) != input_desired &&
 			(g_menu_input_requested.load(std::memory_order_acquire) != input_desired || input_timed_out) &&
 			!request_window_input_state(open)) {
-			log(open ? "Failed to suppress game input for the ImGui menu."
-				: "Failed to restore game input after closing the ImGui menu.");
+			log(open ? "Failed to enable ImGui input routing."
+				: "Failed to disable ImGui input routing.");
 		}
 		if (open)
 			acquire_cursor_lease();
@@ -1319,6 +1266,8 @@ namespace ModRenderHook {
 
 		const bool visible = g_menu_visible.load(std::memory_order_acquire) &&
 			!g_shutting_down.load(std::memory_order_acquire);
+		const bool wants_mouse = visible && g_imgui_wants_mouse.load(std::memory_order_acquire);
+		const bool wants_keyboard = visible && g_imgui_wants_keyboard.load(std::memory_order_acquire);
 		bool consumed = false;
 
 		const UINT cursor_message = menu_cursor_message();
@@ -1375,7 +1324,8 @@ namespace ModRenderHook {
 			const int button = mouse_button_for_message(message, wparam);
 			const bool down = is_mouse_button_down(message);
 			const bool was_down = button >= 0 && g_wndproc_mouse_down[button];
-			if (button >= 0 && down && visible) {
+			const bool capture_mouse = wants_mouse || was_down;
+			if (button >= 0 && down && capture_mouse) {
 				if (!any_window_mouse_button_down() && GetCapture() != hwnd)
 					SetCapture(hwnd);
 				g_wndproc_mouse_down[button] = true;
@@ -1387,10 +1337,10 @@ namespace ModRenderHook {
 					ReleaseCapture();
 			}
 
-			if ((down && visible) || !down || was_down) {
+			if (visible && (capture_mouse || !down && was_down)) {
 				queue_mouse_button(hwnd, button, down);
 			}
-			if (visible) consumed = true;
+			if (capture_mouse) consumed = true;
 		}
 		else if (message == WM_MOUSEMOVE && visible) {
 			if (g_cursor_lease.load(std::memory_order_acquire) || !g_raw_mouse_seen) {
@@ -1398,12 +1348,12 @@ namespace ModRenderHook {
 				g_virtual_mouse_position_valid = true;
 				queue_mouse_position(hwnd, g_virtual_mouse_position.x, g_virtual_mouse_position.y);
 			}
-			consumed = true;
+			consumed = wants_mouse || any_window_mouse_button_down();
 		}
 		else if (message == WM_INPUT && visible) {
 			if (!g_cursor_lease.load(std::memory_order_acquire))
 				queue_raw_mouse_input(hwnd, lparam);
-			consumed = true;
+			consumed = wants_mouse || any_window_mouse_button_down();
 		}
 		else if ((message == WM_MOUSEWHEEL || message == WM_MOUSEHWHEEL) && visible) {
 			InputEvent event{};
@@ -1414,7 +1364,7 @@ namespace ModRenderHook {
 			event.x = message == WM_MOUSEHWHEEL ? -delta : 0.0f;
 			event.y = message == WM_MOUSEWHEEL ? delta : 0.0f;
 			queue_input_event(event);
-			consumed = true;
+			consumed = wants_mouse;
 		}
 		else if (message == WM_MOUSELEAVE && visible) {
 			InputEvent event{};
@@ -1423,10 +1373,10 @@ namespace ModRenderHook {
 			event.x = -std::numeric_limits<float>::max();
 			event.y = -std::numeric_limits<float>::max();
 			queue_input_event(event);
-			consumed = true;
+			consumed = wants_mouse;
 		}
 
-		if (visible && message == WM_SETCURSOR && LOWORD(lparam) == HTCLIENT) {
+		if (wants_mouse && message == WM_SETCURSOR && LOWORD(lparam) == HTCLIENT) {
 			SetCursor(LoadCursor(nullptr, IDC_ARROW));
 			consumed = true;
 		}
@@ -1439,11 +1389,8 @@ namespace ModRenderHook {
 			event.wparam = wparam;
 			event.lparam = lparam;
 			queue_input_event(event);
-			consumed = true;
+			consumed = wants_keyboard;
 		}
-
-		if (visible && (is_client_mouse_message(message) || is_raw_input_message(message)))
-			consumed = true;
 
 		if (relayed || consumed) {
 			const InputRelay input{ message, wparam, lparam };
@@ -1713,7 +1660,7 @@ namespace ModRenderHook {
 		}
 		ImGui_ImplDX12_NewFrame(); ImGui_ImplWin32_NewFrame(); drain_input_events(); ImGui::NewFrame();
 		ImGui::GetIO().MouseDrawCursor = false;
-		ModUI::Highlight::manager().render(); ModUI::render_menu(); ImGui::Render();
+		ModUI::Highlight::manager().render(); ModUI::render_menu(); publish_imgui_capture_state(); ImGui::Render();
 		D3D12_RESOURCE_BARRIER barrier{};
 		barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
 		barrier.Transition.pResource = frame.resource;
@@ -1765,6 +1712,7 @@ namespace ModRenderHook {
 		ImGui::GetIO().MouseDrawCursor = false;
 		ModUI::Highlight::manager().render();
 		ModUI::render_menu();
+		publish_imgui_capture_state();
 		ImGui::Render();
 
 		g_context->OMSetRenderTargets(1, &g_render_target, nullptr);
@@ -1919,7 +1867,7 @@ namespace ModRenderHook {
 		sync_menu_state();
 		ImGui_ImplOpenGL3_NewFrame(); ImGui_ImplWin32_NewFrame(); drain_input_events(); ImGui::NewFrame();
 		ImGui::GetIO().MouseDrawCursor = false;
-		ModUI::Highlight::manager().render(); ModUI::render_menu(); ImGui::Render();
+		ModUI::Highlight::manager().render(); ModUI::render_menu(); publish_imgui_capture_state(); ImGui::Render();
 		ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
 	}
 

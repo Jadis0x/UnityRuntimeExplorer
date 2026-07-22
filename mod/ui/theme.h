@@ -115,6 +115,15 @@ namespace ModUI::Theme {
         return ranges;
     }
 
+    inline const ImWchar* devanagari_glyph_ranges() {
+        static const ImWchar ranges[] = {
+            0x0900, 0x097F, // Devanagari (Hindi and related scripts)
+            0xA8E0, 0xA8FF, // Devanagari Extended
+            0,
+        };
+        return ranges;
+    }
+
     inline float dpi_scale();
     inline const char*& loaded_font_name() {
         static const char* value = "default";
@@ -127,6 +136,11 @@ namespace ModUI::Theme {
     }
 
     inline const char*& cjk_font_support() {
+        static const char* value = "unavailable";
+        return value;
+    }
+
+    inline const char*& devanagari_font_support() {
         static const char* value = "unavailable";
         return value;
     }
@@ -176,6 +190,15 @@ namespace ModUI::Theme {
             : japanese_loaded ? "Japanese only" : chinese_loaded ? "Chinese only" : "unavailable";
     }
 
+    inline void merge_devanagari_fallback(ImGuiIO& io, float size_px) {
+        // Nirmala UI is installed with supported Windows versions and includes
+        // the Devanagari glyphs often used by metadata obfuscators.
+        static const char* const devanagari_fonts[] = { "Nirmala.ttc" };
+        devanagari_font_support() = merge_first_windows_font(
+            io, devanagari_fonts, IM_ARRAYSIZE(devanagari_fonts), size_px, devanagari_glyph_ranges())
+            ? "Nirmala.ttc" : "unavailable";
+    }
+
     inline float font_size_px() {
         float size = std::floor((18.0f * dpi_scale()) + 0.5f);
         if (size < 18.0f) size = 18.0f;
@@ -197,9 +220,13 @@ namespace ModUI::Theme {
         ImFont* regular = load_windows_font(io, "segoeui.ttf", size_px);
         if (regular) {
             merge_cjk_fallbacks(io, size_px);
+            merge_devanagari_fallback(io, size_px);
             io.FontDefault = regular;
             heading_font() = load_windows_font(io, "seguisb.ttf", size_px + 2.0f);
-            if (heading_font()) merge_cjk_fallbacks(io, size_px + 2.0f);
+            if (heading_font()) {
+                merge_cjk_fallbacks(io, size_px + 2.0f);
+                merge_devanagari_fallback(io, size_px + 2.0f);
+            }
             else heading_font() = regular;
             loaded_font_name() = "segoeui.ttf";
             using_ttf_font() = true;

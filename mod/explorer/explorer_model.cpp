@@ -375,6 +375,8 @@ namespace Explorer {
 #endif
 		}
 
+		Inspect::TypeInfo safe_type_of(Object object);
+
 		Inspect::ObjectHandle tracked_reference_handle(const Inspect::ValueInfo& value) {
 			if (!value.object)
 				return {};
@@ -382,10 +384,11 @@ namespace Explorer {
 #if defined(_WIN32)
 			__try {
 #endif
-				const Object object{ value.object };
-				const Inspect::TypeInfo type = Inspect::TypeOf(object);
-				// Keep inspector-created boxes strong; keep ordinary references weak.
-				handle = type.is_value_type ? Inspect::PinObject(object) : Inspect::WeakObject(object);
+			const Object object{ value.object };
+			const Inspect::TypeInfo type = safe_type_of(object);
+			// Keep boxed values and returned strings alive until their Inspector tab closes.
+			handle = type.is_value_type || value.kind == Inspect::ValueKind::String
+				? Inspect::PinObject(object) : Inspect::WeakObject(object);
 #if defined(_WIN32)
 			}
 			__except (capture_native_fault(_exception_info())) {
@@ -479,15 +482,66 @@ namespace Explorer {
 			return memory.State == MEM_COMMIT && (memory.Protect & (PAGE_NOACCESS | PAGE_GUARD)) == 0;
 		}
 
-		// Avoid UnityEngine.Object.op_Implicit here. Some IL2CPP players expose a
-		// generated wrapper for that operator which faults even though ordinary
-		// instance calls on the same object remain valid.
+		bool copy_readable_c_string(const char* value, std::string& output) {
+			output.clear();
+			if (!value)
+				return true;
+			constexpr std::size_t kMaxMetadataString = 512;
+			for (std::size_t index = 0; index < kMaxMetadataString; ++index) {
+				if (!readable_address(reinterpret_cast<std::uintptr_t>(value + index)))
+					return false;
+				if (value[index] == '\0') {
+					output.assign(value, index);
+					return true;
+				}
+			}
+			return false;
+		}
+
+		bool safe_class_display_name(const void* klass, std::string& output) {
+			output.clear();
+			if (!klass || !readable_address(reinterpret_cast<std::uintptr_t>(klass)))
+				return false;
+#if defined(_WIN32)
+			__try {
+#endif
+			const char* namespc = URK::il2cpp::class_get_namespace(
+				static_cast<const URK::il2cpp::Class*>(klass));
+			const char* name = URK::il2cpp::class_get_name(
+				static_cast<const URK::il2cpp::Class*>(klass));
+			std::string namespace_text;
+			std::string name_text;
+			if (!copy_readable_c_string(namespc, namespace_text) ||
+				!copy_readable_c_string(name, name_text) || name_text.empty())
+				return false;
+			output = namespace_text.empty() ? std::move(name_text)
+				: namespace_text + "." + name_text;
+			return true;
+#if defined(_WIN32)
+			} __except (capture_native_fault(_exception_info())) {
+				clear_error();
+				output.clear();
+				return false;
+			}
+#endif
+		}
+
+		// Destroyed Unity wrappers can keep a valid address and instance ID.
+		// op_Implicit is the reliable lifetime check on supported IL2CPP builds.
 		bool safe_object_alive(Object object) {
 			if (!object || !readable_address(reinterpret_cast<std::uintptr_t>(object.handle())))
 				return false;
 #if defined(_WIN32)
 			__try {
-				return object.GetInstanceID() != 0;
+				if (object.GetInstanceID() == 0)
+					return false;
+				clear_error();
+				const bool alive = object.alive();
+				if (const char* error = last_error(); error && error[0]) {
+					clear_error();
+					return false;
+				}
+				return alive;
 			}
 			__except (capture_native_fault(_exception_info())) {
 				clear_error();
@@ -495,6 +549,43 @@ namespace Explorer {
 			}
 #else
 			return object.GetInstanceID() != 0;
+#endif
+		}
+
+		std::string safe_runtime_class_name(Object object) {
+			if (!safe_object_alive(object))
+				return {};
+#if defined(_WIN32)
+			__try {
+				clear_error();
+				const std::string name = object.runtime_class_name();
+				if (const char* error = last_error(); error && error[0])
+					clear_error();
+				return name;
+			}
+			__except (capture_native_fault(_exception_info())) {
+				clear_error();
+				return {};
+			}
+#else
+		return object.runtime_class_name();
+#endif
+		}
+
+		Inspect::TypeInfo safe_type_of(Object object) {
+			if (!object || !readable_address(reinterpret_cast<std::uintptr_t>(object.handle())))
+				return {};
+#if defined(_WIN32)
+			__try {
+				clear_error();
+				return Inspect::TypeOf(object);
+			}
+			__except (capture_native_fault(_exception_info())) {
+				clear_error();
+				return {};
+			}
+#else
+			return Inspect::TypeOf(object);
 #endif
 		}
 
@@ -518,7 +609,6 @@ namespace Explorer {
 		}
 
 		struct ManagedCallerIndex {
-			bool built = false;
 			std::unordered_map<std::uintptr_t, std::string> methods;
 		};
 
@@ -527,48 +617,32 @@ namespace Explorer {
 			return index;
 		}
 
-		void build_managed_caller_index() {
-			ManagedCallerIndex& index = managed_caller_index();
-			if (index.built)
+
+		void remember_managed_method(const Inspect::MethodInfo& method) {
+			if (!method.handle || method.name.empty())
 				return;
-			index.built = true;
-			const std::size_t assembly_count = std::min<std::size_t>(URK::il2cpp::domain_get_assembly_count(), 4096);
-			for (std::size_t assembly_index = 0; assembly_index < assembly_count; ++assembly_index) {
-				const auto* image = URK::il2cpp::assembly_get_image(URK::il2cpp::domain_get_assembly(assembly_index));
-				if (!image)
-					continue;
-				const std::size_t class_count = std::min<std::size_t>(URK::il2cpp::image_get_class_count(image), 1000000);
-				for (std::size_t class_index = 0; class_index < class_count; ++class_index) {
-					const auto* klass = URK::il2cpp::image_get_class(image, class_index);
-					if (!klass)
-						continue;
-					const char* class_name = URK::il2cpp::class_get_name(klass);
-					const char* namespc = URK::il2cpp::class_get_namespace(klass);
-					if (!class_name || !class_name[0])
-						continue;
-					const std::string type_name = namespc && namespc[0] ? std::string(namespc) + "." + class_name : class_name;
-					void* iterator = nullptr;
-					std::unordered_set<const void*> visited_methods;
-					std::size_t method_count = 0;
-					while (const auto* method = URK::il2cpp::class_get_methods(klass, &iterator)) {
-						if (++method_count > Inspect::kMaxMetadataMembersPerClass ||
-							!visited_methods.insert(method).second)
-							break;
-						void* const pointer = URK::il2cpp::method_pointer(method);
-						const char* method_name = URK::il2cpp::method_get_name(method);
-						if (!pointer || !method_name || !method_name[0])
-							continue;
-						const std::string name = type_name + "." + method_name;
-						const auto [found, inserted] = index.methods.emplace(reinterpret_cast<std::uintptr_t>(pointer), name);
-						if (!inserted && found->second != name)
-							found->second = "<shared IL2CPP generic code>";
-					}
-				}
+#if defined(_WIN32)
+			__try {
+#endif
+				void* const pointer = URK::il2cpp::method_pointer(static_cast<const URK::il2cpp::Method*>(method.handle));
+				if (!pointer)
+					return;
+				const std::string name = method.declaring_type.full_name.empty()
+					? method.name
+					: method.declaring_type.full_name + "." + method.name;
+				auto& methods = managed_caller_index().methods;
+				const auto [found, inserted] = methods.emplace(reinterpret_cast<std::uintptr_t>(pointer), name);
+				if (!inserted && found->second != name)
+					found->second = "<shared IL2CPP generic code>";
+#if defined(_WIN32)
 			}
+			__except (capture_native_fault(_exception_info())) {
+				// Caller names are optional. Do not fall back to a domain-wide scan here.
+			}
+#endif
 		}
 
 		std::string managed_caller_location(std::uintptr_t address) {
-			build_managed_caller_index();
 			DWORD64 image_base = 0;
 			const PRUNTIME_FUNCTION function = RtlLookupFunctionEntry(static_cast<DWORD64>(address), &image_base, nullptr);
 			if (!function)
@@ -588,53 +662,37 @@ namespace Explorer {
 				pointer_text(reinterpret_cast<void*>(address));
 			if (!readable_address(address))
 				return fallback + " (unavailable)";
-			std::string type_name;
+			// Trace records are raw register values, not guaranteed managed objects.
+			return fallback;
+		}
+
+		std::string describe_traced_string(std::uint64_t raw) {
+			const std::uintptr_t address = static_cast<std::uintptr_t>(raw);
+			const std::string fallback = "System.String @ " + pointer_text(reinterpret_cast<void*>(address));
+			if (!address)
+				return "null";
+			if (!readable_address(address))
+				return fallback + " (no longer readable)";
+
+			// Decode strings on the Explorer thread, inside the normal native-fault guard.
 #if defined(_WIN32)
 			__try {
 #endif
-				const auto* klass = URK::il2cpp::object_get_class(reinterpret_cast<URK::il2cpp::Object*>(address));
-				type_name = Inspect::DescribeClass(klass).full_name;
+				auto* value = reinterpret_cast<URK::il2cpp::String*>(address);
+				const std::int32_t length = URK::il2cpp::string_length(value);
+				if (length < 0 || length > 4096)
+					return fallback + " (invalid length)";
+				std::vector<char> utf8(static_cast<std::size_t>(length) * 4u + 1u, '\0');
+				if (!URK::il2cpp::string_to_utf8(value, utf8.data(), utf8.size()))
+					return fallback + " (could not decode)";
+				return "\"" + std::string(utf8.data()) + "\"";
 #if defined(_WIN32)
 			}
 			__except (capture_native_fault(_exception_info())) {
+				clear_error();
 				return fallback + " (unavailable)";
 			}
 #endif
-			if (type_name == "System.String") {
-				constexpr std::int32_t kMaxTracedStringLength = 512;
-				const std::int32_t length = URK::il2cpp::string_length(reinterpret_cast<void*>(address));
-				if (length >= 0 && length <= kMaxTracedStringLength) {
-					std::vector<char> utf8(static_cast<std::size_t>(length) * 4 + 1, '\0');
-					if (URK::il2cpp::string_to_utf8(reinterpret_cast<URK::il2cpp::String*>(address), utf8.data(), utf8.size()))
-						return "\"" + std::string(utf8.data()) + "\"";
-				}
-			}
-			const auto* unity_object_class = UnityObjectType.resolve_class();
-			const auto* actual_class = URK::il2cpp::object_get_class(reinterpret_cast<URK::il2cpp::Object*>(address));
-			if (unity_object_class && actual_class && URK::il2cpp::class_is_assignable_from(unity_object_class, actual_class)) {
-				std::string name;
-				int instance_id = 0;
-#if defined(_WIN32)
-				__try {
-#endif
-					const Object object{ reinterpret_cast<void*>(address) };
-					instance_id = object.GetInstanceID();
-					name = object.name();
-#if defined(_WIN32)
-				}
-				__except (capture_native_fault(_exception_info())) {
-					name.clear();
-					instance_id = 0;
-				}
-#endif
-				if (instance_id != 0) {
-					std::string display = type_name.empty() ? std::string(declared_type) : type_name;
-					if (!name.empty())
-						display += " \"" + name + "\"";
-					return display + " #" + std::to_string(instance_id);
-				}
-			}
-			return (type_name.empty() ? fallback : type_name + " @ " + pointer_text(reinterpret_cast<void*>(address)));
 		}
 
 		std::string assembly_name(const Inspect::TypeInfo& type) {
@@ -670,6 +728,8 @@ namespace Explorer {
 	void RuntimeModel::start() {
 		hierarchy_ = std::make_shared<const HierarchyInfo>();
 		working_ = {};
+		flight_recorder_started_ = Clock::now();
+		next_flight_sequence_ = 1;
 		working_.hierarchy = hierarchy_;
 		working_.status = "IL2CPP runtime ready";
 		URK::SceneInfo current_scene{};
@@ -707,12 +767,14 @@ namespace Explorer {
 					return command.kind != CommandKind::Select && command.kind != CommandKind::ClearSelection &&
 						command.kind != CommandKind::Refresh && command.kind != CommandKind::SceneHint &&
 						command.kind != CommandKind::ObjectDestroyRequested &&
-						command.kind != CommandKind::ClearDiagnostics;
+						command.kind != CommandKind::ClearDiagnostics &&
+						command.kind != CommandKind::ClearFlightRecorder;
 					});
 			}
 			const std::uint32_t fault_code = native_fault_code_.exchange(0, std::memory_order_acq_rel);
 			const std::uintptr_t fault_address = native_fault_address_.exchange(0, std::memory_order_acq_rel);
 			const std::uintptr_t fault_instruction = native_fault_instruction_.exchange(0, std::memory_order_acq_rel);
+			record_flight("FAULT", "Native IL2CPP access", "code=" + std::to_string(fault_code));
 			set_status("Explorer isolated a native IL2CPP access fault; stale managed state was released and a census retry is pending.");
 			ModLog::error("Native recovery: code=0x%08X address=%p instruction=%p", fault_code,
 				reinterpret_cast<void*>(fault_address), reinterpret_cast<void*>(fault_instruction));
@@ -798,7 +860,11 @@ namespace Explorer {
 		class_browser_static_handles_.clear();
 		clear_highlight_renderer_cache();
 		clear_highlight_camera_cache();
+		highlight_enabled_ = true;
 		highlight_max_distance_ = 0.0f;
+		camera_focus_distance_ = 8.0f;
+		camera_focus_tilt_ = 3.0f;
+		camera_focus_top_down_ = true;
 		hierarchy_ = std::make_shared<const HierarchyInfo>();
 		working_ = {};
 		working_.hierarchy = hierarchy_;
@@ -829,9 +895,13 @@ namespace Explorer {
 				return;
 		}
 
-		if (command.kind == CommandKind::SetHighlightDistance) {
-			std::erase_if(commands_, [](const Command& pending) {
-				return pending.kind == CommandKind::SetHighlightDistance;
+		if (command.kind == CommandKind::SetHighlightDistance ||
+			command.kind == CommandKind::SetHighlightEnabled ||
+			command.kind == CommandKind::SetCameraFocusDistance ||
+			command.kind == CommandKind::SetCameraFocusTopDown ||
+			command.kind == CommandKind::SetCameraFocusTilt) {
+			std::erase_if(commands_, [&command](const Command& pending) {
+				return pending.kind == command.kind;
 			});
 		}
 
@@ -907,6 +977,7 @@ namespace Explorer {
 		}
 		for (std::size_t command_index = 0; command_index < pending.size(); ++command_index) {
 			const Command& command = pending[command_index];
+			record_flight("BEGIN", command_name(command.kind), "seq=" + std::to_string(command.sequence));
 #if defined(_WIN32)
 			bool native_fault = false;
 			__try {
@@ -916,6 +987,7 @@ namespace Explorer {
 				native_fault = true;
 			}
 			if (native_fault) {
+				record_flight("FAULT", command_name(command.kind), "native access violation");
 				// A malformed member record belongs to one component. Keep the
 				// rooted GameObject, hierarchy, and unrelated inspector state
 				// intact, and expose an explicit retry instead of converting a
@@ -962,7 +1034,8 @@ namespace Explorer {
 					const CommandKind kind = pending[index].kind;
 					if (kind == CommandKind::Select || kind == CommandKind::ClearSelection ||
 						kind == CommandKind::Refresh || kind == CommandKind::SceneHint ||
-						kind == CommandKind::ObjectDestroyRequested || kind == CommandKind::ClearDiagnostics)
+						kind == CommandKind::ObjectDestroyRequested || kind == CommandKind::ClearDiagnostics ||
+						kind == CommandKind::ClearFlightRecorder)
 						retry.push_back(std::move(pending[index]));
 					else
 						++dropped;
@@ -984,6 +1057,7 @@ namespace Explorer {
 #else
 			process_command(command);
 #endif
+			record_flight("DONE", command_name(command.kind));
 		}
 	}
 
@@ -1018,13 +1092,18 @@ namespace Explorer {
 			command.kind == CommandKind::InspectReference || command.kind == CommandKind::InspectRawReference ||
 			command.kind == CommandKind::CloseObjectInspectorTab ||
 			command.kind == CommandKind::SetLiveData ||
-			command.kind == CommandKind::SetHighlightDistance;
+			command.kind == CommandKind::SetHighlightDistance ||
+			command.kind == CommandKind::SetHighlightEnabled ||
+			command.kind == CommandKind::SetCameraFocusDistance ||
+			command.kind == CommandKind::SetCameraFocusTopDown ||
+			command.kind == CommandKind::SetCameraFocusTilt;
 		const bool event_command = command.kind == CommandKind::ObjectDestroyRequested;
 		ScopedObjectRoot command_root;
 		GameObject object{};
 		const bool needs_object = !component_command && !event_command && command.kind != CommandKind::Refresh &&
 			command.kind != CommandKind::ClearSelection && command.kind != CommandKind::SceneHint &&
-			command.kind != CommandKind::ClearDiagnostics && command.kind != CommandKind::RestoreCamera;
+			command.kind != CommandKind::ClearDiagnostics && command.kind != CommandKind::ClearFlightRecorder &&
+			command.kind != CommandKind::RestoreCamera;
 
 		if (needs_object) {
 			if (command.instance_id == working_.selected_instance_id)
@@ -1043,7 +1122,7 @@ namespace Explorer {
 
 		if (!object && command.kind != CommandKind::Refresh && command.kind != CommandKind::ClearSelection &&
 			command.kind != CommandKind::SceneHint && command.kind != CommandKind::ClearDiagnostics &&
-			command.kind != CommandKind::RestoreCamera && !component_command &&
+			command.kind != CommandKind::ClearFlightRecorder && command.kind != CommandKind::RestoreCamera && !component_command &&
 			!event_command) {
 			set_status("Object is no longer available");
 			request_refresh();
@@ -1071,6 +1150,11 @@ namespace Explorer {
 		case CommandKind::ClearDiagnostics:
 			working_.diagnostics.clear();
 			set_status("Diagnostics cleared");
+			publish();
+			return;
+		case CommandKind::ClearFlightRecorder:
+			working_.flight_recorder.clear();
+			set_status("Flight recorder cleared");
 			publish();
 			return;
 		case CommandKind::SetMethodTrace:
@@ -1155,6 +1239,9 @@ namespace Explorer {
 		case CommandKind::SetActive:
 			object.SetActive(command.bool_value);
 			capture_last_error("Set active");
+			// Confirm the state change so a protected object is not mistaken for a missed click.
+			if (!(last_error() && last_error()[0]) && object.activeSelf() != command.bool_value)
+				set_status("Set active failed: Unity did not apply the requested state");
 			request_refresh();
 			return;
 		case CommandKind::SetLocalPosition:
@@ -1250,6 +1337,68 @@ namespace Explorer {
 			set_status(highlight_max_distance_ > 0.0f
 				? "Highlight max distance set to " + std::to_string(static_cast<int>(highlight_max_distance_))
 				: "Highlight max distance disabled");
+			publish();
+			return;
+		case CommandKind::SetHighlightEnabled:
+			highlight_enabled_ = command.bool_value;
+			next_highlight_refresh_ = Clock::now();
+			if (!highlight_enabled_) {
+				if (highlight_id_ != 0) {
+					ModUI::Highlight::enqueue_remove(highlight_id_);
+					highlight_id_ = 0;
+				}
+				if (highlight_locator_id_ != 0) {
+					ModUI::Highlight::enqueue_remove(highlight_locator_id_);
+					highlight_locator_id_ = 0;
+				}
+			}
+			else if (selected_) {
+				update_highlight();
+			}
+			set_status(highlight_enabled_ ? "Selection highlight enabled" : "Selection highlight disabled");
+			publish();
+			return;
+		case CommandKind::SetCameraFocusDistance: {
+			camera_focus_distance_ = std::clamp(command.float_value, 1.0f, 100.0f);
+			// Keep the follow camera above the target to avoid terrain and large meshes.
+			const float offset_length = camera_focus_offset.magnitude();
+			if (camera_focus_active_) {
+				if (camera_focus_top_down_)
+					camera_focus_offset = camera_focus_heading * camera_focus_tilt_ +
+						Vector3{ 0.0f, camera_focus_distance_, 0.0f };
+				else if (std::isfinite(offset_length) && offset_length > 0.001f)
+					camera_focus_offset = camera_focus_offset / offset_length * camera_focus_distance_;
+				camera_transition_active_ = false;
+				// Validate both rooted objects before changing a transform.
+				update_camera_transition(Clock::now());
+			}
+			set_status("Camera focus height set to " + std::to_string(camera_focus_distance_) + " units");
+			publish();
+			return;
+		}
+		case CommandKind::SetCameraFocusTopDown:
+			camera_focus_top_down_ = command.bool_value;
+			if (camera_focus_active_) {
+				if (camera_focus_top_down_)
+					camera_focus_offset = camera_focus_heading * camera_focus_tilt_ +
+						Vector3{ 0.0f, camera_focus_distance_, 0.0f };
+				else
+					camera_focus_offset = camera_focus_heading * camera_focus_distance_;
+				camera_transition_active_ = false;
+				update_camera_transition(Clock::now());
+			}
+			set_status(camera_focus_top_down_ ? "Camera focus changed to top-down" : "Camera focus changed to side view");
+			publish();
+			return;
+		case CommandKind::SetCameraFocusTilt:
+			camera_focus_tilt_ = std::clamp(command.float_value, 0.0f, 100.0f);
+			if (camera_focus_active_ && camera_focus_top_down_) {
+				camera_focus_offset = camera_focus_heading * camera_focus_tilt_ +
+					Vector3{ 0.0f, camera_focus_distance_, 0.0f };
+				camera_transition_active_ = false;
+				update_camera_transition(Clock::now());
+			}
+			set_status("Camera top-down tilt set to " + std::to_string(camera_focus_tilt_) + " units");
 			publish();
 			return;
 		case CommandKind::SetFieldValue:
@@ -1462,6 +1611,11 @@ namespace Explorer {
 		state.max_slice = std::max(state.max_slice,
 			std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - slice_started));
 
+		// Wait for the complete, budgeted census before rebuilding the hierarchy.
+		// Rebuilding partial results duplicates roots in busy scenes.
+		if (state.candidate_index < state.candidate_count)
+			return false;
+
 		const std::size_t ddol_index = state.ddol_index;
 		const std::size_t hidden_index = state.hidden_index;
 		auto& loaded_scene_indices = state.loaded_scene_indices;
@@ -1583,7 +1737,7 @@ namespace Explorer {
 			info.tag = selected_.tag();
 			info.layer = selected_.GetProperty<int>("layer");
 			info.is_static = selected_.GetProperty<bool>("isStatic");
-			const Inspect::TypeInfo object_type = Inspect::TypeOf(Object{ selected_.handle() });
+			const Inspect::TypeInfo object_type = safe_type_of(Object{ selected_.handle() });
 			info.type_name = object_type.full_name.empty() ? "UnityEngine.GameObject" : object_type.full_name;
 			info.assembly_name = assembly_name(object_type);
 			info.namespace_name = object_type.namespc;
@@ -1607,14 +1761,14 @@ namespace Explorer {
 					Inspect::FreeObjectHandle(handle);
 					continue;
 				}
-				const Inspect::TypeInfo component_type = Inspect::TypeOf(Object{ component.handle() });
+				const Inspect::TypeInfo component_type = safe_type_of(Object{ component.handle() });
 				component_info.type_name = component_type.full_name;
 				component_info.assembly_name = assembly_name(component_type);
 				component_info.namespace_name = component_type.namespc;
 				component_info.class_name = component_type.name;
 				component_info.pointer_text = pointer_text(component.handle());
 				if (component_info.type_name.empty())
-					component_info.type_name = component.runtime_class_name();
+					component_info.type_name = safe_runtime_class_name(component);
 				if (component_info.type_name.empty())
 					component_info.type_name = "<missing component>";
 				if (!is_transform_component(component_info.type_name)) {
@@ -1831,6 +1985,7 @@ namespace Explorer {
 		if (component == working_.inspector.components.end() ||
 			(component->metadata && !component->metadata_unavailable))
 			return;
+		record_flight("TARGET", "Load component metadata", component->type_name + " #" + std::to_string(component_instance_id));
 		const auto fail_metadata = [&](std::string message) {
 			component_reflection_.erase(component_instance_id);
 			component->metadata = std::make_shared<ComponentInfo::Metadata>();
@@ -1874,29 +2029,73 @@ namespace Explorer {
 		enumerate("Methods", [&] { reflection.methods = Inspect::methods_from_class(klass, true); });
 		active_metadata_stage_.clear();
 
+		component->dynamic_bridge = {};
+		for (std::size_t method_index = 0; method_index < reflection.methods.size(); ++method_index) {
+			const Inspect::MethodInfo& method = reflection.methods[method_index];
+			const bool parameterless_instance = !method.is_static && method.parameters.empty();
+			if (parameterless_instance && method.return_type == "System.String" &&
+				(method.name == "GetBehaviourType" || method.name == "GetBehaviorType" ||
+					method.name == "GetScriptType")) {
+				component->dynamic_bridge.detected = true;
+				component->dynamic_bridge.type_getter = method.name + "()";
+				component->dynamic_bridge.type_getter_method_index = static_cast<int>(method_index);
+			}
+			if (method.name == "GetSerializedData" || method.name == "GetSerializedDataRef" ||
+				method.name == "GetSerializedDataInternal") {
+				component->dynamic_bridge.detected = true;
+				component->dynamic_bridge.serialized_data_methods.push_back(
+					method.name + "(" + std::to_string(method.parameters.size()) + " arg" +
+					(method.parameters.size() == 1 ? ")" : "s)"));
+			}
+			if (method.name == "GetObject" && !method.is_static) {
+				component->dynamic_bridge.detected = true;
+				component->dynamic_bridge.object_reference_methods.push_back(
+					method.name + "(" + std::to_string(method.parameters.size()) + " arg" +
+					(method.parameters.size() == 1 ? ")" : "s)"));
+			}
+		}
+
 		metadata->fields.reserve(reflection.fields.size());
 		for (const Inspect::FieldInfo& field : reflection.fields) {
-			metadata->fields.push_back({ field.name, field.type_name, field.declaring_type.full_name, field.is_static });
+			metadata->fields.push_back({ field.name, field.type_name, field.declaring_type.full_name, field.is_static,
+				{}, field.is_value_type, field.is_enum, !field.type_is_opaque,
+				field.type_is_opaque ? "Runtime-specific type; metadata is available but generic read/write is unsafe." : "" });
 		}
 
 		metadata->properties.reserve(reflection.properties.size());
 		for (const Inspect::PropertyInfo& property : reflection.properties) {
 			metadata->properties.push_back({ property.name, property.type_name, property.declaring_type.full_name,
-											property.can_read, property.can_write });
+									 property.can_read, property.can_write, {}, property.is_value_type, property.is_enum,
+									 !property.type_is_opaque,
+									 property.type_is_opaque ? "Runtime-specific type; metadata is available but generic read/write is unsafe." : "" });
 		}
 
 		metadata->methods.reserve(reflection.methods.size());
 		for (const Inspect::MethodInfo& method : reflection.methods) {
+			// Feed caller resolution only from metadata that was successfully
+			// loaded for the current inspected component. Never enumerate the
+			// whole domain merely to decorate a trace row.
+			remember_managed_method(method);
 			ComponentInfo::Method member{};
 			member.name = method.name;
 			member.return_type = method.return_type;
 			member.declaring_type = method.declaring_type.full_name;
 			member.is_static = method.is_static;
+			member.return_is_value_type = method.return_is_value_type;
+			member.return_is_enum = method.return_is_enum;
+			member.runtime_callable = !method.return_type_is_opaque &&
+				std::none_of(method.parameters.begin(), method.parameters.end(), [](const Inspect::MethodParamInfo& parameter) {
+					return parameter.is_opaque;
+					});
+			if (!member.runtime_callable)
+				member.capability_reason = "Runtime-specific by-ref/internal signature; generic invocation is disabled.";
 			member.parameter_types.reserve(method.parameters.size());
 			member.parameter_names.reserve(method.parameters.size());
 			for (const Inspect::MethodParamInfo& parameter : method.parameters) {
 				member.parameter_types.push_back(parameter.type_name);
 				member.parameter_names.push_back(parameter.name);
+				member.parameter_is_value_types.push_back(parameter.is_value_type);
+				member.parameter_is_enums.push_back(parameter.is_enum);
 			}
 			metadata->methods.push_back(std::move(member));
 		}
@@ -2117,7 +2316,7 @@ namespace Explorer {
 		for (const Object& object : direct_instances) {
 			if (working_.class_browser_instances.size() >= kMaxDirectInstanceResults)
 				break;
-			const Inspect::TypeInfo type = Inspect::TypeOf(object);
+			const Inspect::TypeInfo type = safe_type_of(object);
 			Inspect::ObjectHandle handle = type.is_value_type ? Inspect::PinObject(object) : Inspect::WeakObject(object);
 			if (!handle.handle)
 				continue;
@@ -2354,11 +2553,15 @@ namespace Explorer {
 		auto members = std::make_shared<ComponentInfo::Metadata>();
 		for (const Inspect::FieldInfo& field : Inspect::fields_from_class(klass, true))
 			members->fields.push_back({ field.name, field.type_name, field.declaring_type.full_name, field.is_static,
-									   pointer_text(const_cast<void*>(field.handle)) });
+									   pointer_text(const_cast<void*>(field.handle)), field.is_value_type, field.is_enum,
+									   !field.type_is_opaque,
+									   field.type_is_opaque ? "Runtime-specific type; metadata only." : "" });
 		for (const Inspect::PropertyInfo& property : Inspect::properties_from_class(klass, true))
 			members->properties.push_back({ property.name, property.type_name, property.declaring_type.full_name,
-										   property.can_read, property.can_write,
-										   pointer_text(const_cast<void*>(property.handle)) });
+									 property.can_read, property.can_write,
+									 pointer_text(const_cast<void*>(property.handle)), property.is_value_type, property.is_enum,
+									 !property.type_is_opaque,
+									 property.type_is_opaque ? "Runtime-specific type; metadata only." : "" });
 		for (const Inspect::MethodInfo& method : Inspect::methods_from_class(klass, true)) {
 			ComponentInfo::Method entry{};
 			entry.name = method.name;
@@ -2366,9 +2569,19 @@ namespace Explorer {
 			entry.declaring_type = method.declaring_type.full_name;
 			entry.is_static = method.is_static;
 			entry.pointer_text = pointer_text(const_cast<void*>(method.handle));
+			entry.return_is_value_type = method.return_is_value_type;
+			entry.return_is_enum = method.return_is_enum;
+			entry.runtime_callable = !method.return_type_is_opaque &&
+				std::none_of(method.parameters.begin(), method.parameters.end(), [](const Inspect::MethodParamInfo& parameter) {
+					return parameter.is_opaque;
+					});
+			if (!entry.runtime_callable)
+				entry.capability_reason = "Runtime-specific by-ref/internal signature; generic invocation is disabled.";
 			for (const Inspect::MethodParamInfo& parameter : method.parameters) {
 				entry.parameter_types.push_back(parameter.type_name);
 				entry.parameter_names.push_back(parameter.name);
+				entry.parameter_is_value_types.push_back(parameter.is_value_type);
+				entry.parameter_is_enums.push_back(parameter.is_enum);
 			}
 			members->methods.push_back(std::move(entry));
 		}
@@ -2433,7 +2646,10 @@ namespace Explorer {
 			for (std::size_t index = 0; index < values->fields.size(); ++index) {
 				const bool sampled =
 					sampled_component_members_.contains(component_sample_token(component.instance_id, false, index));
-				if (index < reflection->second.fields.size() && sampled)
+				if (!component.metadata->fields[index].runtime_safe)
+					values->fields[index] = Inspect::unavailable_value(component.metadata->fields[index].type_name,
+						"Metadata only: " + component.metadata->fields[index].capability_reason);
+				else if (index < reflection->second.fields.size() && sampled)
 					values->fields[index] = guarded_managed_read(component.metadata->fields[index].type_name, [&] {
 					return Inspect::ReadField(target, reflection->second.fields[index]);
 						});
@@ -2448,7 +2664,10 @@ namespace Explorer {
 			for (std::size_t index = 0; index < values->properties.size(); ++index) {
 				const bool sampled =
 					sampled_component_members_.contains(component_sample_token(component.instance_id, true, index));
-				if (index < reflection->second.properties.size() && sampled)
+				if (!component.metadata->properties[index].runtime_safe)
+					values->properties[index] = Inspect::unavailable_value(component.metadata->properties[index].type_name,
+						"Metadata only: " + component.metadata->properties[index].capability_reason);
+				else if (index < reflection->second.properties.size() && sampled)
 					values->properties[index] = guarded_managed_read(component.metadata->properties[index].type_name, [&] {
 					return Inspect::ReadProperty(target, reflection->second.properties[index]);
 						});
@@ -2580,6 +2799,16 @@ namespace Explorer {
 		const bool keep_locked = !prepared && lock_key != 0 && (command.lock_value || locked_members_.contains(lock_key));
 		auto apply_member = [&](const auto& member) {
 			constexpr bool is_property = requires { member.can_write; };
+			if (member.type_is_opaque) {
+				record_flight("BLOCKED", std::string(is_property ? "Write property " : "Write field ") + member.name,
+					"runtime-specific type");
+				set_status(std::string(is_property ? "Property " : "Field ") + member.name +
+					" is metadata-only: " + member.type_name);
+				return;
+			}
+			record_flight("TARGET", std::string(is_property ? "Write property " : "Write field ") + member.name,
+				member.declaring_type.full_name.empty() ? member.type_name
+					: member.declaring_type.full_name + " : " + member.type_name);
 			if (prepared) {
 				value = *prepared;
 			}
@@ -2778,6 +3007,15 @@ namespace Explorer {
 			return;
 		}
 		const Inspect::MethodInfo& method = reflection->methods[command.member_index];
+		if (method.return_type_is_opaque || std::any_of(method.parameters.begin(), method.parameters.end(),
+			[](const Inspect::MethodParamInfo& parameter) { return parameter.is_opaque; })) {
+			record_flight("BLOCKED", "Execute " + method.name, "runtime-specific signature");
+			set_status("Method is metadata-only because its signature needs runtime-specific marshalling");
+			return;
+		}
+		record_flight("TARGET", "Execute " + method.name,
+			method.declaring_type.full_name.empty() ? method.return_type
+				: method.declaring_type.full_name + " -> " + method.return_type);
 		const Object target =
 			nested ? Inspect::ResolveObjectHandle(object_inspector_handle_) : resolve_component(command.instance_id);
 		if (!method.is_static && (!target || (!nested && !safe_object_alive(target)))) {
@@ -2843,6 +3081,17 @@ namespace Explorer {
 			capture_last_error("Invoke method");
 			return;
 		}
+		if (!nested) {
+			const auto component = std::find_if(working_.inspector.components.begin(), working_.inspector.components.end(),
+				[&command](const ComponentInfo& info) { return info.instance_id == command.instance_id; });
+			if (component != working_.inspector.components.end() &&
+				component->dynamic_bridge.type_getter_method_index == command.member_index) {
+				if (result.kind == Inspect::ValueKind::String)
+					component->dynamic_bridge.behaviour_type = result.display;
+				else
+					component->dynamic_bridge.diagnostic = "Type getter completed but did not return a managed string.";
+			}
+		}
 		Snapshot::MethodResult record{};
 		record.component_instance_id = command.instance_id;
 		record.method_index = static_cast<std::size_t>(command.member_index);
@@ -2861,8 +3110,8 @@ namespace Explorer {
 				release_reference_handle(previous.reference.token);
 			it = working_.method_results.erase(it);
 		}
-		const bool is_reference =
-			result.kind == Inspect::ValueKind::ObjectReference || result.kind == Inspect::ValueKind::ArrayReference;
+		const bool is_reference = result.kind == Inspect::ValueKind::ObjectReference ||
+			result.kind == Inspect::ValueKind::ArrayReference || result.kind == Inspect::ValueKind::String;
 		if (is_reference && result.object) {
 			// Allocate a token that cannot clash with a component/member reference.
 			std::uint64_t reference_token = 0;
@@ -2932,6 +3181,7 @@ namespace Explorer {
 			return;
 		}
 		std::string error;
+		remember_managed_method(method);
 		if (!MethodTracer::start(method, error)) {
 			set_status("Method tracing failed: " + error);
 			return;
@@ -3186,7 +3436,7 @@ namespace Explorer {
 			set_status("Referenced object was released");
 			return;
 		}
-		const Inspect::TypeInfo type = Inspect::TypeOf(object);
+		const Inspect::TypeInfo type = safe_type_of(object);
 		if (type.full_name == "UnityEngine.GameObject") {
 			// GameObjects have a dedicated hierarchy/Inspector flow.  Sending one
 			// through the generic Object Inspector only reflects the GameObject
@@ -3235,6 +3485,9 @@ namespace Explorer {
 		inspector.valid = true;
 		inspector.token = token;
 		inspector.type_name = type.full_name.empty() ? "<object>" : type.full_name;
+		inspector.assembly_name = assembly_name(type);
+		inspector.namespace_name = type.namespc;
+		inspector.class_name = type.name;
 		inspector.pointer_text = pointer_text(rooted.handle());
 		inspector.is_value_type = type.is_value_type;
 		inspector.is_array = Inspect::type_name_looks_array(inspector.type_name);
@@ -3263,6 +3516,9 @@ namespace Explorer {
 		}
 		inspector.component.instance_id = 0;
 		inspector.component.type_name = inspector.type_name;
+		inspector.component.assembly_name = inspector.assembly_name;
+		inspector.component.namespace_name = inspector.namespace_name;
+		inspector.component.class_name = inspector.class_name;
 
 		if (inspector.is_array) {
 			working_.object_inspector = std::move(inspector);
@@ -3278,12 +3534,16 @@ namespace Explorer {
 		auto metadata = std::make_shared<ComponentInfo::Metadata>();
 		metadata->fields.reserve(reflection.fields.size());
 		for (const Inspect::FieldInfo& field : reflection.fields) {
-			metadata->fields.push_back({ field.name, field.type_name, field.declaring_type.full_name, field.is_static });
+			metadata->fields.push_back({ field.name, field.type_name, field.declaring_type.full_name, field.is_static,
+				{}, field.is_value_type, field.is_enum, !field.type_is_opaque,
+				field.type_is_opaque ? "Runtime-specific type; metadata is available but generic read/write is unsafe." : "" });
 		}
 		metadata->properties.reserve(reflection.properties.size());
 		for (const Inspect::PropertyInfo& property : reflection.properties) {
 			metadata->properties.push_back({ property.name, property.type_name, property.declaring_type.full_name,
-											property.can_read, property.can_write });
+									 property.can_read, property.can_write, {}, property.is_value_type, property.is_enum,
+									 !property.type_is_opaque,
+									 property.type_is_opaque ? "Runtime-specific type; metadata is available but generic read/write is unsafe." : "" });
 		}
 		metadata->methods.reserve(reflection.methods.size());
 		for (const Inspect::MethodInfo& method : reflection.methods) {
@@ -3292,9 +3552,19 @@ namespace Explorer {
 			member.return_type = method.return_type;
 			member.declaring_type = method.declaring_type.full_name;
 			member.is_static = method.is_static;
+			member.return_is_value_type = method.return_is_value_type;
+			member.return_is_enum = method.return_is_enum;
+			member.runtime_callable = !method.return_type_is_opaque &&
+				std::none_of(method.parameters.begin(), method.parameters.end(), [](const Inspect::MethodParamInfo& parameter) {
+					return parameter.is_opaque;
+					});
+			if (!member.runtime_callable)
+				member.capability_reason = "Runtime-specific by-ref/internal signature; generic invocation is disabled.";
 			for (const Inspect::MethodParamInfo& parameter : method.parameters) {
 				member.parameter_types.push_back(parameter.type_name);
 				member.parameter_names.push_back(parameter.name);
+				member.parameter_is_value_types.push_back(parameter.is_value_type);
+				member.parameter_is_enums.push_back(parameter.is_enum);
 			}
 			metadata->methods.push_back(std::move(member));
 		}
@@ -3578,27 +3848,52 @@ namespace Explorer {
 	}
 
 	void RuntimeModel::update_camera_transition(Clock::time_point now) {
-		if (!camera_transition_active_)
+		if (!camera_focus_active_ || !focused_camera_handle_.handle)
 			return;
-		if (!camera_focus_active_ || !focused_camera_handle_.handle) {
-			camera_transition_active_ = false;
-			return;
-		}
 		const Camera camera{ Inspect::ResolveObjectHandle(focused_camera_handle_).handle() };
 		const Transform camera_transform = camera.transform();
 		if (!safe_object_alive(camera_transform)) {
 			camera_transition_active_ = false;
 			return;
 		}
-		const float elapsed = std::chrono::duration<float>(now - camera_transition_started_).count();
-		const float duration = std::chrono::duration<float>(kCameraFocusTransition).count();
-		const float linear_amount = duration > 0.0f ? std::clamp(elapsed / duration, 0.0f, 1.0f) : 1.0f;
-		const float amount = linear_amount * linear_amount * (3.0f - 2.0f * linear_amount);
-		camera_transform.set_localPosition(camera_transition_start_position);
-		camera_transform.set_localRotation(
-			quaternion_slerp(camera_transition_start_rotation, camera_transition_target_rotation, amount));
-		if (linear_amount >= 1.0f)
+
+		if (camera_transition_active_) {
+			const float elapsed = std::chrono::duration<float>(now - camera_transition_started_).count();
+			const float duration = std::chrono::duration<float>(kCameraFocusTransition).count();
+			const float linear_amount = duration > 0.0f ? std::clamp(elapsed / duration, 0.0f, 1.0f) : 1.0f;
+			const float amount = linear_amount * linear_amount * (3.0f - 2.0f * linear_amount);
+			camera_transform.set_position(camera_transition_start_position * (1.0f - amount) +
+				camera_transition_target_position * amount);
+			camera_transform.set_localRotation(
+				quaternion_slerp(camera_transition_start_rotation, camera_transition_target_rotation, amount));
+			if (linear_amount < 1.0f)
+				return;
 			camera_transition_active_ = false;
+		}
+
+		// The game's camera controller may write its own local pose after the
+		// initial transition (Heartophia does this for the player camera). Keep
+		// the focus pose authoritative until the user explicitly restores the
+		// camera. The target owns the focus even if the user double-clicked a
+		// hierarchy row without changing the current Inspector selection.
+		const GameObject target{ Inspect::ResolveObjectHandle(focused_target_handle_).handle() };
+		if (!safe_object_alive(target)) {
+			restore_focused_camera();
+			return;
+		}
+		const Transform target_transform = target.transform();
+		if (!safe_object_alive(target_transform)) {
+			restore_focused_camera();
+			return;
+		}
+		clear_error();
+		const Vector3 target_position = target_transform.position();
+		camera_transform.set_position(target_position + camera_focus_offset);
+		camera_transform.LookAt(target_position);
+		if (const char* error = last_error(); error && error[0]) {
+			clear_error();
+			ModLog::warn("Camera focus hold failed; retaining the previous camera pose: %s", error);
+		}
 	}
 
 	void RuntimeModel::focus_selected_camera(GameObject object) {
@@ -3630,8 +3925,15 @@ namespace Explorer {
 
 		if (camera_focus_active_)
 			restore_focused_camera();
+		focused_target_handle_ = Inspect::PinObject(Object{ object.handle() });
+		if (!focused_target_handle_.handle) {
+			set_status("Camera focus failed: target could not be rooted");
+			return;
+		}
 		focused_camera_handle_ = Inspect::PinObject(Object{ camera.handle() });
 		if (!focused_camera_handle_.handle) {
+			Inspect::FreeObjectHandle(focused_target_handle_);
+			focused_target_handle_ = {};
 			set_status("Camera focus failed: camera could not be rooted");
 			return;
 		}
@@ -3640,6 +3942,8 @@ namespace Explorer {
 		if (!safe_object_alive(rooted_transform)) {
 			Inspect::FreeObjectHandle(focused_camera_handle_);
 			focused_camera_handle_ = {};
+			Inspect::FreeObjectHandle(focused_target_handle_);
+			focused_target_handle_ = {};
 			set_status("Camera focus failed: camera Transform is unavailable");
 			return;
 		}
@@ -3647,25 +3951,61 @@ namespace Explorer {
 		saved_camera_rotation = rooted_transform.rotation();
 		saved_camera_local_position = rooted_transform.localPosition();
 		saved_camera_local_rotation = rooted_transform.localRotation();
-		camera_transition_start_position = saved_camera_local_position;
+		const Vector3 target_position = target_transform.position();
+		Vector3 offset = saved_camera_position - target_position;
+		float offset_length = offset.magnitude();
+		if (!std::isfinite(offset_length) || offset_length <= 0.001f) {
+			offset = -rooted_transform.forward();
+			offset_length = offset.magnitude();
+		}
+		if (!std::isfinite(offset_length) || offset_length <= 0.001f) {
+			offset = { 0.0f, 0.0f, -1.0f };
+			offset_length = 1.0f;
+		}
+		Vector3 horizontal_offset{ offset.x, 0.0f, offset.z };
+		float horizontal_length = horizontal_offset.magnitude();
+		if (!std::isfinite(horizontal_length) || horizontal_length <= 0.001f) {
+			const Vector3 forward = rooted_transform.forward();
+			horizontal_offset = { -forward.x, 0.0f, -forward.z };
+			horizontal_length = horizontal_offset.magnitude();
+		}
+		if (!std::isfinite(horizontal_length) || horizontal_length <= 0.001f) {
+			horizontal_offset = { 0.0f, 0.0f, -1.0f };
+			horizontal_length = 1.0f;
+		}
+		camera_focus_heading = horizontal_offset / horizontal_length;
+		// Editor-like focus is deliberately above the target. Keeping this in
+		// world-space prevents the former side-on pose from being pushed into
+		// sloped terrain, oversized colliders, or world-space UI. A small
+		// retained horizontal offset gives the view a useful perspective angle.
+		camera_focus_offset = camera_focus_top_down_
+			? camera_focus_heading * camera_focus_tilt_ + Vector3{ 0.0f, camera_focus_distance_, 0.0f }
+			: offset / offset_length * camera_focus_distance_;
+		camera_transition_start_position = saved_camera_position;
+		camera_transition_target_position = target_position + camera_focus_offset;
 		camera_transition_start_rotation = saved_camera_local_rotation;
-		rooted_transform.LookAt(target_transform.position());
+		rooted_transform.set_position(camera_transition_target_position);
+		rooted_transform.LookAt(target_position);
 		if (const char* error = last_error(); error && error[0]) {
 			const std::string message = std::string("Camera focus failed: ") + error;
 			clear_error();
 			Inspect::FreeObjectHandle(focused_camera_handle_);
 			focused_camera_handle_ = {};
+			Inspect::FreeObjectHandle(focused_target_handle_);
+			focused_target_handle_ = {};
 			set_status(message);
 			return;
 		}
 		camera_transition_target_rotation = rooted_transform.localRotation();
-		rooted_transform.set_localPosition(camera_transition_start_position);
+		rooted_transform.set_position(camera_transition_start_position);
 		rooted_transform.set_localRotation(camera_transition_start_rotation);
 		if (const char* error = last_error(); error && error[0]) {
 			const std::string message = std::string("Camera focus transition failed: ") + error;
 			clear_error();
 			Inspect::FreeObjectHandle(focused_camera_handle_);
 			focused_camera_handle_ = {};
+			Inspect::FreeObjectHandle(focused_target_handle_);
+			focused_target_handle_ = {};
 			set_status(message);
 			return;
 		}
@@ -3673,7 +4013,7 @@ namespace Explorer {
 		working_.camera_focus_active = true;
 		camera_transition_started_ = Clock::now();
 		camera_transition_active_ = true;
-		set_status("Camera focused on " + object.name() + " (use Return camera to restore it)");
+		set_status("Camera moved to and following " + object.name() + " (use Return camera to restore it)");
 	}
 
 	void RuntimeModel::restore_focused_camera() {
@@ -3703,18 +4043,31 @@ namespace Explorer {
 			Inspect::FreeObjectHandle(focused_camera_handle_);
 			focused_camera_handle_ = {};
 		}
+		Inspect::FreeObjectHandle(focused_target_handle_);
+		focused_target_handle_ = {};
 		camera_focus_active_ = false;
 		working_.camera_focus_active = false;
 		set_status(restored ? "Camera restored" : "Camera focus ended; the original camera was unavailable");
 	}
 
 	void RuntimeModel::update_highlight() {
+		if (!highlight_enabled_) {
+			if (highlight_id_ != 0) {
+				ModUI::Highlight::enqueue_remove(highlight_id_);
+				highlight_id_ = 0;
+			}
+			if (highlight_locator_id_ != 0) {
+				ModUI::Highlight::enqueue_remove(highlight_locator_id_);
+				highlight_locator_id_ = 0;
+			}
+			return;
+		}
 		if (!safe_object_alive(selected_))
 			return;
 
 		ModUI::Highlight::Style style{};
-		style.color = IM_COL32(80, 220, 255, 255);
-		style.fill_color = IM_COL32(40, 190, 255, 42);
+		style.color = IM_COL32(50, 235, 255, 255);
+		style.fill_color = IM_COL32(40, 190, 255, 72);
 		style.label_color = IM_COL32(255, 255, 255, 255);
 		style.label_bg_color = IM_COL32(7, 16, 24, 238);
 		style.label_border_color = IM_COL32(80, 220, 255, 255);
@@ -3722,17 +4075,17 @@ namespace Explorer {
 		style.corner_box = true;
 		style.filled = true;
 		style.shadow = true;
-		style.thickness = 2.5f;
-		style.corner_length = 14.0f;
+		style.thickness = 3.5f;
+		style.corner_length = 18.0f;
 		style.draw_label = true;
 		style.label_above_box = true;
 		style.max_distance = highlight_max_distance_;
 		// Use renderer bounds when available.
 		style.offscreen_indicator = false;
-		const std::string label = selected_.name();
+		std::string label = selected_.name();
 
 		const Transform selected_transform = selected_.transform();
-		const std::string transform_type = selected_transform ? selected_transform.runtime_class_name() : std::string{};
+		const std::string transform_type = selected_transform ? safe_runtime_class_name(selected_transform) : std::string{};
 		const bool is_rect_transform = transform_type == "UnityEngine.RectTransform" ||
 			transform_type == "RectTransform";
 		// Canvas children require the canvas camera, not necessarily Camera.main.
@@ -3773,29 +4126,15 @@ namespace Explorer {
 					break;
 			}
 
-			// Prefer the tagged main camera only when it can actually see the
-			// target.  A main camera may be a disabled/transitioning view while a
-			// gameplay camera is rendering the frame, which otherwise projects the
-			// highlight far away from the selected object.
-			if (main_camera) {
-				int visible_samples = 0;
-				for (const Vector3& sample : camera_samples) {
-					const Vector3 viewport = main_camera.WorldToViewportPoint(sample);
-					if (std::isfinite(viewport.x) && std::isfinite(viewport.y) &&
-						std::isfinite(viewport.z) && viewport.z > 0.01f &&
-						viewport.x >= 0.0f && viewport.x <= 1.0f &&
-						viewport.y >= 0.0f && viewport.y <= 1.0f)
-						++visible_samples;
-				}
-				if (visible_samples > 0)
-					camera = main_camera;
-			}
+			// Camera.main is the camera that defines the player's screen in the
+			// usual case.  Do not replace it merely because a scene/minimap camera
+			// can see the object: that made off-screen locators jump to the wrong side.
+			camera = main_camera;
 
-			// If the main camera cannot see the target, fall back to the active
-			// camera with the most visible samples.  This covers split-screen,
-			// camera stacks, and games that do not tag their gameplay camera.
+			// Untagged games still need a fallback.  Only pick a camera that has a
+			// real on-screen sample, so a hidden auxiliary camera cannot win a tie.
 			if (!camera) {
-				int best_visible_samples = -1;
+				int best_visible_samples = 0;
 				int best_front_samples = -1;
 				float best_center_distance = std::numeric_limits<float>::max();
 				for (const Inspect::ObjectHandle& camera_handle : highlight_cameras_) {
@@ -3819,10 +4158,10 @@ namespace Explorer {
 								++visible_samples;
 						}
 					}
-					if (visible_samples > best_visible_samples ||
+					if (visible_samples > 0 && (visible_samples > best_visible_samples ||
 						(visible_samples == best_visible_samples && front_samples > best_front_samples) ||
 						(visible_samples == best_visible_samples && front_samples == best_front_samples &&
-							center_distance < best_center_distance)) {
+							center_distance < best_center_distance))) {
 						camera = candidate;
 						best_visible_samples = visible_samples;
 						best_front_samples = front_samples;
@@ -3852,11 +4191,18 @@ namespace Explorer {
 			};
 
 		const Vector3 selected_position = selected_transform ? selected_transform.position() : Vector3{};
-		if (highlight_max_distance_ > 0.0f && camera) {
+		float selected_distance = -1.0f;
+		if (camera) {
 			const Transform camera_transform = camera.transform();
 			if (camera_transform) {
-				const float camera_distance = Vector3::distance(selected_position, camera_transform.position());
-				if (std::isfinite(camera_distance) && camera_distance > highlight_max_distance_) {
+				selected_distance = Vector3::distance(selected_position, camera_transform.position());
+				if (std::isfinite(selected_distance) && selected_distance >= 0.0f) {
+					char distance_text[48]{};
+					std::snprintf(distance_text, sizeof(distance_text), "  |  %.1f m", selected_distance);
+					label += distance_text;
+				}
+				if (highlight_max_distance_ > 0.0f && std::isfinite(selected_distance) &&
+					selected_distance > highlight_max_distance_) {
 					if (highlight_id_ != 0) {
 						ModUI::Highlight::enqueue_remove(highlight_id_);
 						highlight_id_ = 0;
@@ -3922,9 +4268,13 @@ namespace Explorer {
 			};
 		const bool rect_projected = project_rect_transform();
 		projected = rect_projected;
-		// Union every projected renderer under the selected GameObject.  Picking
-		// only the nearest renderer makes parent objects appear highlighted at a
-		// seemingly arbitrary child, especially when the active camera changes.
+		// Union renderers that plausibly belong to the selected object. Some VFX
+		// and UI renderers report a screen-sized bounds even when their GameObject
+		// is a small child; accepting those turns a nearby selection into a giant
+		// highlight rectangle.
+		const float maximum_bounds_radius = selected_distance > 0.01f
+			? std::max(2.5f, selected_distance * 1.5f)
+			: 100.0f;
 		for (const Inspect::ObjectHandle& renderer_handle : highlight_renderers_) {
 			const Renderer renderer{ Inspect::ResolveObjectHandle(renderer_handle).handle() };
 			if (rect_projected || !camera)
@@ -3932,6 +4282,11 @@ namespace Explorer {
 			if (!safe_object_alive(renderer))
 				continue;
 			const Bounds bounds = renderer.bounds();
+			const float bounds_radius = bounds.extents.magnitude();
+			if (!std::isfinite(bounds.center.x) || !std::isfinite(bounds.center.y) ||
+				!std::isfinite(bounds.center.z) || !std::isfinite(bounds_radius) ||
+				bounds_radius <= 0.0001f || bounds_radius > maximum_bounds_radius)
+				continue;
 			const Vector3 min = bounds.min();
 			const Vector3 max = bounds.max();
 			const Vector3 corners[] = {
@@ -4033,12 +4388,12 @@ namespace Explorer {
 				const Vector3 direction = offset / distance;
 				float horizontal = Vector3::dot(direction, camera_transform.right());
 				float vertical = -Vector3::dot(direction, camera_transform.up());
-				horizontal = -horizontal;
-				vertical = -vertical;
 				const float length = std::sqrt(horizontal * horizontal + vertical * vertical);
 				if (length <= 0.0001f) {
 					horizontal = 0.0f;
-					vertical = -1.0f;
+					// A target exactly behind the player has no left/right component.
+					// Use the lower edge to communicate "turn around", not the top.
+					vertical = 1.0f;
 				}
 				else {
 					horizontal /= length;
@@ -4059,23 +4414,24 @@ namespace Explorer {
 			locator_style.corner_length = 8.0f;
 			locator_style.draw_label = true;
 			locator_style.label_above_box = false;
+			locator_style.offscreen_indicator = true;
+			locator_style.indicator_color = IM_COL32(255, 145, 48, 255);
+			locator_style.indicator_thickness = 3.5f;
+			locator_style.indicator_head_size = 14.0f;
+			locator_style.indicator_center_gap = 10.0f;
+			// Zero keeps the arrow connected to the edge marker.
+			locator_style.indicator_length = 0.0f;
+			locator_style.indicator_center_dot_radius = 4.5f;
 			const ImVec2 min(edge_x - 10.0f, edge_y - 10.0f);
 			const ImVec2 max(edge_x + 10.0f, edge_y + 10.0f);
+			const std::string locator_label = "OFFSCREEN  " + label;
 			if (highlight_locator_id_ == 0) {
-				const float left_overflow = -locator_x;
-				const float right_overflow = locator_x - screen_width;
-				const float top_overflow = -locator_y;
-				const float bottom_overflow = locator_y - screen_height;
-				const float dominant_overflow = std::max({ left_overflow, right_overflow, top_overflow, bottom_overflow });
-				const char* direction = dominant_overflow == left_overflow ? "<-- " :
-					dominant_overflow == right_overflow ? "--> " :
-					dominant_overflow == top_overflow ? "^ " : "v ";
-				const std::string locator_label = std::string(direction) + "OFFSCREEN  " + label;
 				highlight_locator_id_ = ModUI::Highlight::enqueue_add_screen_rect(
 					min, max, locator_label.c_str(), locator_style);
 			}
 			else {
 				ModUI::Highlight::enqueue_set_screen_rect(highlight_locator_id_, min, max);
+				ModUI::Highlight::enqueue_set_label(highlight_locator_id_, locator_label.c_str());
 			}
 			};
 
@@ -4091,8 +4447,10 @@ namespace Explorer {
 
 		constexpr float kPadding = 3.0f;
 		constexpr float kMinimumSize = 14.0f;
-		// Fall back to an anchor for invalidly large bounds.
-		if (max_x - min_x > screen_width * 1.75f || max_y - min_y > screen_height * 1.75f) {
+		// Fall back to an anchor for invalid or screen-dominating bounds. A normal
+		// object may be close, but a single selection should never obscure most of
+		// the game view because one child renderer has an oversized AABB.
+		if (max_x - min_x > screen_width * 0.65f || max_y - min_y > screen_height * 0.65f) {
 			use_transform_anchor();
 		}
 		min_x -= kPadding;
@@ -4115,6 +4473,8 @@ namespace Explorer {
 			ModUI::Highlight::enqueue_add_screen_rect(ImVec2(min_x, min_y), ImVec2(max_x, max_y), label.c_str(), style);
 		else
 			ModUI::Highlight::enqueue_set_screen_rect(highlight_id_, ImVec2(min_x, min_y), ImVec2(max_x, max_y));
+		if (highlight_id_ != 0)
+			ModUI::Highlight::enqueue_set_label(highlight_id_, label.c_str());
 	}
 
 	void RuntimeModel::clear_highlight_renderer_cache() {
@@ -4161,6 +4521,8 @@ namespace Explorer {
 		highlight_locator_id_ = 0;
 		Inspect::FreeObjectHandle(focused_camera_handle_);
 		focused_camera_handle_ = {};
+		Inspect::FreeObjectHandle(focused_target_handle_);
+		focused_target_handle_ = {};
 		camera_focus_active_ = false;
 		camera_transition_active_ = false;
 
@@ -4219,6 +4581,44 @@ namespace Explorer {
 		ModLog::error("%s", working_.status.c_str());
 	}
 
+	const char* RuntimeModel::command_name(CommandKind kind) {
+		switch (kind) {
+		case CommandKind::Select: return "Select object";
+		case CommandKind::Refresh: return "Refresh hierarchy";
+		case CommandKind::LoadComponentMetadata: return "Load component metadata";
+		case CommandKind::SetFieldValue: return "Write field";
+		case CommandKind::SetPropertyValue: return "Write property";
+		case CommandKind::SampleMemberValue: return "Read member";
+		case CommandKind::InvokeMethod: return "Execute method";
+		case CommandKind::SetMethodTrace: return "Configure method trace";
+		case CommandKind::InspectReference: return "Inspect reference";
+		case CommandKind::SetActive: return "Set GameObject active";
+		case CommandKind::DeleteObject: return "Delete GameObject";
+		case CommandKind::DeleteComponent: return "Delete component";
+		case CommandKind::FocusSelected: return "Focus camera";
+		case CommandKind::RestoreCamera: return "Restore camera";
+		case CommandKind::SetCameraFocusDistance: return "Set camera focus distance";
+		case CommandKind::SetCameraFocusTopDown: return "Set camera focus orientation";
+		case CommandKind::SetCameraFocusTilt: return "Set camera focus tilt";
+		case CommandKind::SceneHint: return "Scene transition";
+		case CommandKind::ClearFlightRecorder: return "Clear flight recorder";
+		default: return "Explorer command";
+		}
+	}
+
+	void RuntimeModel::record_flight(std::string stage, std::string operation, std::string detail) {
+		constexpr std::size_t kMaxFlightEvents = 50;
+		Snapshot::FlightEvent event{};
+		event.sequence = next_flight_sequence_++;
+		event.seconds_since_start = std::chrono::duration<double>(Clock::now() - flight_recorder_started_).count();
+		event.stage = std::move(stage);
+		event.operation = std::move(operation);
+		event.detail = std::move(detail);
+		if (working_.flight_recorder.size() == kMaxFlightEvents)
+			working_.flight_recorder.erase(working_.flight_recorder.begin());
+		working_.flight_recorder.push_back(std::move(event));
+	}
+
 	void RuntimeModel::record_value_error(std::string context, const Inspect::ValueInfo& value) {
 		if (value.readable || value.display.empty() || value.display == "Not sampled")
 			return;
@@ -4247,6 +4647,10 @@ namespace Explorer {
 		working_.component_class_catalog = component_class_catalog_;
 		working_.class_browser_catalog = class_browser_catalog_;
 		working_.live_data = live_data_;
+		working_.highlight_enabled = highlight_enabled_;
+		working_.camera_focus_distance = camera_focus_distance_;
+		working_.camera_focus_tilt = camera_focus_tilt_;
+		working_.camera_focus_top_down = camera_focus_top_down_;
 		working_.method_traces = MethodTracer::snapshots();
 		working_.field_watches.clear();
 		working_.field_watches.reserve(field_watches_.size());
@@ -4259,6 +4663,8 @@ namespace Explorer {
 		for (MethodTracer::Snapshot& trace : working_.method_traces) {
 			for (MethodTracer::Record& record : trace.records) {
 				record.caller_display = managed_caller_location(record.caller_address);
+				if (record.return_captured && trace.return_type == "System.String")
+					record.return_display = describe_traced_string(record.return_rax);
 				if (trace.target_is_reference)
 					record.target_display = describe_traced_reference(record.target_address, trace.declaring_type);
 				record.argument_displays.resize(record.arguments.size());

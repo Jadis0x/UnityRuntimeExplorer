@@ -55,12 +55,28 @@ struct ComponentInfo {
     bool enabled = false;
     bool metadata_unavailable = false;
     std::string metadata_error;
+    // Some games expose managed scripts through an IL2CPP bridge component.
+    // This describes capabilities that are safe to discover without assuming a
+    // game-specific serialization format.
+    struct DynamicScriptBridge {
+        bool detected = false;
+        std::string behaviour_type;
+        std::string type_getter;
+        int type_getter_method_index = -1;
+        std::vector<std::string> serialized_data_methods;
+        std::vector<std::string> object_reference_methods;
+        std::string diagnostic;
+    } dynamic_bridge;
     struct Field {
         std::string name;
         std::string type_name;
         std::string declaring_type;
         bool is_static = false;
         std::string pointer_text;
+        bool is_value_type = false;
+        bool is_enum = false;
+        bool runtime_safe = true;
+        std::string capability_reason;
     };
     struct Property {
         std::string name;
@@ -69,6 +85,10 @@ struct ComponentInfo {
         bool can_read = false;
         bool can_write = false;
         std::string pointer_text;
+        bool is_value_type = false;
+        bool is_enum = false;
+        bool runtime_safe = true;
+        std::string capability_reason;
     };
     struct Method {
         std::string name;
@@ -76,8 +96,14 @@ struct ComponentInfo {
         std::string declaring_type;
         std::vector<std::string> parameter_types;
         std::vector<std::string> parameter_names;
+        std::vector<bool> parameter_is_value_types;
+        std::vector<bool> parameter_is_enums;
         bool is_static = false;
         std::string pointer_text;
+        bool return_is_value_type = false;
+        bool return_is_enum = false;
+        bool runtime_callable = true;
+        std::string capability_reason;
     };
     // Reflection metadata is immutable and shared across snapshots.
     struct Metadata {
@@ -166,6 +192,9 @@ struct ObjectInspectorInfo {
     std::size_t array_length = 0;
     std::size_t array_offset = 0;
     std::string type_name;
+    std::string assembly_name;
+    std::string namespace_name;
+    std::string class_name;
     std::string pointer_text;
     std::string array_element_type;
     // For arrays, `fields`/`field_references` are element values/references.
@@ -199,6 +228,13 @@ struct InspectorInfo {
 };
 
 struct Snapshot {
+    struct FlightEvent {
+        std::uint64_t sequence = 0;
+        double seconds_since_start = 0.0;
+        std::string stage;
+        std::string operation;
+        std::string detail;
+    };
     struct FieldWatchEvent {
         std::uint64_t sequence = 0;
         double seconds_since_start = 0.0;
@@ -245,10 +281,19 @@ struct Snapshot {
     InspectorInfo inspector;
     ObjectInspectorInfo object_inspector;
     bool live_data = false;
+    bool highlight_enabled = true;
+    // This must be configurable because a practical focus distance differs
+    // widely between games and object scales.
+    float camera_focus_distance = 8.0f;
+    float camera_focus_tilt = 3.0f;
+    bool camera_focus_top_down = true;
     bool camera_focus_active = false;
     int selected_instance_id = 0;
     std::string status;
     std::vector<std::string> diagnostics;
+    // Native-only breadcrumb data: retained across an SEH recovery so the
+    // operation that faulted is still visible after managed state is released.
+    std::vector<FlightEvent> flight_recorder;
     // The most recent result of each executed method.  Object results retain a
     // tracked reference so the UI can open them in the Object Inspector.
     std::unordered_map<std::uint64_t, MethodResult> method_results;
@@ -310,6 +355,11 @@ enum class CommandKind {
     SetHighlightDistance = 40,
     FocusSelected = 41,
     RestoreCamera = 42,
+    SetHighlightEnabled = 43,
+    ClearFlightRecorder = 44,
+    SetCameraFocusDistance = 45,
+    SetCameraFocusTopDown = 46,
+    SetCameraFocusTilt = 47,
 };
 
 struct Command {
@@ -414,6 +464,8 @@ class RuntimeModel {
     // one of those handles may be the invalid pointer that raised the fault.
     void discard_managed_state_after_native_fault();
     void set_status(std::string message);
+    void record_flight(std::string stage, std::string operation, std::string detail = {});
+    static const char* command_name(CommandKind kind);
     void record_value_error(std::string context, const URK::Unity::Inspect::ValueInfo &value);
     void capture_last_error(std::string_view action);
     void publish();
@@ -438,6 +490,8 @@ class RuntimeModel {
     std::uint64_t next_hierarchy_revision_ = 1;
     std::uint64_t scene_generation_ = 1;
     std::atomic<std::uint64_t> next_command_sequence_{1};
+    std::uint64_t next_flight_sequence_ = 1;
+    Clock::time_point flight_recorder_started_{};
     std::uint64_t next_method_result_id_ = 1;
     std::uint64_t next_field_watch_id_ = 1;
     URK::Unity::Inspect::ObjectHandle object_inspector_handle_{};
@@ -479,9 +533,16 @@ class RuntimeModel {
     std::vector<URK::Unity::Inspect::ObjectHandle> highlight_cameras_;
     std::uint32_t highlight_id_ = 0;
     std::uint32_t highlight_locator_id_ = 0;
+    bool highlight_enabled_ = true;
     // Zero means unlimited highlight distance.
     float highlight_max_distance_ = 0.0f;
+    // Follow from above by default. World-space Y avoids terrain clipping
+    // caused by preserving the player's side-on camera direction.
+    float camera_focus_distance_ = 8.0f;
+    float camera_focus_tilt_ = 3.0f;
+    bool camera_focus_top_down_ = true;
     URK::Unity::Inspect::ObjectHandle focused_camera_handle_{};
+    URK::Unity::Inspect::ObjectHandle focused_target_handle_{};
     URK::Unity::Vector3 saved_camera_position{};
     URK::Unity::Quaternion saved_camera_rotation{};
     URK::Unity::Vector3 saved_camera_local_position{};
@@ -490,6 +551,11 @@ class RuntimeModel {
     bool camera_transition_active_ = false;
     Clock::time_point camera_transition_started_{};
     URK::Unity::Vector3 camera_transition_start_position{};
+    URK::Unity::Vector3 camera_transition_target_position{};
+    URK::Unity::Vector3 camera_focus_offset{};
+    // Normalized horizontal direction from the target toward the original
+    // camera pose; retained while the target moves.
+    URK::Unity::Vector3 camera_focus_heading{ 0.0f, 0.0f, -1.0f };
     URK::Unity::Quaternion camera_transition_start_rotation{};
     URK::Unity::Quaternion camera_transition_target_rotation{};
     int active_scene_handle_hint_ = 0;

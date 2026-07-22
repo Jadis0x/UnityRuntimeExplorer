@@ -1,7 +1,10 @@
 #pragma once
 #include "unity_shortcuts.h"
 
+#include <algorithm>
 #include <array>
+#include <string>
+#include <string_view>
 #include <unordered_set>
 
 namespace URK::Unity {
@@ -12,6 +15,78 @@ inline constexpr std::size_t kMaxMetadataInheritanceDepth = 128;
 inline constexpr std::size_t kMaxMetadataMembers = 131072;
 inline constexpr std::size_t kMaxMetadataMembersPerClass = 32768;
 inline constexpr std::uint32_t kMaxMethodParameters = 256;
+
+// IL2CPP metadata is normally UTF-8, but some obfuscators deliberately use
+// invalid byte sequences for member names. Dear ImGui replaces those bytes with
+// identical replacement glyphs, making distinct methods impossible to tell
+// apart. Keep valid UTF-8 intact (including non-Latin scripts) and render only
+// malformed names as stable hex IDs.
+inline bool metadata_name_is_valid_utf8(std::string_view text) {
+    for (std::size_t index = 0; index < text.size();) {
+        const unsigned char first = static_cast<unsigned char>(text[index]);
+        if (first <= 0x7Fu) {
+            ++index;
+            continue;
+        }
+
+        const auto continuation = [&](std::size_t offset) {
+            return index + offset < text.size() &&
+                   (static_cast<unsigned char>(text[index + offset]) & 0xC0u) == 0x80u;
+        };
+        if (first >= 0xC2u && first <= 0xDFu && continuation(1)) {
+            index += 2;
+            continue;
+        }
+        if (first >= 0xE0u && first <= 0xEFu && continuation(1) && continuation(2)) {
+            const unsigned char second = static_cast<unsigned char>(text[index + 1]);
+            if ((first != 0xE0u || second >= 0xA0u) && (first != 0xEDu || second <= 0x9Fu)) {
+                index += 3;
+                continue;
+            }
+        }
+        if (first >= 0xF0u && first <= 0xF4u && continuation(1) && continuation(2) && continuation(3)) {
+            const unsigned char second = static_cast<unsigned char>(text[index + 1]);
+            if ((first != 0xF0u || second >= 0x90u) && (first != 0xF4u || second <= 0x8Fu)) {
+                index += 4;
+                continue;
+            }
+        }
+        return false;
+    }
+    return true;
+}
+
+inline std::string metadata_display_name(const char* value) {
+    if (!value || !value[0])
+        return {};
+
+    const std::string raw(value);
+    if (metadata_name_is_valid_utf8(raw))
+        return raw;
+
+    constexpr char kHex[] = "0123456789ABCDEF";
+    constexpr std::size_t kDisplayBytes = 24;
+    std::string display = "obf_";
+    const std::size_t byteCount = (std::min)(raw.size(), kDisplayBytes);
+    display.reserve(display.size() + byteCount * 2 + 9 + (raw.size() > byteCount ? 3 : 0));
+    for (std::size_t index = 0; index < byteCount; ++index) {
+        const unsigned char byte = static_cast<unsigned char>(raw[index]);
+        display.push_back(kHex[byte >> 4u]);
+        display.push_back(kHex[byte & 0x0Fu]);
+    }
+    if (raw.size() > byteCount)
+        display += "...";
+    std::uint32_t hash = 2166136261u;
+    for (const unsigned char byte : raw) {
+        hash ^= byte;
+        hash *= 16777619u;
+    }
+    display.push_back('_');
+    for (int shift = 28; shift >= 0; shift -= 4)
+        display.push_back(kHex[(hash >> static_cast<unsigned>(shift)) & 0x0Fu]);
+    return display;
+}
+
 #if defined(_WIN32)
 inline int metadata_exception_filter(unsigned long code) {
     // Access violation and in-page error are the only faults that can safely be
@@ -29,6 +104,13 @@ struct TypeInfo {
     bool is_value_type = false;
     bool is_enum = false;
 };
+struct MemberTypeInfo {
+    std::string name;
+    bool readable = false;
+    bool is_value_type = false;
+    bool is_enum = false;
+    bool is_opaque = false;
+};
 struct FieldInfo {
     const void* handle = nullptr;
     TypeInfo declaring_type;
@@ -39,11 +121,15 @@ struct FieldInfo {
     bool is_static = false;
     bool is_value_type = false;
     bool is_enum = false;
+    bool type_is_opaque = false;
 };
 struct MethodParamInfo {
     const void* type = nullptr;
     std::string name;
     std::string type_name;
+    bool is_value_type = false;
+    bool is_enum = false;
+    bool is_opaque = false;
 };
 struct MethodInfo {
     const void* handle = nullptr;
@@ -55,6 +141,9 @@ struct MethodInfo {
     std::uint32_t flags = 0;
     std::uint32_t iflags = 0;
     bool is_static = false;
+    bool return_is_value_type = false;
+    bool return_is_enum = false;
+    bool return_type_is_opaque = false;
 };
 struct PropertyInfo {
     const void* handle = nullptr;
@@ -70,6 +159,7 @@ struct PropertyInfo {
     bool is_static = false;
     bool is_value_type = false;
     bool is_enum = false;
+    bool type_is_opaque = false;
 };
 enum class ValueKind {
     Unavailable,
@@ -133,6 +223,71 @@ inline std::string type_name(const void* type) {
     return URK::il2cpp::type_get_name(static_cast<const URK::il2cpp::Type*>(type), out, sizeof(out))
         ? std::string(out) : std::string{};
 #endif
+}
+inline std::int32_t metadata_type_code(const void* type) {
+    if (!type) return -1;
+#if defined(_WIN32)
+    // This is intentionally best-effort.  It is used only to improve value
+    // rendering; a foreign type record must remain displayable even when it
+    // does not implement IL2CPP's class-resolution contract.
+    __try {
+        return URK::il2cpp::type_get_type(static_cast<const URK::il2cpp::Type*>(type));
+    } __except (metadata_exception_filter(_exception_code())) {
+        return -1;
+    }
+#else
+    return URK::il2cpp::type_get_type(static_cast<const URK::il2cpp::Type*>(type));
+#endif
+}
+inline MemberTypeInfo describe_member_type(const void* type) {
+    MemberTypeInfo out{};
+    out.name = type_name(type);
+    out.readable = !out.name.empty();
+    if (!out.readable) return out;
+
+    // ECMA-335 / Il2CppRGCTXDataType element kinds.  These answers come from
+    // the Type record itself and do not require type_get_class_or_element_class.
+    // In particular, do not resolve a Class just to learn traits for a method
+    // signature: DynamicMonoBehaviour exposes foreign Mono signatures there.
+    switch (metadata_type_code(type)) {
+    case 0x02: // BOOLEAN
+    case 0x03: // CHAR
+    case 0x04: // I1
+    case 0x05: // U1
+    case 0x06: // I2
+    case 0x07: // U2
+    case 0x08: // I4
+    case 0x09: // U4
+    case 0x0A: // I8
+    case 0x0B: // U8
+    case 0x0C: // R4
+    case 0x0D: // R8
+    case 0x11: // VALUETYPE
+    case 0x16: // TYPEDBYREF
+    case 0x18: // I
+    case 0x19: // U
+        out.is_value_type = true;
+        break;
+    case 0x55: // ENUM
+        out.is_value_type = true;
+        out.is_enum = true;
+        break;
+    case 0x10: // BYREF
+    case 0x13: // VAR
+    case 0x1B: // FNPTR
+    case 0x1E: // MVAR
+    case 0x1F: // CMOD_REQD
+    case 0x20: // CMOD_OPT
+    case 0x21: // INTERNAL
+        // These signatures require runtime-specific marshalling.  They are
+        // valid metadata and remain visible/copyable, but must never be read
+        // or invoked through the generic object/value path.
+        out.is_opaque = true;
+        break;
+    default:
+        break;
+    }
+    return out;
 }
 inline TypeInfo DescribeClass(const void* klass) {
     TypeInfo out{};
@@ -307,20 +462,20 @@ inline std::vector<FieldInfo> fields_from_class(const URK::il2cpp::Class* klass,
             info.handle = field;
             info.declaring_type = declaring;
             const char* name = URK::il2cpp::field_get_name(field);
-            info.name = name ? name : "";
+            info.name = metadata_display_name(name);
             const void* fieldType = URK::il2cpp::field_get_type(field);
-            const TypeInfo fieldTypeInfo = DescribeType(fieldType);
-            // A component can contain a transient/generated field whose type
-            // metadata is not readable yet. Do not retain that raw type
-            // pointer: a later live-value pass would dereference it again.
-            if (!fieldType || !fieldTypeInfo.handle)
+            const MemberTypeInfo fieldTypeInfo = describe_member_type(fieldType);
+            // Keep readable foreign signatures. They can be copied and shown,
+            // but their value traits remain deliberately conservative.
+            if (!fieldType || !fieldTypeInfo.readable)
                 continue;
             info.type = fieldType;
-            info.type_name = type_name(fieldType);
+            info.type_name = std::move(fieldTypeInfo.name);
             info.flags = URK::il2cpp::field_get_flags(field);
             info.is_static = (info.flags & kStaticMemberFlag) != 0;
             info.is_value_type = fieldTypeInfo.is_value_type;
             info.is_enum = fieldTypeInfo.is_enum;
+            info.type_is_opaque = fieldTypeInfo.is_opaque;
             out.push_back(info);
         }
     }
@@ -346,11 +501,15 @@ inline MethodInfo method_info(const URK::il2cpp::Method* method, TypeInfo declar
     info.handle = method;
     info.declaring_type = std::move(declaring);
     const char* name = URK::il2cpp::method_get_name(method);
-    info.name = name ? name : "";
+    info.name = metadata_display_name(name);
     info.flags = URK::il2cpp::method_get_flags(method, &info.iflags);
     info.is_static = (info.flags & kStaticMemberFlag) != 0;
     info.return_type_handle = URK::il2cpp::method_get_return_type(method);
-    info.return_type = type_name(info.return_type_handle);
+    const MemberTypeInfo return_type_info = describe_member_type(info.return_type_handle);
+    info.return_type = return_type_info.name;
+    info.return_is_value_type = return_type_info.is_value_type;
+    info.return_is_enum = return_type_info.is_enum;
+    info.return_type_is_opaque = return_type_info.is_opaque;
     const std::uint32_t count = URK::il2cpp::method_get_param_count(method);
     if (count > kMaxMethodParameters) {
         detail::set_error("Unity Inspect::Methods rejected an excessive parameter count");
@@ -364,7 +523,12 @@ inline MethodInfo method_info(const URK::il2cpp::Method* method, TypeInfo declar
         if (!paramType)
             return {};
         const char* paramName = URK::il2cpp::method_get_param_name(method, i);
-        info.parameters.push_back(MethodParamInfo{paramType, paramName ? paramName : "", type_name(paramType)});
+        const MemberTypeInfo parameter_type_info = describe_member_type(paramType);
+        if (!parameter_type_info.readable)
+            return {};
+        info.parameters.push_back(MethodParamInfo{paramType, metadata_display_name(paramName), parameter_type_info.name,
+                                                  parameter_type_info.is_value_type, parameter_type_info.is_enum,
+                                                  parameter_type_info.is_opaque});
     }
     return info;
 }
@@ -418,7 +582,7 @@ inline PropertyInfo property_info(const URK::il2cpp::Property* property, TypeInf
     info.handle = property;
     info.declaring_type = std::move(declaring);
     const char* name = URK::il2cpp::property_get_name(property);
-    info.name = name ? name : "";
+    info.name = metadata_display_name(name);
     info.flags = URK::il2cpp::property_get_flags(property);
     info.get_method = URK::il2cpp::property_get_get_method(property);
     info.set_method = URK::il2cpp::property_get_set_method(property);
@@ -435,13 +599,14 @@ inline PropertyInfo property_info(const URK::il2cpp::Property* property, TypeInf
     }
     const void* propertyType = info.get_method ? URK::il2cpp::method_get_return_type(static_cast<const URK::il2cpp::Method*>(info.get_method))
                                                : (info.set_method ? URK::il2cpp::method_get_param(static_cast<const URK::il2cpp::Method*>(info.set_method), 0) : nullptr);
-    const TypeInfo propertyTypeInfo = DescribeType(propertyType);
-    if (!propertyType || !propertyTypeInfo.handle)
+    const MemberTypeInfo propertyTypeInfo = describe_member_type(propertyType);
+    if (!propertyType || !propertyTypeInfo.readable)
         return {};
     info.type = propertyType;
-    info.type_name = type_name(propertyType);
+    info.type_name = propertyTypeInfo.name;
     info.is_value_type = propertyTypeInfo.is_value_type;
     info.is_enum = propertyTypeInfo.is_enum;
+    info.type_is_opaque = propertyTypeInfo.is_opaque;
     return info;
 }
 inline std::vector<PropertyInfo> properties_from_class(const URK::il2cpp::Class* klass, bool includeInherited) {
@@ -999,6 +1164,11 @@ inline bool SetArrayElement(const ValueInfo& array, std::size_t index, const Val
     return true;
 }
 inline bool method_argument_pointer(const MethodParamInfo& parameter, const ValueInfo& value, WriteStorage& storage, void*& pointer) {
+    if (parameter.is_opaque) {
+        detail::set_error(std::string("Unity Inspect::InvokeMethod cannot marshal runtime-specific parameter type: ") +
+                          parameter.type_name);
+        return false;
+    }
     const TypeInfo type = DescribeType(parameter.type);
     if (!type.handle && parameter.type_name.empty()) { detail::set_error("Unity Inspect::InvokeMethod failed: parameter type metadata is unavailable"); return false; }
     const std::string normalized = detail::normalized_type_name(parameter.type_name);
@@ -1045,6 +1215,11 @@ inline ValueInfo invoke_result_value(std::string typeName, const void* type, voi
 inline ValueInfo InvokeMethod(Object object, const MethodInfo& method, const std::vector<ValueInfo>& arguments = {}) {
     detail::clear_error();
     if (!method.handle) return unavailable_value(method.return_type, "Unity Inspect::InvokeMethod failed: method handle is null");
+    if (method.return_type_is_opaque) {
+        return unavailable_value(method.return_type,
+                                 std::string("Unity Inspect::InvokeMethod cannot safely inspect runtime-specific return type: ") +
+                                     method.return_type);
+    }
     if (arguments.size() != method.parameters.size()) return unavailable_value(method.return_type, std::string("Unity Inspect::InvokeMethod failed: argument count mismatch for ") + method.name);
     if (!method.is_static && !object.handle()) return unavailable_value(method.return_type, std::string("Unity Inspect::InvokeMethod failed: target object is null for instance method: ") + method.name);
     std::vector<WriteStorage> storage(arguments.size());
@@ -1084,6 +1259,8 @@ inline bool read_field_scalar_pointer(Object object, const FieldInfo& field, std
 }
 inline ValueInfo ReadField(Object object, const FieldInfo& field) {
     detail::clear_error();
+    if (field.type_is_opaque)
+        return unavailable_value(field.type_name, "field type requires runtime-specific marshalling");
     const std::string normalized = detail::normalized_type_name(field.type_name);
     if (normalized == "system.string") { void* ref = nullptr; return read_field_raw(object, field, &ref) ? string_value(field.type_name, ref) : unavailable_value(field.type_name, detail::fallback_error() ? detail::fallback_error() : "field read failed"); }
     if (!field.is_value_type) { void* ref = nullptr; return read_field_raw(object, field, &ref) ? object_reference_value(field.type_name, ref) : unavailable_value(field.type_name, detail::fallback_error() ? detail::fallback_error() : "field read failed"); }
@@ -1121,6 +1298,8 @@ inline ValueInfo ReadField(Object object, const FieldInfo& field) {
 }
 inline ValueInfo ReadProperty(Object object, const PropertyInfo& property) {
     detail::clear_error();
+    if (property.type_is_opaque)
+        return unavailable_value(property.type_name, "property type requires runtime-specific marshalling");
     if (!property.can_read || !property.get_method) return unavailable_value(property.type_name, std::string("property is not readable: ") + property.name);
     void* result = nullptr;
     void* ex = nullptr;
@@ -1146,6 +1325,10 @@ inline ValueInfo ReadProperty(Object object, const PropertyInfo& property) {
 }
 inline bool SetField(Object object, const FieldInfo& field, const ValueInfo& value) {
     detail::clear_error();
+    if (field.type_is_opaque) {
+        detail::set_error(std::string("Unity Inspect::SetField cannot marshal runtime-specific type: ") + field.type_name);
+        return false;
+    }
     if (!field.handle) { detail::set_error("Unity Inspect::SetField failed: field handle is null"); return false; }
     WriteStorage storage{};
     const std::string normalized = detail::normalized_type_name(field.type_name);
@@ -1179,6 +1362,10 @@ inline bool SetField(Object object, const FieldInfo& field, const ValueInfo& val
 }
 inline bool SetProperty(Object object, const PropertyInfo& property, const ValueInfo& value) {
     detail::clear_error();
+    if (property.type_is_opaque) {
+        detail::set_error(std::string("Unity Inspect::SetProperty cannot marshal runtime-specific type: ") + property.type_name);
+        return false;
+    }
     if (!property.can_write || !property.set_method) { detail::set_error(std::string("Unity Inspect::SetProperty failed: property is not writable: ") + property.name); return false; }
     WriteStorage storage{};
     void* arg = nullptr;

@@ -25,6 +25,9 @@ inline std::string message_text(void* message) {
   if (!message)
     return "<null>";
 
+#if defined(_WIN32)
+  __try {
+#endif
   auto* object = static_cast<URK::il2cpp::Object*>(message);
   const auto* klass = URK::il2cpp::object_get_class(object);
   const char* namespc = klass ? URK::il2cpp::class_get_namespace(klass) : nullptr;
@@ -41,6 +44,11 @@ inline std::string message_text(void* message) {
                 namespc && namespc[0] ? "." : "", name && name[0] ? name : "unknown",
                 message);
   return fallback;
+#if defined(_WIN32)
+  } __except (EXCEPTION_EXECUTE_HANDLER) {
+    return "<unreadable Unity log object>";
+  }
+#endif
 }
 
 inline void write(LogLevel level, void* message) {

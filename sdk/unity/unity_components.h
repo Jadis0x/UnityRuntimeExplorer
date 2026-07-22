@@ -968,7 +968,11 @@ struct GameObject : Object {
     Transform transform() const { return Call<Transform>("get_transform"); }
     bool activeSelf() const { return GetProperty<bool>("activeSelf"); }
     bool activeInHierarchy() const { return GetProperty<bool>("activeInHierarchy"); }
-    void SetActive(bool value) const { CallExact<void>("SetActive", {"System.Boolean"}, value); }
+    // Some protected IL2CPP players expose the Boolean parameter with a
+    // non-canonical type name. SetActive has a unique one-argument overload,
+    // so resolve it by name and arity instead of rejecting a valid method over
+    // a metadata spelling mismatch.
+    void SetActive(bool value) const { Call<void>("SetActive", value); }
     Scene scene() const { return Scene{Call<void*>("get_scene")}; }
     std::string tag() const;
     template<class T> T GetComponent() const { return T{GetComponent(T::unity_type().image, T::unity_type().namespc, T::unity_type().name).handle()}; }

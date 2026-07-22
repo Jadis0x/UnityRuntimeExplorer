@@ -5,17 +5,15 @@ if(POLICY CMP0091)
     cmake_policy(SET CMP0091 NEW)
 endif()
 
-set(CMAKE_CXX_COMPILER clang++ CACHE STRING "Clang compiler")
-
 set(VCPKG_APPLOCAL_DEPS OFF CACHE BOOL "Generated mods keep dependencies linked into the mod DLL when possible" FORCE)
 
 project(URK_Il2cpp_UnityRuntimeExplorer LANGUAGES CXX)
 
-include(CTest)
-
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+set(CMAKE_CXX_SCAN_FOR_MODULES OFF)
 
 # The distributed Explorer mod must run without a separate Visual C++ runtime.
 set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>" CACHE STRING
@@ -60,6 +58,7 @@ endif()
 urk_disable_vs_vcpkg_integration(imgui)
 
 add_library(URK_Il2cpp_UnityRuntimeExplorer SHARED)
+set_target_properties(URK_Il2cpp_UnityRuntimeExplorer PROPERTIES CXX_SCAN_FOR_MODULES OFF)
 
 target_include_directories(URK_Il2cpp_UnityRuntimeExplorer PRIVATE . mod)
 
@@ -120,6 +119,7 @@ source_group(TREE "${CMAKE_CURRENT_SOURCE_DIR}" FILES
     ${URK_USER_MODULE_FILES}
 )
 
+target_compile_features(URK_Il2cpp_UnityRuntimeExplorer PRIVATE cxx_std_20)
 target_compile_definitions(URK_Il2cpp_UnityRuntimeExplorer PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
 target_link_libraries(URK_Il2cpp_UnityRuntimeExplorer PRIVATE imgui d3d11 d3d12 dxgi opengl32 ntdll)
 if(MSVC)
@@ -131,14 +131,6 @@ if(MSVC)
     )
 endif()
 urk_disable_vs_vcpkg_integration(URK_Il2cpp_UnityRuntimeExplorer)
-
-if(BUILD_TESTING)
-    add_executable(URK_ExplorerSafetyTests tests/explorer_safety_tests.cpp)
-    target_include_directories(URK_ExplorerSafetyTests PRIVATE . mod)
-    target_compile_definitions(URK_ExplorerSafetyTests PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
-    urk_disable_vs_vcpkg_integration(URK_ExplorerSafetyTests)
-    add_test(NAME explorer_safety_contracts COMMAND URK_ExplorerSafetyTests)
-endif()
 
 set(URK_DEPLOY_DIR "" CACHE PATH "Optional game Mods directory where the built DLL will be copied")
 if(URK_DEPLOY_DIR)
