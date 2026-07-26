@@ -69,7 +69,7 @@ struct Snapshot {
 
 // A native detour captures game calls as well as Explorer invocations.
 bool start(const URK::Unity::Inspect::MethodInfo &method, std::string &error);
-bool stop(const URK::il2cpp::Method *method);
+bool stop(const URK::managed::Method *method);
 bool stop(TraceId id);
 bool clear(TraceId id);
 bool close(TraceId id);

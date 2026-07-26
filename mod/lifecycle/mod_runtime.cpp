@@ -45,19 +45,21 @@ int capture_runtime_fault(void* raw_info) {
 bool start(const URK_ModContext* ctx) {
   URK::set_context(ctx);
   if (!URK::initialize_backend(ctx)) {
-    ModLog::error("IL2CPP runtime API initialization failed");
+    ModLog::error("%s runtime API initialization failed", URK::compiled_runtime_name);
     return false;
   }
 
   Explorer::RuntimeModel::instance().start();
-  ModLog::info("runtime ready: backend=IL2CPP main_thread=%s scene_events=%s", URK::has_main_thread() ? "yes" : "no", URK::has_scene_events() ? "yes" : "no");
+  ModLog::info("runtime ready: backend=%s main_thread=%s scene_events=%s",
+               URK::compiled_runtime_name, URK::has_main_thread() ? "yes" : "no",
+               URK::has_scene_events() ? "yes" : "no");
   return true;
 }
 
 void update() {
 #if defined(_WIN32)
   // URKit unregisters a main-thread callback when an exception escapes it.
-  // Keep a malformed third-party IL2CPP metadata record isolated to this
+  // Keep a malformed third-party managed metadata record isolated to this
   // update; RuntimeModel will discard stale reflection state next frame.
   __try {
     Explorer::RuntimeModel::instance().tick();

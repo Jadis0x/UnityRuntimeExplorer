@@ -418,7 +418,7 @@ std::string urkit_cpp_type(std::string_view managed_type) {
 
 std::string hook_cpp_type(std::string_view managed_type) {
     const std::string type = urkit_cpp_type(managed_type);
-    return type == "std::string" || type.rfind("Managed_", 0) == 0 ? "URK::il2cpp::Object*" : type;
+    return type == "std::string" || type.rfind("Managed_", 0) == 0 ? "URK::managed::Object*" : type;
 }
 
 std::string code_value_placeholder(std::string_view managed_type, std::size_t index) {
@@ -607,7 +607,7 @@ std::string method_hook_code(const ComponentInfo::Method &method, const CodeCont
     std::string parameters;
     std::string call_arguments;
     if (!method.is_static) {
-        parameters = "URK::il2cpp::Object* self";
+        parameters = "URK::managed::Object* self";
         call_arguments = "self";
     }
     for (std::size_t index = 0; index < method.parameter_types.size(); ++index) {
@@ -619,17 +619,19 @@ std::string method_hook_code(const ComponentInfo::Method &method, const CodeCont
             call_arguments += ", ";
         call_arguments += argument_name;
     }
+#if defined(URK_BACKEND_IL2CPP)
     if (!parameters.empty())
         parameters += ", ";
-    parameters += "const URK::il2cpp::Method* method";
+    parameters += "const URK::managed::Method* method";
     if (!call_arguments.empty())
         call_arguments += ", ";
     call_arguments += "method";
+#endif
 
     const std::string fn = id + "_fn";
     const std::string original = "g_original_" + id;
     const std::string detour = "detour_" + id;
-    std::string code = "// Include sdk/il2cpp/il2cpp_helpers.h and sdk/runtime_api.h.\n";
+    std::string code = "// Include sdk/runtime/managed_hooks.h and sdk/runtime_api.h.\n";
     code += "// Managed signature: " + method_signature(method) + "\n";
     code += "using " + fn + " = " + return_type + "(__fastcall*) (" + parameters + ");\n";
     code += "inline " + fn + " " + original + "{};\n\n";
@@ -638,17 +640,25 @@ std::string method_hook_code(const ComponentInfo::Method &method, const CodeCont
     if (return_type == "void") {
         code += "    if (" + original + ")\n        " + original + "(" + call_arguments + ");\n";
     } else {
-        const std::string fallback = return_type == "URK::il2cpp::Object*" ? "nullptr" : return_type + "{}";
+        const std::string fallback = return_type == "URK::managed::Object*" ? "nullptr" : return_type + "{}";
         code += "    return " + original + " ? " + original + "(" + call_arguments + ") : " + fallback + ";\n";
     }
     code += "}\n\n";
     code += "bool install_" + id + "() {\n";
     code += "    URK::HookOptions options{};\n    options.size = sizeof(options);\n";
     code += "    options.backend = static_cast<std::uint32_t>(URK::hook_backend_detours);\n";
-    code += "    return Il2CppHook::attach(" + cpp_string_literal(context.image) + ", " +
-            cpp_string_literal(context.namespc) + ", " + cpp_string_literal(context.class_name) + ", " +
-            cpp_string_literal(method.name) + ", {" + method_parameter_type_literals(method) + "}, &" + original +
-            ", &" + detour + ", nullptr, &options);\n}";
+    const std::string parameter_literals = method_parameter_type_literals(method);
+    const bool has_parameters = !method.parameter_types.empty();
+    if (has_parameters)
+        code += "    static constexpr const char* parameter_types[] = {" + parameter_literals + "};\n";
+    code += "    return URK::managed_hooks::try_hook_managed_method(" +
+            cpp_string_literal(context.image) + ", " +
+            cpp_string_literal(context.namespc) + ", " +
+            cpp_string_literal(context.class_name) + ", " +
+            cpp_string_literal(method.name) +
+            ", " + std::string(has_parameters ? "parameter_types" : "nullptr") +
+            ", " + std::to_string(method.parameter_types.size()) +
+            ", &" + original + ", &" + detour + ", nullptr, &options);\n}";
     return code;
 }
 
@@ -2398,6 +2408,10 @@ void render_components(const InspectorInfo &info, const Snapshot &snapshot, int 
                                 if (member.is_static)
                                     ImGui::SameLine(), ImGui::TextDisabled("static");
                             }
+							if constexpr (requires { member.is_read_only; }) {
+								if (member.is_read_only)
+									ImGui::SameLine(), ImGui::TextDisabled("ro");
+							}
 							if (!member.runtime_safe) {
 								ImGui::SameLine();
 								ImGui::TextDisabled("metadata only");
@@ -2409,6 +2423,8 @@ void render_components(const InspectorInfo &info, const Snapshot &snapshot, int 
                             bool writable = true;
                             if constexpr (requires { member.can_write; })
                                 writable = member.can_write;
+							else if constexpr (requires { member.is_read_only; })
+								writable = !member.is_read_only;
                             const std::uint64_t key = (static_cast<std::uint64_t>(component.instance_id) << 32) |
                                                       (properties ? 0x80000000ull : 0ull) | index;
                             const auto *reference = properties ? (live && index < live->property_references.size()
@@ -2913,6 +2929,8 @@ void render_current_object_inspector(const Snapshot &snapshot) {
                 bool writable = !info.is_value_type || info.value_origin_component_id != 0;
                 if constexpr (requires { member.can_write; })
                     writable = writable && member.can_write;
+				else if constexpr (requires { member.is_read_only; })
+					writable = writable && !member.is_read_only;
                 const bool properties = requires { member.can_write; };
                 const std::uint64_t key =
                     scoped_ui_key(info.token, properties ? 0x6100000000000000ull : 0x6000000000000000ull, index);

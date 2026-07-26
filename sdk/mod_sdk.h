@@ -7,7 +7,7 @@ extern "C" {
 #endif
 
 #define URK_SDK_VERSION 28
-#define URK_MONO_API_VERSION 7
+#define URK_MONO_API_VERSION 9
 #define URK_RUNTIME_API_VERSION 9
 #define URK_IL2CPP_API_VERSION 6
 #define URK_NETWORK_API_VERSION 1
@@ -242,7 +242,12 @@ typedef struct URK_RuntimeApi {
      * aggressive tail-call optimization.
      */
     int (*menu_cursor_set_open_owned)(const void *owner_address, int open);
-    /* Owner-explicit ImGui mouse-capture state (v9, append-only). */
+    /*
+     * Reports whether a native menu is actively consuming mouse input. Cursor
+     * visibility and mouse capture are intentionally separate: opening an
+     * overlay must not disable the game's mouse controls outside that overlay.
+     * This v9 entry is owner-explicit and automatically released on unload.
+     */
     int (*menu_mouse_capture_set_owned)(const void *owner_address, int capture);
 } URK_RuntimeApi;
 
@@ -698,6 +703,30 @@ typedef struct URK_MonoApi {
     void *(*method_get_object)(const void *method);
     /* Boxes a value-type storage slot into a managed object. */
     void *(*value_box)(const void *klass, void *data);
+    /* Returns non-zero when the method is a generic method definition or an inflated generic method. */
+    int (*method_is_generic)(const void *method);
+    /*
+     * Explorer/runtime parity surface (v9, append-only). These entries keep
+     * backend-specific metadata traversal out of shared Unity and Explorer
+     * code. Handles remain opaque and are owned by the Mono runtime.
+     */
+    int (*is_available)();
+    size_t (*domain_get_assembly_count)();
+    const void *(*domain_get_assembly)(size_t index);
+    const void *(*class_get_image)(const void *klass);
+    size_t (*image_get_class_count)(const void *image);
+    const void *(*image_get_class_at)(const void *image, size_t index);
+    const char *(*class_get_assemblyname)(const void *klass);
+    const void *(*class_get_element_class)(const void *klass);
+    int32_t (*class_value_size)(const void *klass, uint32_t *alignment);
+    int (*class_is_assignable_from)(const void *target, const void *candidate);
+    const void *(*class_enum_basetype)(const void *klass);
+    const char *(*method_get_param_name)(const void *method, uint32_t index);
+    const void *(*field_get_parent)(const void *field);
+    void *(*field_get_value_object)(const void *field, void *object);
+    void *(*string_new_len)(const char *utf8, uint32_t length);
+    int64_t (*gc_get_used_size)();
+    int64_t (*gc_get_heap_size)();
 } URK_MonoApi;
 
 #ifdef __cplusplus
@@ -705,6 +734,12 @@ static_assert(offsetof(URK_MonoApi, method_get_object) > offsetof(URK_MonoApi, g
               "URK_MonoApi new fields must be appended.");
 static_assert(offsetof(URK_MonoApi, value_box) > offsetof(URK_MonoApi, method_get_object),
               "URK_MonoApi value_box must be appended.");
+static_assert(offsetof(URK_MonoApi, method_is_generic) > offsetof(URK_MonoApi, value_box),
+              "URK_MonoApi generic method helper must stay appended.");
+static_assert(offsetof(URK_MonoApi, is_available) > offsetof(URK_MonoApi, method_is_generic),
+              "URK_MonoApi v9 parity surface must stay appended.");
+static_assert(offsetof(URK_MonoApi, gc_get_heap_size) > offsetof(URK_MonoApi, is_available),
+              "URK_MonoApi v9 fields must remain append-only.");
 #endif
 
 typedef enum URK_HookBackend {

@@ -7,10 +7,10 @@ and methods.
 
 ![UnityRuntimeExplorer showcase](showcase/ss1.png)
 
-The project is still early, but the basic IL2CPP side is now in place. The
-current release is focused on **Windows x64 IL2CPP games**. Mono support is
-planned, but it will come after the IL2CPP runtime and inspection layer are in a
-more stable state.
+The project is still early. The current release remains focused on **Windows
+x64 IL2CPP games**, while the source tree and build targets are separated for
+IL2CPP and Mono. The Mono target requires the matching URKit Mono v9 runtime
+API surface before it can be used in a game.
 
 ## Why this exists
 
@@ -103,10 +103,11 @@ cmake --preset clang-release
 cmake --build --preset clang-release --parallel
 ```
 
-The resulting DLL will be at:
+The build produces backend-specific plugins:
 
 ```text
 out/build/clang-release/URK_Il2cpp_UnityRuntimeExplorer.dll
+out/build/clang-release/URK_Mono_UnityRuntimeExplorer.dll
 ```
 
 For a clean Release build:
@@ -124,9 +125,9 @@ its IL2CPP metadata, and the URKit proxy being used. Calling methods or editing
 live objects can also make a game unstable. Use it with a game and save data
 you can afford to restart.
 
-Mono support is on the roadmap. The current work is intentionally focused on
-building a reliable IL2CPP foundation first; once that layer is in better shape,
-the project can be extended to support Mono runtimes as well.
+Mono runtime support is still incomplete at the loader/integration boundary.
+The Explorer now consumes a common managed-runtime interface, so backend work
+can continue without mixing Mono logic into the IL2CPP implementation.
 
 ## Roadmap
 

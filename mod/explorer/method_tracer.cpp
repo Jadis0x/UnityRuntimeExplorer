@@ -2,7 +2,7 @@
 #include "method_tracer.h"
 
 #include "sdk/hook_api.h"
-#include "sdk/il2cpp/il2cpp_helpers.h"
+#include "sdk/runtime/managed_hooks.h"
 
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -42,7 +42,7 @@ struct RingRecord {
 
 struct HookSession {
     TraceId id = 0;
-    const URK::il2cpp::Method *method = nullptr;
+    const URK::managed::Method *method = nullptr;
     void *original = nullptr;
     void *stub = nullptr;
     bool visible = true;
@@ -355,7 +355,7 @@ bool start(const URK::Unity::Inspect::MethodInfo &method, std::string &error) {
     std::lock_guard lock(g_state.control_mutex);
     if (!URK::hooks::available()) { error = "Hook API is unavailable in this runtime"; return false; }
     if (!method.handle) { error = "Method metadata handle is unavailable"; return false; }
-    const auto *method_handle = static_cast<const URK::il2cpp::Method *>(method.handle);
+    const auto *method_handle = static_cast<const URK::managed::Method *>(method.handle);
     for (const auto &existing : g_state.sessions) {
         if (existing->method != method_handle)
             continue;
@@ -365,9 +365,9 @@ bool start(const URK::Unity::Inspect::MethodInfo &method, std::string &error) {
         }
         reset_records(*existing);
         g_state.diagnostic.clear();
-        if (!URK::il2cpp::helpers::try_hook_method_pointer(method_handle, &existing->original, existing->stub,
-                                                            &tracer_diagnostic, nullptr, nullptr, nullptr, nullptr,
-                                                            method.name.c_str())) {
+        if (!URK::managed_hooks::try_hook_method_pointer(method_handle, &existing->original, existing->stub,
+                                                          &tracer_diagnostic, nullptr, nullptr, nullptr, nullptr,
+                                                          method.name.c_str())) {
             error = g_state.diagnostic.empty() ? "The runtime refused to re-enable this method trace" : g_state.diagnostic;
             return false;
         }
@@ -431,8 +431,8 @@ bool start(const URK::Unity::Inspect::MethodInfo &method, std::string &error) {
     if (!create_stub(*session, error)) return false;
     HookSession *const raw = session.get();
     g_state.diagnostic.clear();
-    if (!URK::il2cpp::helpers::try_hook_method_pointer(method_handle, &raw->original, raw->stub, &tracer_diagnostic,
-                                                        nullptr, nullptr, nullptr, nullptr, method.name.c_str())) {
+    if (!URK::managed_hooks::try_hook_method_pointer(method_handle, &raw->original, raw->stub, &tracer_diagnostic,
+                                                      nullptr, nullptr, nullptr, nullptr, method.name.c_str())) {
         error = g_state.diagnostic.empty() ? "The runtime refused to hook this method" : g_state.diagnostic;
         VirtualFree(raw->stub, 0, MEM_RELEASE);
         return false;
@@ -443,7 +443,7 @@ bool start(const URK::Unity::Inspect::MethodInfo &method, std::string &error) {
     return true;
 }
 
-bool stop(const URK::il2cpp::Method *method) {
+bool stop(const URK::managed::Method *method) {
     std::lock_guard lock(g_state.control_mutex);
     for (const auto &session : g_state.sessions)
         if (session->method == method && session->active.load(std::memory_order_acquire)) { deactivate(*session); return true; }

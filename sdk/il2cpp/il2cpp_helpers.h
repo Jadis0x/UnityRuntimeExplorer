@@ -42,7 +42,8 @@ inline std::string to_utf8(URK::il2cpp::String *value,
   if (!value)
     return std::string(fallback);
   const std::int32_t length = URK::il2cpp::string_length(value);
-  if (length < 0)
+  constexpr std::int32_t kMaxManagedStringUnits = 1024 * 1024;
+  if (length < 0 || length > kMaxManagedStringUnits)
     return std::string(fallback);
   const std::size_t capacity = static_cast<std::size_t>(length) * 4u + 1u;
   std::vector<char> buffer(capacity ? capacity : 1u, '\0');

@@ -7,7 +7,7 @@ endif()
 
 set(VCPKG_APPLOCAL_DEPS OFF CACHE BOOL "Generated mods keep dependencies linked into the mod DLL when possible" FORCE)
 
-project(URK_Il2cpp_UnityRuntimeExplorer LANGUAGES CXX)
+project(URK_UnityRuntimeExplorer LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -57,20 +57,28 @@ if(MSVC)
 endif()
 urk_disable_vs_vcpkg_integration(imgui)
 
-add_library(URK_Il2cpp_UnityRuntimeExplorer SHARED)
-set_target_properties(URK_Il2cpp_UnityRuntimeExplorer PROPERTIES CXX_SCAN_FOR_MODULES OFF)
-
-target_include_directories(URK_Il2cpp_UnityRuntimeExplorer PRIVATE . mod)
-
-set(URK_PROJECT_SOURCES
+set(URK_COMMON_SOURCES
         mod/support/mod_log.cpp
         mod/hooks/mod_hooks.cpp
+        mod/hooks/render_imgui_hook.cpp
+        mod/hooks/unity_log_hook.cpp
         mod/lifecycle/mod_network.cpp
         mod/lifecycle/mod_runtime.cpp
         mod/generated/mod_lifecycle.cpp
         mod/generated/mod_entry.cpp
+        mod/explorer/explorer_model.cpp
+        mod/explorer/explorer_ui.cpp
+        mod/explorer/method_tracer.cpp
+        mod/explorer/camera/camera_focus_controller.cpp
+        mod/ui/highlight.cpp
+)
+
+set(URK_COMMON_HEADERS
         sdk/runtime_api.h
         sdk/runtime_bootstrap.h
+        sdk/runtime/managed_runtime.h
+        sdk/runtime/managed_hooks.h
+        sdk/runtime/managed_strings.h
         sdk/hook_api.h
         sdk/network_api.h
         sdk/events.h
@@ -78,6 +86,7 @@ set(URK_PROJECT_SOURCES
         sdk/mod_async.h
         sdk/unity/unity.h
         sdk/unity/unity_types.h
+        sdk/unity/detail/managed_backend.h
         sdk/unity/unity_invoke.h
         sdk/unity/unity_components.h
         sdk/unity/unity_inspect.h
@@ -92,50 +101,80 @@ set(URK_PROJECT_SOURCES
         mod/hooks/render_imgui_hook.h
         mod/hooks/unity_log_hook.h
         mod/generated/mod_lifecycle.h
-        sdk/il2cpp/il2cpp_runtime.h
-        sdk/il2cpp/il2cpp_helpers.h
+        mod/explorer/explorer_types.h
+        mod/explorer/explorer_commands.h
+        mod/explorer/explorer_model.h
+        mod/explorer/explorer_ui.h
+        mod/explorer/method_tracer.h
+        mod/explorer/camera/camera_focus_controller.h
+        mod/hooks/mod_hooks.h
+        mod/lifecycle/mod_network.h
+        mod/lifecycle/mod_runtime.h
+        mod/support/mod_log.h
+        mod/config/mod_config.h
 )
 
-# User modules under mod are picked up automatically after CMake reconfigures.
-file(GLOB_RECURSE URK_USER_MODULE_FILES CONFIGURE_DEPENDS
-    RELATIVE "${CMAKE_CURRENT_SOURCE_DIR}"
-    "${CMAKE_CURRENT_SOURCE_DIR}/mod/*.h"
-    "${CMAKE_CURRENT_SOURCE_DIR}/mod/*.hpp"
-    "${CMAKE_CURRENT_SOURCE_DIR}/mod/*.cpp"
-    "${CMAKE_CURRENT_SOURCE_DIR}/mod/*.cc"
-    "${CMAKE_CURRENT_SOURCE_DIR}/mod/*.cxx"
+set(URK_IL2CPP_BACKEND_SOURCES
+    sdk/il2cpp/il2cpp_runtime.h
+    sdk/il2cpp/il2cpp_helpers.h
 )
 
-list(REMOVE_ITEM URK_USER_MODULE_FILES ${URK_PROJECT_SOURCES})
-
-target_sources(URK_Il2cpp_UnityRuntimeExplorer
-    PRIVATE
-        ${URK_PROJECT_SOURCES}
-        ${URK_USER_MODULE_FILES}
+set(URK_MONO_BACKEND_SOURCES
+    sdk/mono/mono_runtime.h
+    sdk/mono/mono_runtime.cpp
 )
 
-source_group(TREE "${CMAKE_CURRENT_SOURCE_DIR}" FILES
-    ${URK_PROJECT_SOURCES}
-    ${URK_USER_MODULE_FILES}
-)
-
-target_compile_features(URK_Il2cpp_UnityRuntimeExplorer PRIVATE cxx_std_20)
-target_compile_definitions(URK_Il2cpp_UnityRuntimeExplorer PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
-target_link_libraries(URK_Il2cpp_UnityRuntimeExplorer PRIVATE imgui d3d11 d3d12 dxgi opengl32 ntdll)
-if(MSVC)
-    target_compile_options(URK_Il2cpp_UnityRuntimeExplorer PRIVATE /W4 /permissive- /EHsc /utf-8 /bigobj)
-    target_link_options(URK_Il2cpp_UnityRuntimeExplorer PRIVATE
-        "$<$<NOT:$<CONFIG:Debug>>:/INCREMENTAL:NO>"
-        "$<$<NOT:$<CONFIG:Debug>>:/OPT:REF>"
-        "$<$<NOT:$<CONFIG:Debug>>:/OPT:ICF>"
+function(urk_add_explorer_target target_name backend_definition)
+    add_library(${target_name} SHARED)
+    set_target_properties(${target_name} PROPERTIES CXX_SCAN_FOR_MODULES OFF)
+    target_include_directories(${target_name} PRIVATE . mod)
+    target_sources(${target_name}
+        PRIVATE
+            ${URK_COMMON_SOURCES}
+            ${URK_COMMON_HEADERS}
+            ${ARGN}
     )
-endif()
-urk_disable_vs_vcpkg_integration(URK_Il2cpp_UnityRuntimeExplorer)
+    source_group(TREE "${CMAKE_CURRENT_SOURCE_DIR}" FILES
+        ${URK_COMMON_SOURCES}
+        ${URK_COMMON_HEADERS}
+        ${ARGN}
+    )
+    target_compile_features(${target_name} PRIVATE cxx_std_20)
+    target_compile_definitions(${target_name} PRIVATE
+        WIN32_LEAN_AND_MEAN
+        NOMINMAX
+        ${backend_definition}
+    )
+    target_link_libraries(${target_name} PRIVATE imgui d3d11 d3d12 dxgi opengl32 ntdll)
+    if(MSVC)
+        target_compile_options(${target_name} PRIVATE /W4 /permissive- /EHsc /utf-8 /bigobj)
+        target_link_options(${target_name} PRIVATE
+            "$<$<NOT:$<CONFIG:Debug>>:/INCREMENTAL:NO>"
+            "$<$<NOT:$<CONFIG:Debug>>:/OPT:REF>"
+            "$<$<NOT:$<CONFIG:Debug>>:/OPT:ICF>"
+        )
+    endif()
+    urk_disable_vs_vcpkg_integration(${target_name})
+endfunction()
+
+urk_add_explorer_target(
+    URK_Il2cpp_UnityRuntimeExplorer
+    URK_BACKEND_IL2CPP
+    ${URK_IL2CPP_BACKEND_SOURCES}
+)
+
+urk_add_explorer_target(
+    URK_Mono_UnityRuntimeExplorer
+    URK_BACKEND_MONO
+    ${URK_MONO_BACKEND_SOURCES}
+)
 
 set(URK_DEPLOY_DIR "" CACHE PATH "Optional game Mods directory where the built DLL will be copied")
 if(URK_DEPLOY_DIR)
-    add_custom_command(TARGET URK_Il2cpp_UnityRuntimeExplorer POST_BUILD
-        COMMAND ${CMAKE_COMMAND} -E make_directory "${URK_DEPLOY_DIR}"
-        COMMAND ${CMAKE_COMMAND} -E copy_if_different $<TARGET_FILE:URK_Il2cpp_UnityRuntimeExplorer> "${URK_DEPLOY_DIR}"
-    )
+    foreach(target_name IN ITEMS URK_Il2cpp_UnityRuntimeExplorer URK_Mono_UnityRuntimeExplorer)
+        add_custom_command(TARGET ${target_name} POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E make_directory "${URK_DEPLOY_DIR}"
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different $<TARGET_FILE:${target_name}> "${URK_DEPLOY_DIR}"
+        )
+    endforeach()
 endif()

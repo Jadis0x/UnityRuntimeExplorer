@@ -9,8 +9,7 @@
 #include "sdk/hook_api.h"
 #include "render_imgui_hook.h"
 #include "unity_log_hook.h"
-#include "sdk/il2cpp/il2cpp_runtime.h"
-#include "sdk/il2cpp/il2cpp_helpers.h"
+#include "sdk/runtime/managed_runtime.h"
 
 namespace {
 URK::hooks::HookSet g_hooks;
@@ -19,7 +18,7 @@ URK::hooks::HookSet g_hooks;
 namespace ModHooks {
 bool install(const URK_ModContext* ctx) {
   URK::set_context(ctx);
-  URK::il2cpp::init(ctx);
+  URK::managed::init(ctx);
 
   if (!URK::hooks::available()) {
     ModLog::warn("hook API is unavailable; no hooks were installed");

@@ -91,6 +91,13 @@ struct Camera : Behaviour {
     float nearClipPlane() const { return GetProperty<float>("nearClipPlane"); }
     float farClipPlane() const { return GetProperty<float>("farClipPlane"); }
     float aspect() const { return GetProperty<float>("aspect"); }
+    bool orthographic() const { return GetProperty<bool>("orthographic"); }
+    float orthographicSize() const { return GetProperty<float>("orthographicSize"); }
+    void set_orthographicSize(float value) const { SetProperty("orthographicSize", value); }
+    int cullingMask() const { return GetProperty<int>("cullingMask"); }
+    float depth() const { return GetProperty<float>("depth"); }
+    int targetDisplay() const { return GetProperty<int>("targetDisplay"); }
+    Object targetTexture() const { return GetProperty<Object>("targetTexture"); }
     int pixelWidth() const { return GetProperty<int>("pixelWidth"); }
     int pixelHeight() const { return GetProperty<int>("pixelHeight"); }
     Vector3 WorldToScreenPoint(Vector3 world) const { return CallExact<Vector3>("WorldToScreenPoint", {"UnityEngine.Vector3"}, world); }
@@ -968,7 +975,7 @@ struct GameObject : Object {
     Transform transform() const { return Call<Transform>("get_transform"); }
     bool activeSelf() const { return GetProperty<bool>("activeSelf"); }
     bool activeInHierarchy() const { return GetProperty<bool>("activeInHierarchy"); }
-    // Some protected IL2CPP players expose the Boolean parameter with a
+    // Some protected Unity players expose the Boolean parameter with a
     // non-canonical type name. SetActive has a unique one-argument overload,
     // so resolve it by name and arity instead of rejecting a valid method over
     // a metadata spelling mismatch.

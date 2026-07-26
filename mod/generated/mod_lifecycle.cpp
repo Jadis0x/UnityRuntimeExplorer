@@ -13,7 +13,7 @@
 #include <utility>
 
 #include "sdk/runtime_api.h"
-#include "sdk/il2cpp/il2cpp_runtime.h"
+#include "sdk/runtime/managed_runtime.h"
 
 namespace {
 const URK_ModContext* g_ctx = nullptr;
@@ -51,14 +51,34 @@ bool validate_required_backend(const URK_ModContext* ctx) {
     ModLog::error("mod context is too small for runtimeBackend; refusing to initialize");
     return false;
   }
-  if (ctx->runtimeBackend != URK::runtime_backend_il2cpp) {
-    ModLog::error("required backend mismatch: generated for IL2CPP but loader runtimeBackend=%u; refusing to initialize", ctx->runtimeBackend);
+  if (ctx->runtimeBackend != URK::compiled_runtime_backend) {
+    ModLog::error("required backend mismatch: generated for %s but loader runtimeBackend=%u; refusing to initialize",
+                  URK::compiled_runtime_name, ctx->runtimeBackend);
     return false;
   }
   if (!context_has_field(ctx, field_end(offsetof(URK_ModContext, runtimeCapabilities), sizeof(ctx->runtimeCapabilities)))) {
     ModLog::error("mod context is too small for runtimeCapabilities; refusing to initialize");
     return false;
   }
+#if defined(URK_BACKEND_MONO)
+  if ((ctx->runtimeCapabilities & URK::runtime_cap_mono_api) == 0) {
+    ModLog::error("required Mono API capability is missing; refusing to initialize");
+    return false;
+  }
+  if (!context_has_field(ctx, field_end(offsetof(URK_ModContext, mono), sizeof(ctx->mono)))) {
+    ModLog::error("mod context is too small for Mono API table; refusing to initialize");
+    return false;
+  }
+  if (!ctx->mono) {
+    ModLog::error("required Mono API table is missing; refusing to initialize");
+    return false;
+  }
+  if (ctx->mono->version < URK_MONO_API_VERSION || ctx->mono->size < sizeof(*ctx->mono)) {
+    ModLog::error("required Mono API table is incompatible: version=%d size=%u",
+                  ctx->mono->version, ctx->mono->size);
+    return false;
+  }
+#else
   if ((ctx->runtimeCapabilities & URK::runtime_cap_il2cpp_api) == 0) {
     ModLog::error("required IL2CPP API capability is missing; refusing to initialize");
     return false;
@@ -72,9 +92,11 @@ bool validate_required_backend(const URK_ModContext* ctx) {
     return false;
   }
   if (ctx->il2cpp->version < URK_IL2CPP_API_VERSION || ctx->il2cpp->size < sizeof(*ctx->il2cpp)) {
-    ModLog::error("required IL2CPP API table is incompatible: version=%d size=%u", ctx->il2cpp->version, ctx->il2cpp->size);
+    ModLog::error("required IL2CPP API table is incompatible: version=%d size=%u",
+                  ctx->il2cpp->version, ctx->il2cpp->size);
     return false;
   }
+#endif
   return true;
 }
 } // namespace

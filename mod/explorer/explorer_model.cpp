@@ -36,7 +36,6 @@ namespace Explorer {
 		constexpr auto kFieldWatchInterval = std::chrono::milliseconds(250);
 		constexpr auto kTracePublishInterval = std::chrono::milliseconds(250);
 		constexpr auto kEventRefreshDebounce = std::chrono::milliseconds(180);
-		constexpr auto kCameraFocusTransition = std::chrono::milliseconds(320);
 		constexpr int kMaxSceneCount = 128;
 		constexpr int kMaxHierarchyDepth = 256;
 		constexpr std::size_t kMaxCensusCandidates = 250000;
@@ -45,55 +44,21 @@ namespace Explorer {
 		constexpr int kHideAndDontSaveMask = 1 | 4 | 8 | 16 | 32;
 		constexpr TypeRef kSceneType{ "", "UnityEngine.SceneManagement", "Scene" };
 
-		float quaternion_dot(const Quaternion& left, const Quaternion& right) {
-			return left.x * right.x + left.y * right.y + left.z * right.z + left.w * right.w;
-		}
-
-		Quaternion quaternion_normalize(Quaternion value) {
-			const float length = std::sqrt(quaternion_dot(value, value));
-			if (!std::isfinite(length) || length <= 0.000001f)
-				return Quaternion{};
-			const float inverse = 1.0f / length;
-			value.x *= inverse;
-			value.y *= inverse;
-			value.z *= inverse;
-			value.w *= inverse;
-			return value;
-		}
-
-		Quaternion quaternion_slerp(Quaternion start, Quaternion end, float amount) {
-			start = quaternion_normalize(start);
-			end = quaternion_normalize(end);
-			float cosine = quaternion_dot(start, end);
-			if (cosine < 0.0f) {
-				end.x = -end.x;
-				end.y = -end.y;
-				end.z = -end.z;
-				end.w = -end.w;
-				cosine = -cosine;
-			}
-			cosine = std::clamp(cosine, -1.0f, 1.0f);
-			if (cosine > 0.9995f) {
-				Quaternion result{
-					start.x + amount * (end.x - start.x),
-					start.y + amount * (end.y - start.y),
-					start.z + amount * (end.z - start.z),
-					start.w + amount * (end.w - start.w),
-				};
-				return quaternion_normalize(result);
-			}
-			const float angle = std::acos(cosine);
-			const float sine = std::sin(angle);
-			if (std::abs(sine) <= 0.000001f)
-				return start;
-			const float start_weight = std::sin((1.0f - amount) * angle) / sine;
-			const float end_weight = std::sin(amount * angle) / sine;
-			return quaternion_normalize(Quaternion{
-				start.x * start_weight + end.x * end_weight,
-				start.y * start_weight + end.y * end_weight,
-				start.z * start_weight + end.z * end_weight,
-				start.w * start_weight + end.w * end_weight,
-			});
+		ComponentInfo::Field field_metadata(const Inspect::FieldInfo& field) {
+			ComponentInfo::Field member{};
+			member.name = field.name;
+			member.type_name = field.type_name;
+			member.declaring_type = field.declaring_type.full_name;
+			member.is_static = field.is_static;
+			member.is_read_only = !Inspect::FieldCanWrite(field);
+			member.is_value_type = field.is_value_type;
+			member.is_enum = field.is_enum;
+			member.runtime_safe = !field.type_is_opaque && !field.is_delegate;
+			if (field.is_delegate)
+				member.capability_reason = "Delegate/event fields are metadata-only; generic access can dereference runtime-owned callback state.";
+			else if (field.type_is_opaque)
+				member.capability_reason = "Runtime-specific type; metadata is available but generic read/write is unsafe.";
+			return member;
 		}
 
 #if defined(_WIN32)
@@ -280,11 +245,11 @@ namespace Explorer {
 			const Inspect::TypeInfo destination = Inspect::DescribeType(destination_type);
 			if (input == "default" && destination_type && destination.is_value_type && !destination.is_enum) {
 				std::uint32_t alignment = 0;
-				const std::int32_t size = URK::il2cpp::class_value_size(destination.handle, &alignment);
+				const std::int32_t size = URK::managed::class_value_size(destination.handle, &alignment);
 				if (size <= 0)
 					return false;
 				std::vector<std::uint8_t> bytes(static_cast<std::size_t>(size), 0);
-				void* boxed = URK::il2cpp::value_box(static_cast<const URK::il2cpp::Class*>(destination.handle), bytes.data());
+				void* boxed = URK::managed::value_box(static_cast<const URK::managed::Class*>(destination.handle), bytes.data());
 				rooted = Inspect::PinObject(Object{ boxed });
 				const Object resolved = Inspect::ResolveObjectHandle(rooted);
 				if (!rooted.handle || !resolved || !Inspect::IsBoxedValueOfType(resolved, destination_type)) {
@@ -505,10 +470,10 @@ namespace Explorer {
 #if defined(_WIN32)
 			__try {
 #endif
-			const char* namespc = URK::il2cpp::class_get_namespace(
-				static_cast<const URK::il2cpp::Class*>(klass));
-			const char* name = URK::il2cpp::class_get_name(
-				static_cast<const URK::il2cpp::Class*>(klass));
+			const char* namespc = URK::managed::class_get_namespace(
+				static_cast<const URK::managed::Class*>(klass));
+			const char* name = URK::managed::class_get_name(
+				static_cast<const URK::managed::Class*>(klass));
 			std::string namespace_text;
 			std::string name_text;
 			if (!copy_readable_c_string(namespc, namespace_text) ||
@@ -624,7 +589,7 @@ namespace Explorer {
 #if defined(_WIN32)
 			__try {
 #endif
-				void* const pointer = URK::il2cpp::method_pointer(static_cast<const URK::il2cpp::Method*>(method.handle));
+				void* const pointer = URK::managed::method_pointer(static_cast<const URK::managed::Method*>(method.handle));
 				if (!pointer)
 					return;
 				const std::string name = method.declaring_type.full_name.empty()
@@ -678,12 +643,12 @@ namespace Explorer {
 #if defined(_WIN32)
 			__try {
 #endif
-				auto* value = reinterpret_cast<URK::il2cpp::String*>(address);
-				const std::int32_t length = URK::il2cpp::string_length(value);
+				auto* value = reinterpret_cast<URK::managed::String*>(address);
+				const std::int32_t length = URK::managed::string_length(value);
 				if (length < 0 || length > 4096)
 					return fallback + " (invalid length)";
 				std::vector<char> utf8(static_cast<std::size_t>(length) * 4u + 1u, '\0');
-				if (!URK::il2cpp::string_to_utf8(value, utf8.data(), utf8.size()))
+				if (!URK::managed::string_to_utf8(value, utf8.data(), utf8.size()))
 					return fallback + " (could not decode)";
 				return "\"" + std::string(utf8.data()) + "\"";
 #if defined(_WIN32)
@@ -698,7 +663,7 @@ namespace Explorer {
 		std::string assembly_name(const Inspect::TypeInfo& type) {
 			if (!type.handle)
 				return {};
-			const char* name = URK::il2cpp::class_get_assemblyname(type.handle);
+			const char* name = URK::managed::class_get_assemblyname(type.handle);
 			return name ? name : "";
 		}
 	} // namespace
@@ -731,7 +696,7 @@ namespace Explorer {
 		flight_recorder_started_ = Clock::now();
 		next_flight_sequence_ = 1;
 		working_.hierarchy = hierarchy_;
-		working_.status = "IL2CPP runtime ready";
+		working_.status = std::string(URK::compiled_runtime_name) + " runtime ready";
 		URK::SceneInfo current_scene{};
 		if (URK::current_scene(&current_scene)) {
 			active_scene_handle_hint_ = current_scene.handle;
@@ -756,7 +721,7 @@ namespace Explorer {
 		if (native_faulted_.exchange(false, std::memory_order_acq_rel)) {
 			// An invalid managed pointer may also make gchandle_free unsafe.  Drop
 			// the native copies first, then wait for the current Unity transition
-			// to settle before asking IL2CPP for a new hierarchy.
+			// to settle before asking the managed runtime for a new hierarchy.
 			discard_managed_state_after_native_fault();
 			{
 				std::lock_guard<std::mutex> lock(command_mutex_);
@@ -774,8 +739,10 @@ namespace Explorer {
 			const std::uint32_t fault_code = native_fault_code_.exchange(0, std::memory_order_acq_rel);
 			const std::uintptr_t fault_address = native_fault_address_.exchange(0, std::memory_order_acq_rel);
 			const std::uintptr_t fault_instruction = native_fault_instruction_.exchange(0, std::memory_order_acq_rel);
-			record_flight("FAULT", "Native IL2CPP access", "code=" + std::to_string(fault_code));
-			set_status("Explorer isolated a native IL2CPP access fault; stale managed state was released and a census retry is pending.");
+			record_flight("FAULT", std::string("Native ") + URK::compiled_runtime_name + " access",
+				"code=" + std::to_string(fault_code));
+			set_status(std::string("Explorer isolated a native ") + URK::compiled_runtime_name +
+				" access fault; stale managed state was released and a census retry is pending.");
 			ModLog::error("Native recovery: code=0x%08X address=%p instruction=%p", fault_code,
 				reinterpret_cast<void*>(fault_address), reinterpret_cast<void*>(fault_instruction));
 			refresh_requested_.store(false, std::memory_order_release);
@@ -791,7 +758,7 @@ namespace Explorer {
 			return;
 
 		const Clock::time_point now = Clock::now();
-		update_camera_transition(now);
+		update_camera_focus();
 		if (event_refresh_pending_ && now >= event_refresh_due_) {
 			event_refresh_pending_ = false;
 			request_refresh();
@@ -862,9 +829,7 @@ namespace Explorer {
 		clear_highlight_camera_cache();
 		highlight_enabled_ = true;
 		highlight_max_distance_ = 0.0f;
-		camera_focus_distance_ = 8.0f;
-		camera_focus_tilt_ = 3.0f;
-		camera_focus_top_down_ = false;
+		camera_focus_.set_settings(CameraFocus::Settings{});
 		hierarchy_ = std::make_shared<const HierarchyInfo>();
 		working_ = {};
 		working_.hierarchy = hierarchy_;
@@ -1367,49 +1332,33 @@ namespace Explorer {
 			publish();
 			return;
 		case CommandKind::SetCameraFocusDistance: {
-			camera_focus_distance_ = std::clamp(command.float_value, 1.0f, 100.0f);
-			// Apply zoom along the active focus direction.
-			const float offset_length = camera_focus_offset.magnitude();
-			if (camera_focus_active_) {
-				if (camera_focus_top_down_)
-					camera_focus_offset = camera_focus_heading * camera_focus_tilt_ +
-						Vector3{ 0.0f, camera_focus_distance_, 0.0f };
-				else if (std::isfinite(offset_length) && offset_length > 0.001f)
-					camera_focus_offset = camera_focus_offset / offset_length * camera_focus_distance_;
-				camera_transition_active_ = false;
-				// Validate both rooted objects before changing a transform.
-				update_camera_transition(Clock::now());
-			}
-			set_status(std::string(camera_focus_top_down_ ? "Camera focus height set to " : "Camera focus distance set to ") +
-				std::to_string(camera_focus_distance_) + " units");
+			CameraFocus::Settings settings = camera_focus_.settings();
+			settings.distance = std::clamp(command.float_value, 1.0f, 100.0f);
+			camera_focus_.set_settings(settings);
+			update_camera_focus();
+			set_status(std::string(settings.top_down ? "Camera focus height set to " : "Camera focus distance set to ") +
+				std::to_string(settings.distance) + " units");
 			publish();
 			return;
 		}
-		case CommandKind::SetCameraFocusTopDown:
-			camera_focus_top_down_ = command.bool_value;
-			if (camera_focus_active_) {
-				if (camera_focus_top_down_)
-					camera_focus_offset = camera_focus_heading * camera_focus_tilt_ +
-						Vector3{ 0.0f, camera_focus_distance_, 0.0f };
-				else
-					camera_focus_offset = camera_focus_view_direction * camera_focus_distance_;
-				camera_transition_active_ = false;
-				update_camera_transition(Clock::now());
-			}
-			set_status(camera_focus_top_down_ ? "Camera focus changed to top-down" : "Camera focus now preserves the game view angle");
+		case CommandKind::SetCameraFocusTopDown: {
+			CameraFocus::Settings settings = camera_focus_.settings();
+			settings.top_down = command.bool_value;
+			camera_focus_.set_settings(settings);
+			update_camera_focus();
+			set_status(settings.top_down ? "Camera focus changed to top-down" : "Camera focus now preserves the game view angle");
 			publish();
 			return;
-		case CommandKind::SetCameraFocusTilt:
-			camera_focus_tilt_ = std::clamp(command.float_value, 0.0f, 100.0f);
-			if (camera_focus_active_ && camera_focus_top_down_) {
-				camera_focus_offset = camera_focus_heading * camera_focus_tilt_ +
-					Vector3{ 0.0f, camera_focus_distance_, 0.0f };
-				camera_transition_active_ = false;
-				update_camera_transition(Clock::now());
-			}
-			set_status("Camera top-down tilt set to " + std::to_string(camera_focus_tilt_) + " units");
+		}
+		case CommandKind::SetCameraFocusTilt: {
+			CameraFocus::Settings settings = camera_focus_.settings();
+			settings.top_down_tilt = std::clamp(command.float_value, 0.0f, 100.0f);
+			camera_focus_.set_settings(settings);
+			update_camera_focus();
+			set_status("Camera top-down tilt set to " + std::to_string(settings.top_down_tilt) + " units");
 			publish();
 			return;
+		}
 		case CommandKind::SetFieldValue:
 			set_member_value(command, false);
 			publish();
@@ -2003,8 +1952,8 @@ namespace Explorer {
 			set_status("Component metadata load failed for " + component->type_name + ": " + component->metadata_error);
 			};
 
-		const auto* klass = static_cast<const URK::il2cpp::Class*>(
-			URK::il2cpp::object_get_class(static_cast<URK::il2cpp::Object*>(target.handle())));
+		const auto* klass = static_cast<const URK::managed::Class*>(
+			URK::managed::object_get_class(static_cast<URK::managed::Object*>(target.handle())));
 		if (!klass) {
 			fail_metadata("runtime class is unavailable");
 			return;
@@ -2065,11 +2014,8 @@ namespace Explorer {
 		}
 
 		metadata->fields.reserve(reflection.fields.size());
-		for (const Inspect::FieldInfo& field : reflection.fields) {
-			metadata->fields.push_back({ field.name, field.type_name, field.declaring_type.full_name, field.is_static,
-				{}, field.is_value_type, field.is_enum, !field.type_is_opaque,
-				field.type_is_opaque ? "Runtime-specific type; metadata is available but generic read/write is unsafe." : "" });
-		}
+		for (const Inspect::FieldInfo& field : reflection.fields)
+			metadata->fields.push_back(field_metadata(field));
 
 		metadata->properties.reserve(reflection.properties.size());
 		for (const Inspect::PropertyInfo& property : reflection.properties) {
@@ -2129,11 +2075,11 @@ namespace Explorer {
 	}
 
 	void RuntimeModel::load_component_class_catalog() {
-		// IL2CPP metadata is read only from the Unity main thread.
-		const URK::il2cpp::Class* component_base =
-			URK::il2cpp::find_class("UnityEngine.CoreModule.dll", "UnityEngine", "Component");
+		// Managed metadata is read only from the Unity main thread.
+		const URK::managed::Class* component_base =
+			URK::managed::find_class("UnityEngine.CoreModule.dll", "UnityEngine", "Component");
 		if (!component_base)
-			component_base = URK::il2cpp::find_class("UnityEngine.dll", "UnityEngine", "Component");
+			component_base = URK::managed::find_class("UnityEngine.dll", "UnityEngine", "Component");
 		if (!component_base) {
 			set_status("Component browser is unavailable: UnityEngine.Component was not found");
 			return;
@@ -2145,31 +2091,31 @@ namespace Explorer {
 		constexpr std::uint32_t kTypeAttributeAbstract = 0x80u;
 		constexpr std::size_t kMaxComponentClasses = 20000;
 
-		const std::size_t assembly_count = std::min<std::size_t>(URK::il2cpp::domain_get_assembly_count(), 4096);
+		const std::size_t assembly_count = std::min<std::size_t>(URK::managed::domain_get_assembly_count(), 4096);
 		for (std::size_t assembly_index = 0; assembly_index < assembly_count; ++assembly_index) {
-			const URK::il2cpp::Assembly* assembly = URK::il2cpp::domain_get_assembly(assembly_index);
-			const URK::il2cpp::Image* image = assembly ? URK::il2cpp::assembly_get_image(assembly) : nullptr;
-			const char* image_name = image ? URK::il2cpp::image_get_name(image) : nullptr;
+			const URK::managed::Assembly* assembly = URK::managed::domain_get_assembly(assembly_index);
+			const URK::managed::Image* image = assembly ? URK::managed::assembly_get_image(assembly) : nullptr;
+			const char* image_name = image ? URK::managed::image_get_name(image) : nullptr;
 			if (!image || !image_name || !image_name[0])
 				continue;
 
-			const std::size_t class_count = std::min<std::size_t>(URK::il2cpp::image_get_class_count(image), 1000000);
+			const std::size_t class_count = std::min<std::size_t>(URK::managed::image_get_class_count(image), 1000000);
 			for (std::size_t class_index = 0; class_index < class_count; ++class_index) {
-				const URK::il2cpp::Class* klass = URK::il2cpp::image_get_class(image, class_index);
+				const URK::managed::Class* klass = URK::managed::image_get_class(image, class_index);
 				if (!klass || klass == component_base)
 					continue;
-				const std::uint32_t flags = URK::il2cpp::class_get_flags(klass);
+				const std::uint32_t flags = URK::managed::class_get_flags(klass);
 				if ((flags & (kTypeAttributeInterface | kTypeAttributeAbstract)) != 0)
 					continue;
 
-				bool is_component = URK::il2cpp::class_is_assignable_from(component_base, klass) != 0;
+				bool is_component = URK::managed::class_is_assignable_from(component_base, klass) != 0;
 				if (!is_component) {
-					std::unordered_set<const URK::il2cpp::Class*> visited_parents;
+					std::unordered_set<const URK::managed::Class*> visited_parents;
 					std::size_t parent_depth = 0;
-					for (const URK::il2cpp::Class* parent = URK::il2cpp::class_get_parent(klass);
+					for (const URK::managed::Class* parent = URK::managed::class_get_parent(klass);
 						parent && parent_depth++ < Inspect::kMaxMetadataInheritanceDepth &&
 						visited_parents.insert(parent).second;
-						parent = URK::il2cpp::class_get_parent(parent)) {
+						parent = URK::managed::class_get_parent(parent)) {
 						if (parent == component_base) {
 							is_component = true;
 							break;
@@ -2191,7 +2137,7 @@ namespace Explorer {
 				entry.namespc = type.namespc;
 				entry.class_name = type.name;
 				entry.full_name = type.full_name.empty() ? type.name : type.full_name;
-				entry.pointer_text = pointer_text(const_cast<URK::il2cpp::Class*>(klass));
+				entry.pointer_text = pointer_text(const_cast<URK::managed::Class*>(klass));
 				const std::string key = entry.image + "\n" + entry.full_name;
 				if (!seen.insert(key).second)
 					continue;
@@ -2213,30 +2159,30 @@ namespace Explorer {
 	}
 
 	void RuntimeModel::load_class_browser_catalog() {
-		const URK::il2cpp::Class* object_base =
-			URK::il2cpp::find_class("UnityEngine.CoreModule.dll", "UnityEngine", "Object");
-		const URK::il2cpp::Class* component_base =
-			URK::il2cpp::find_class("UnityEngine.CoreModule.dll", "UnityEngine", "Component");
+		const URK::managed::Class* object_base =
+			URK::managed::find_class("UnityEngine.CoreModule.dll", "UnityEngine", "Object");
+		const URK::managed::Class* component_base =
+			URK::managed::find_class("UnityEngine.CoreModule.dll", "UnityEngine", "Component");
 		if (!object_base)
-			object_base = URK::il2cpp::find_class("UnityEngine.dll", "UnityEngine", "Object");
+			object_base = URK::managed::find_class("UnityEngine.dll", "UnityEngine", "Object");
 		if (!component_base)
-			component_base = URK::il2cpp::find_class("UnityEngine.dll", "UnityEngine", "Component");
+			component_base = URK::managed::find_class("UnityEngine.dll", "UnityEngine", "Component");
 		auto catalog = std::make_shared<ClassBrowserCatalog>();
 		std::unordered_set<std::string> seen;
 		constexpr std::uint32_t kTypeAttributeInterface = 0x20u;
 		constexpr std::uint32_t kTypeAttributeAbstract = 0x80u;
 		constexpr std::uint32_t kTypeAttributeSealed = 0x100u;
 		constexpr std::size_t kMaxBrowserClasses = 50000;
-		const std::size_t assembly_count = std::min<std::size_t>(URK::il2cpp::domain_get_assembly_count(), 4096);
+		const std::size_t assembly_count = std::min<std::size_t>(URK::managed::domain_get_assembly_count(), 4096);
 		for (std::size_t assembly_index = 0; assembly_index < assembly_count; ++assembly_index) {
-			const URK::il2cpp::Assembly* assembly = URK::il2cpp::domain_get_assembly(assembly_index);
-			const URK::il2cpp::Image* image = assembly ? URK::il2cpp::assembly_get_image(assembly) : nullptr;
-			const char* image_name = image ? URK::il2cpp::image_get_name(image) : nullptr;
+			const URK::managed::Assembly* assembly = URK::managed::domain_get_assembly(assembly_index);
+			const URK::managed::Image* image = assembly ? URK::managed::assembly_get_image(assembly) : nullptr;
+			const char* image_name = image ? URK::managed::image_get_name(image) : nullptr;
 			if (!image || !image_name || !image_name[0])
 				continue;
-			const std::size_t class_count = std::min<std::size_t>(URK::il2cpp::image_get_class_count(image), 1000000);
+			const std::size_t class_count = std::min<std::size_t>(URK::managed::image_get_class_count(image), 1000000);
 			for (std::size_t class_index = 0; class_index < class_count; ++class_index) {
-				const URK::il2cpp::Class* klass = URK::il2cpp::image_get_class(image, class_index);
+				const URK::managed::Class* klass = URK::managed::image_get_class(image, class_index);
 				if (!klass)
 					continue;
 				const Inspect::TypeInfo type = Inspect::DescribeClass(klass);
@@ -2247,22 +2193,22 @@ namespace Explorer {
 				entry.namespc = type.namespc;
 				entry.class_name = type.name;
 				entry.full_name = type.full_name.empty() ? type.name : type.full_name;
-				entry.pointer_text = pointer_text(const_cast<URK::il2cpp::Class*>(klass));
-				const std::uint32_t flags = URK::il2cpp::class_get_flags(klass);
-				entry.parent_name = Inspect::DescribeClass(URK::il2cpp::class_get_parent(klass)).full_name;
+				entry.pointer_text = pointer_text(const_cast<URK::managed::Class*>(klass));
+				const std::uint32_t flags = URK::managed::class_get_flags(klass);
+				entry.parent_name = Inspect::DescribeClass(URK::managed::class_get_parent(klass)).full_name;
 				entry.is_interface = (flags & kTypeAttributeInterface) != 0;
 				entry.is_abstract = (flags & kTypeAttributeAbstract) != 0;
 				entry.is_static = entry.is_abstract && (flags & kTypeAttributeSealed) != 0;
 				entry.is_value_type = type.is_value_type;
 				entry.is_enum = type.is_enum;
-				entry.is_unity_object = object_base && URK::il2cpp::class_is_assignable_from(object_base, klass) != 0;
-				entry.is_component = component_base && (URK::il2cpp::class_is_assignable_from(component_base, klass) != 0 ||
-					URK::il2cpp::class_has_parent(klass, component_base) != 0);
+				entry.is_unity_object = object_base && URK::managed::class_is_assignable_from(object_base, klass) != 0;
+				entry.is_component = component_base && (URK::managed::class_is_assignable_from(component_base, klass) != 0 ||
+					URK::managed::class_has_parent(klass, component_base) != 0);
 				void* interface_iterator = nullptr;
-				std::unordered_set<const URK::il2cpp::Class*> visited_interfaces;
+				std::unordered_set<const URK::managed::Class*> visited_interfaces;
 				std::size_t interface_count = 0;
-				while (const URK::il2cpp::Class* interface_type =
-					URK::il2cpp::class_get_interfaces(klass, &interface_iterator)) {
+				while (const URK::managed::Class* interface_type =
+					URK::managed::class_get_interfaces(klass, &interface_iterator)) {
 					if (++interface_count > 4096 || !visited_interfaces.insert(interface_type).second)
 						break;
 					const Inspect::TypeInfo interface_info = Inspect::DescribeClass(interface_type);
@@ -2308,8 +2254,8 @@ namespace Explorer {
 			return;
 		}
 
-		const URK::il2cpp::Class* target =
-			URK::il2cpp::find_class(command.image.c_str(), command.namespc.c_str(), command.class_name.c_str());
+		const URK::managed::Class* target =
+			URK::managed::find_class(command.image.c_str(), command.namespc.c_str(), command.class_name.c_str());
 		if (!target) {
 			set_status("Selected type could no longer be resolved");
 			return;
@@ -2353,10 +2299,10 @@ namespace Explorer {
 			working_.class_browser_query.full_name);
 		return;
 
-		const URK::il2cpp::Class* object_base =
-			URK::il2cpp::find_class("UnityEngine.CoreModule.dll", "UnityEngine", "Object");
+		const URK::managed::Class* object_base =
+			URK::managed::find_class("UnityEngine.CoreModule.dll", "UnityEngine", "Object");
 		if (!object_base)
-			object_base = URK::il2cpp::find_class("UnityEngine.dll", "UnityEngine", "Object");
+			object_base = URK::managed::find_class("UnityEngine.dll", "UnityEngine", "Object");
 
 		struct PendingObject {
 			Object object;
@@ -2380,16 +2326,16 @@ namespace Explorer {
 			};
 
 		// Static references cover non-Unity managed singletons and interfaces.
-		const std::size_t assembly_count = std::min<std::size_t>(URK::il2cpp::domain_get_assembly_count(), 4096);
+		const std::size_t assembly_count = std::min<std::size_t>(URK::managed::domain_get_assembly_count(), 4096);
 		for (std::size_t assembly_index = 0; assembly_index < assembly_count && seen.size() < kMaxGraphNodes;
 			++assembly_index) {
-			const URK::il2cpp::Assembly* assembly = URK::il2cpp::domain_get_assembly(assembly_index);
-			const URK::il2cpp::Image* image = assembly ? URK::il2cpp::assembly_get_image(assembly) : nullptr;
+			const URK::managed::Assembly* assembly = URK::managed::domain_get_assembly(assembly_index);
+			const URK::managed::Image* image = assembly ? URK::managed::assembly_get_image(assembly) : nullptr;
 			if (!image)
 				continue;
-			const std::size_t class_count = std::min<std::size_t>(URK::il2cpp::image_get_class_count(image), 1000000);
+			const std::size_t class_count = std::min<std::size_t>(URK::managed::image_get_class_count(image), 1000000);
 			for (std::size_t class_index = 0; class_index < class_count && seen.size() < kMaxGraphNodes; ++class_index) {
-				const URK::il2cpp::Class* klass = URK::il2cpp::image_get_class(image, class_index);
+				const URK::managed::Class* klass = URK::managed::image_get_class(image, class_index);
 				if (!klass)
 					continue;
 				const Inspect::TypeInfo owner = Inspect::DescribeClass(klass);
@@ -2420,11 +2366,11 @@ namespace Explorer {
 			PendingObject current = std::move(pending.front());
 			pending.pop_front();
 			++working_.class_browser_scanned_objects;
-			const URK::il2cpp::Class* actual =
-				URK::il2cpp::object_get_class(static_cast<URK::il2cpp::Object*>(current.object.handle()));
+			const URK::managed::Class* actual =
+				URK::managed::object_get_class(static_cast<URK::managed::Object*>(current.object.handle()));
 			if (!actual)
 				continue;
-			if (URK::il2cpp::class_is_assignable_from(target, actual) != 0 &&
+			if (URK::managed::class_is_assignable_from(target, actual) != 0 &&
 				working_.class_browser_instances.size() < kMaxInstanceResults) {
 				const Inspect::TypeInfo type = Inspect::DescribeClass(actual);
 				Inspect::ObjectHandle handle = Inspect::PinObject(current.object);
@@ -2437,7 +2383,7 @@ namespace Explorer {
 					result.pointer_text = pointer_text(current.object.handle());
 					result.source = current.source;
 					result.name = result.type_name;
-					if (object_base && URK::il2cpp::class_is_assignable_from(object_base, actual) != 0)
+					if (object_base && URK::managed::class_is_assignable_from(object_base, actual) != 0)
 						result.name = current.object.name();
 					if (current.depth == 0 && working_.class_browser_query.is_component) {
 						const GameObject owner = Component{ current.object.handle() }.gameObject();
@@ -2504,8 +2450,8 @@ namespace Explorer {
 			if (match != class_browser_catalog_->classes.end())
 				working_.class_browser_static_query = *match;
 		}
-		const URK::il2cpp::Class* klass =
-			URK::il2cpp::find_class(command.image.c_str(), command.namespc.c_str(), command.class_name.c_str());
+		const URK::managed::Class* klass =
+			URK::managed::find_class(command.image.c_str(), command.namespc.c_str(), command.class_name.c_str());
 		if (!klass) {
 			set_status("Selected type could no longer be resolved");
 			return;
@@ -2553,18 +2499,18 @@ namespace Explorer {
 			if (match != class_browser_catalog_->classes.end())
 				working_.class_browser_members_query = *match;
 		}
-		const URK::il2cpp::Class* klass =
-			URK::il2cpp::find_class(command.image.c_str(), command.namespc.c_str(), command.class_name.c_str());
+		const URK::managed::Class* klass =
+			URK::managed::find_class(command.image.c_str(), command.namespc.c_str(), command.class_name.c_str());
 		if (!klass) {
 			set_status("Selected type could no longer be resolved");
 			return;
 		}
 		auto members = std::make_shared<ComponentInfo::Metadata>();
-		for (const Inspect::FieldInfo& field : Inspect::fields_from_class(klass, true))
-			members->fields.push_back({ field.name, field.type_name, field.declaring_type.full_name, field.is_static,
-									   pointer_text(const_cast<void*>(field.handle)), field.is_value_type, field.is_enum,
-									   !field.type_is_opaque,
-									   field.type_is_opaque ? "Runtime-specific type; metadata only." : "" });
+		for (const Inspect::FieldInfo& field : Inspect::fields_from_class(klass, true)) {
+			ComponentInfo::Field member = field_metadata(field);
+			member.pointer_text = pointer_text(const_cast<void*>(field.handle));
+			members->fields.push_back(std::move(member));
+		}
 		for (const Inspect::PropertyInfo& property : Inspect::properties_from_class(klass, true))
 			members->properties.push_back({ property.name, property.type_name, property.declaring_type.full_name,
 									 property.can_read, property.can_write,
@@ -2676,6 +2622,9 @@ namespace Explorer {
 				if (!component.metadata->properties[index].runtime_safe)
 					values->properties[index] = Inspect::unavailable_value(component.metadata->properties[index].type_name,
 						"Metadata only: " + component.metadata->properties[index].capability_reason);
+				else if (!component.metadata->properties[index].can_read)
+					values->properties[index] = Inspect::unavailable_value(component.metadata->properties[index].type_name,
+						"Property is not readable");
 				else if (index < reflection->second.properties.size() && sampled)
 					values->properties[index] = guarded_managed_read(component.metadata->properties[index].type_name, [&] {
 					return Inspect::ReadProperty(target, reflection->second.properties[index]);
@@ -2683,8 +2632,9 @@ namespace Explorer {
 				else
 					values->properties[index] =
 					Inspect::unavailable_value(component.metadata->properties[index].type_name, "Not sampled");
-				record_value_error(component.type_name + "." + component.metadata->properties[index].name,
-					values->properties[index]);
+				if (component.metadata->properties[index].can_read)
+					record_value_error(component.type_name + "." + component.metadata->properties[index].name,
+						values->properties[index]);
 				capture_reference(values->properties[index], member_reference_token(component.instance_id, true, index),
 					values->property_references[index]);
 			}
@@ -2745,10 +2695,10 @@ namespace Explorer {
 			}
 			Inspect::ValueInfo value{};
 			Inspect::ObjectHandle argument_root{};
-			const auto* array_class = static_cast<const URK::il2cpp::Class*>(
-				URK::il2cpp::object_get_class(static_cast<URK::il2cpp::Object*>(target.handle())));
-			const auto* element_class = array_class ? URK::il2cpp::class_get_element_class(array_class) : nullptr;
-			const void* element_type = element_class ? URK::il2cpp::class_get_type(element_class) : nullptr;
+			const auto* array_class = static_cast<const URK::managed::Class*>(
+				URK::managed::object_get_class(static_cast<URK::managed::Object*>(target.handle())));
+			const auto* element_class = array_class ? URK::managed::class_get_element_class(array_class) : nullptr;
+			const void* element_type = element_class ? URK::managed::class_get_type(element_class) : nullptr;
 			const bool parsed = command_value(working_.object_inspector.array_element_type, command, value) ||
 				reference_value_from_text(working_.object_inspector.array_element_type, element_type,
 					command.text, value, argument_root);
@@ -2757,12 +2707,12 @@ namespace Explorer {
 				return;
 			}
 			if (value.object) {
-				const void* actual_class = URK::il2cpp::object_get_class(value.object);
-				const bool is_value_element = element_class && URK::il2cpp::class_is_valuetype(element_class);
+				const void* actual_class = URK::managed::object_get_class(value.object);
+				const bool is_value_element = element_class && URK::managed::class_is_valuetype(element_class);
 				const bool matches =
 					element_class && actual_class &&
 					(is_value_element ? element_class == actual_class
-						: URK::il2cpp::class_is_assignable_from(element_class, actual_class) != 0);
+						: URK::managed::class_is_assignable_from(element_class, actual_class) != 0);
 				if (!matches) {
 					Inspect::FreeObjectHandle(argument_root);
 					set_status("Array reference type mismatch: expected " + working_.object_inspector.array_element_type);
@@ -2840,7 +2790,7 @@ namespace Explorer {
 				}
 				if (keep_locked && value.kind == Inspect::ValueKind::String && !value.object) {
 					value.object =
-						URK::il2cpp::string_new_len(value.display.data(), static_cast<std::uint32_t>(value.display.size()));
+						URK::managed::string_new_len(value.display.data(), static_cast<std::uint32_t>(value.display.size()));
 					if (value.object)
 						argument_root = Inspect::PinValue(value);
 					if (!argument_root.handle) {
@@ -3183,7 +3133,7 @@ namespace Explorer {
 		}
 		const Inspect::MethodInfo& method = reflection->methods[command.member_index];
 		if (!command.bool_value) {
-			if (MethodTracer::stop(static_cast<const URK::il2cpp::Method*>(method.handle)))
+			if (MethodTracer::stop(static_cast<const URK::managed::Method*>(method.handle)))
 				set_status("Method tracing stopped");
 			else
 				set_status("Method trace is no longer active");
@@ -3542,11 +3492,8 @@ namespace Explorer {
 		reflection.methods = Inspect::Methods(rooted, true);
 		auto metadata = std::make_shared<ComponentInfo::Metadata>();
 		metadata->fields.reserve(reflection.fields.size());
-		for (const Inspect::FieldInfo& field : reflection.fields) {
-			metadata->fields.push_back({ field.name, field.type_name, field.declaring_type.full_name, field.is_static,
-				{}, field.is_value_type, field.is_enum, !field.type_is_opaque,
-				field.type_is_opaque ? "Runtime-specific type; metadata is available but generic read/write is unsafe." : "" });
-		}
+		for (const Inspect::FieldInfo& field : reflection.fields)
+			metadata->fields.push_back(field_metadata(field));
 		metadata->properties.reserve(reflection.properties.size());
 		for (const Inspect::PropertyInfo& property : reflection.properties) {
 			metadata->properties.push_back({ property.name, property.type_name, property.declaring_type.full_name,
@@ -3694,8 +3641,10 @@ namespace Explorer {
 			};
 		for (std::size_t index = 0; index < values->fields.size(); ++index) {
 			const bool sampled = sampled_object_fields_.contains(index);
-			values->fields[index] =
-				index < object_inspector_reflection_.fields.size() && sampled
+			values->fields[index] = !metadata.fields[index].runtime_safe
+				? Inspect::unavailable_value(metadata.fields[index].type_name,
+					"Metadata only: " + metadata.fields[index].capability_reason)
+				: index < object_inspector_reflection_.fields.size() && sampled
 				? guarded_managed_read(
 					metadata.fields[index].type_name,
 					[&] { return Inspect::ReadField(object, object_inspector_reflection_.fields[index]); })
@@ -3706,14 +3655,19 @@ namespace Explorer {
 		}
 		for (std::size_t index = 0; index < values->properties.size(); ++index) {
 			const bool sampled = sampled_object_properties_.contains(index);
-			values->properties[index] =
-				index < object_inspector_reflection_.properties.size() && sampled
+			values->properties[index] = !metadata.properties[index].runtime_safe
+				? Inspect::unavailable_value(metadata.properties[index].type_name,
+					"Metadata only: " + metadata.properties[index].capability_reason)
+				: !metadata.properties[index].can_read
+				? Inspect::unavailable_value(metadata.properties[index].type_name, "Property is not readable")
+				: index < object_inspector_reflection_.properties.size() && sampled
 				? guarded_managed_read(
 					metadata.properties[index].type_name,
 					[&] { return Inspect::ReadProperty(object, object_inspector_reflection_.properties[index]); })
 				: Inspect::unavailable_value(metadata.properties[index].type_name, "Not sampled");
-			record_value_error(working_.object_inspector.type_name + "." + metadata.properties[index].name,
-				values->properties[index]);
+			if (metadata.properties[index].can_read)
+				record_value_error(working_.object_inspector.type_name + "." + metadata.properties[index].name,
+					values->properties[index]);
 			capture_reference(values->properties[index], 0x5000000000000000ull | index, values->property_references[index]);
 		}
 		working_.object_inspector.component.live_values = std::move(values);
@@ -3820,7 +3774,7 @@ namespace Explorer {
 		}
 		// A new selection ends a temporary camera focus so the previous camera
 		// pose is not carried into an unrelated object.
-		if (camera_focus_active_)
+		if (camera_focus_.active())
 			restore_focused_camera();
 
 		if (!root.handle) {
@@ -3856,249 +3810,36 @@ namespace Explorer {
 		clear_highlight_renderer_cache();
 	}
 
-	void RuntimeModel::update_camera_transition(Clock::time_point now) {
-		if (!camera_focus_active_ || !focused_camera_handle_.handle)
+	void RuntimeModel::update_camera_focus() {
+		if (!camera_focus_.active())
 			return;
-		const Camera camera{ Inspect::ResolveObjectHandle(focused_camera_handle_).handle() };
-		const Transform camera_transform = camera.transform();
-		if (!safe_object_alive(camera_transform)) {
-			camera_transition_active_ = false;
-			return;
-		}
-
-		if (camera_transition_active_) {
-			const float elapsed = std::chrono::duration<float>(now - camera_transition_started_).count();
-			const float duration = std::chrono::duration<float>(kCameraFocusTransition).count();
-			const float linear_amount = duration > 0.0f ? std::clamp(elapsed / duration, 0.0f, 1.0f) : 1.0f;
-			const float amount = linear_amount * linear_amount * (3.0f - 2.0f * linear_amount);
-			camera_transform.set_position(camera_transition_start_position * (1.0f - amount) +
-				camera_transition_target_position * amount);
-			camera_transform.set_localRotation(
-				quaternion_slerp(camera_transition_start_rotation, camera_transition_target_rotation, amount));
-			if (linear_amount < 1.0f)
-				return;
-			camera_transition_active_ = false;
-		}
-
-		// The game's camera controller may write its own local pose after the
-		// initial transition (Heartophia does this for the player camera). Keep
-		// the focus pose authoritative until the user explicitly restores the
-		// camera. The target owns the focus even if the user double-clicked a
-		// hierarchy row without changing the current Inspector selection.
-		const GameObject target{ Inspect::ResolveObjectHandle(focused_target_handle_).handle() };
-		if (!safe_object_alive(target)) {
-			restore_focused_camera();
-			return;
-		}
-		const Transform target_transform = target.transform();
-		if (!safe_object_alive(target_transform)) {
-			restore_focused_camera();
-			return;
-		}
-		clear_error();
-		const Vector3 target_position = target_transform.position();
-		camera_transform.set_position(target_position + camera_focus_offset);
-		camera_transform.LookAt(target_position);
-		if (const char* error = last_error(); error && error[0]) {
-			clear_error();
-			ModLog::warn("Camera focus hold failed; retaining the previous camera pose: %s", error);
+		std::string error;
+		if (!camera_focus_.update(error)) {
+			working_.camera_focus_active = false;
+			set_status(error.empty() ? "Camera focus ended" : std::move(error));
 		}
 	}
 
 	void RuntimeModel::focus_selected_camera(GameObject object) {
-		if (!safe_object_alive(object)) {
-			set_status("Camera focus failed: object is no longer available");
+		std::string error;
+		if (!camera_focus_.start(object, error)) {
+			working_.camera_focus_active = false;
+			set_status(error.empty() ? "Camera focus failed" : std::move(error));
 			return;
 		}
-		const Transform target_transform = object.transform();
-		if (!safe_object_alive(target_transform)) {
-			set_status("Camera focus failed: object has no Transform");
-			return;
-		}
-		const Vector3 target_position = target_transform.position();
-
-		// Prefer the tagged gameplay camera. Untagged games frequently have no
-		// useful Camera.current on this worker thread, so select the largest enabled
-		// camera that can see the target before falling back to Camera.current.
-		// Keep the discovery array alive until the chosen camera is pinned below.
-		const auto focus_camera_candidates = Object::FindObjectsOfTypeRooted<Camera>();
-		Camera camera = Camera::main();
-		if (!safe_object_alive(camera) || !camera.enabled()) {
-			camera = {};
-			double best_score = -1.0;
-			const double screen_area = static_cast<double>(std::max(1, Screen::width())) *
-				static_cast<double>(std::max(1, Screen::height()));
-			for (const Camera& candidate : focus_camera_candidates) {
-				if (!safe_object_alive(candidate) || !candidate.enabled())
-					continue;
-				clear_error();
-				const int pixel_width = candidate.pixelWidth();
-				const int pixel_height = candidate.pixelHeight();
-				const Vector3 viewport = candidate.WorldToViewportPoint(target_position);
-				if (const char* error = last_error(); error && error[0]) {
-					clear_error();
-					continue;
-				}
-				const double pixel_area = static_cast<double>(std::max(1, pixel_width)) *
-					static_cast<double>(std::max(1, pixel_height));
-				const bool finite_projection = std::isfinite(viewport.x) && std::isfinite(viewport.y) &&
-					std::isfinite(viewport.z);
-				const bool in_front = finite_projection && viewport.z > 0.01f;
-				const bool visible = in_front && viewport.x >= 0.0f && viewport.x <= 1.0f &&
-					viewport.y >= 0.0f && viewport.y <= 1.0f;
-				// Render area dominates so a minimap cannot steal focus merely because
-				// the target happens to be visible in it.
-				const double score = pixel_area * 10.0 + (in_front ? screen_area : 0.0) +
-					(visible ? screen_area * 2.0 : 0.0);
-				if (score > best_score) {
-					best_score = score;
-					camera = candidate;
-				}
-			}
-			if (!safe_object_alive(camera) || !camera.enabled())
-				camera = Camera::current();
-		}
-		if (!safe_object_alive(camera) || !camera.enabled()) {
-			set_status("Camera focus failed: no enabled camera was found");
-			return;
-		}
-		const Transform camera_transform = camera.transform();
-		if (!safe_object_alive(camera_transform)) {
-			set_status("Camera focus failed: camera Transform is unavailable");
-			return;
-		}
-
-		if (camera_focus_active_)
-			restore_focused_camera();
-		focused_target_handle_ = Inspect::PinObject(Object{ object.handle() });
-		if (!focused_target_handle_.handle) {
-			set_status("Camera focus failed: target could not be rooted");
-			return;
-		}
-		focused_camera_handle_ = Inspect::PinObject(Object{ camera.handle() });
-		if (!focused_camera_handle_.handle) {
-			Inspect::FreeObjectHandle(focused_target_handle_);
-			focused_target_handle_ = {};
-			set_status("Camera focus failed: camera could not be rooted");
-			return;
-		}
-		const Camera rooted_camera{ Inspect::ResolveObjectHandle(focused_camera_handle_).handle() };
-		const Transform rooted_transform = rooted_camera.transform();
-		if (!safe_object_alive(rooted_transform)) {
-			Inspect::FreeObjectHandle(focused_camera_handle_);
-			focused_camera_handle_ = {};
-			Inspect::FreeObjectHandle(focused_target_handle_);
-			focused_target_handle_ = {};
-			set_status("Camera focus failed: camera Transform is unavailable");
-			return;
-		}
-		saved_camera_position = rooted_transform.position();
-		saved_camera_rotation = rooted_transform.rotation();
-		saved_camera_local_position = rooted_transform.localPosition();
-		saved_camera_local_rotation = rooted_transform.localRotation();
-		// The vector from an arbitrary target to the current camera says where
-		// the target happens to be, not where the camera looks. Using it caused
-		// side-on/sky views for off-screen objects. Preserve the camera's actual
-		// viewing direction so FPS and isometric games both retain their angle.
-		Vector3 view_direction = -rooted_transform.forward();
-		float view_direction_length = view_direction.magnitude();
-		if (!std::isfinite(view_direction_length) || view_direction_length <= 0.001f) {
-			view_direction = saved_camera_position - target_position;
-			view_direction_length = view_direction.magnitude();
-		}
-		if (!std::isfinite(view_direction_length) || view_direction_length <= 0.001f) {
-			view_direction = { 0.0f, 0.0f, -1.0f };
-			view_direction_length = 1.0f;
-		}
-		camera_focus_view_direction = view_direction / view_direction_length;
-		Vector3 horizontal_offset{ camera_focus_view_direction.x, 0.0f, camera_focus_view_direction.z };
-		float horizontal_length = horizontal_offset.magnitude();
-		if (!std::isfinite(horizontal_length) || horizontal_length <= 0.001f) {
-			const Vector3 forward = rooted_transform.forward();
-			horizontal_offset = { -forward.x, 0.0f, -forward.z };
-			horizontal_length = horizontal_offset.magnitude();
-		}
-		if (!std::isfinite(horizontal_length) || horizontal_length <= 0.001f) {
-			horizontal_offset = { 0.0f, 0.0f, -1.0f };
-			horizontal_length = 1.0f;
-		}
-		camera_focus_heading = horizontal_offset / horizontal_length;
-		// Editor-like focus is deliberately above the target. Keeping this in
-		// world-space prevents the former side-on pose from being pushed into
-		// sloped terrain, oversized colliders, or world-space UI. A small
-		// retained horizontal offset gives the view a useful perspective angle.
-		camera_focus_offset = camera_focus_top_down_
-			? camera_focus_heading * camera_focus_tilt_ + Vector3{ 0.0f, camera_focus_distance_, 0.0f }
-			: camera_focus_view_direction * camera_focus_distance_;
-		camera_transition_start_position = saved_camera_position;
-		camera_transition_target_position = target_position + camera_focus_offset;
-		camera_transition_start_rotation = saved_camera_local_rotation;
-		rooted_transform.set_position(camera_transition_target_position);
-		rooted_transform.LookAt(target_position);
-		if (const char* error = last_error(); error && error[0]) {
-			const std::string message = std::string("Camera focus failed: ") + error;
-			clear_error();
-			Inspect::FreeObjectHandle(focused_camera_handle_);
-			focused_camera_handle_ = {};
-			Inspect::FreeObjectHandle(focused_target_handle_);
-			focused_target_handle_ = {};
-			set_status(message);
-			return;
-		}
-		camera_transition_target_rotation = rooted_transform.localRotation();
-		rooted_transform.set_position(camera_transition_start_position);
-		rooted_transform.set_localRotation(camera_transition_start_rotation);
-		if (const char* error = last_error(); error && error[0]) {
-			const std::string message = std::string("Camera focus transition failed: ") + error;
-			clear_error();
-			Inspect::FreeObjectHandle(focused_camera_handle_);
-			focused_camera_handle_ = {};
-			Inspect::FreeObjectHandle(focused_target_handle_);
-			focused_target_handle_ = {};
-			set_status(message);
-			return;
-		}
-		camera_focus_active_ = true;
 		working_.camera_focus_active = true;
-		camera_transition_started_ = Clock::now();
-		camera_transition_active_ = true;
-		set_status("Camera moved to and following " + object.name() + " (use Return camera to restore it)");
+		set_status("Camera focused on " + object.name() + " (use Return camera to restore it)");
 	}
 
 	void RuntimeModel::restore_focused_camera() {
-		if (!camera_focus_active_ && !focused_camera_handle_.handle)
+		if (!camera_focus_.active())
 			return;
-		camera_transition_active_ = false;
-		bool restored = false;
-		if (focused_camera_handle_.handle) {
-			const Camera camera{ Inspect::ResolveObjectHandle(focused_camera_handle_).handle() };
-			const Transform camera_transform = camera.transform();
-			if (safe_object_alive(camera_transform)) {
-				// Restore the rig-local pose. Restoring only world position/rotation
-				// breaks cameras parented under a player or camera rig because their
-				// controller drives localRotation every frame.
-				camera_transform.set_localPosition(saved_camera_local_position);
-				camera_transform.set_localRotation(saved_camera_local_rotation);
-				const char* local_error = last_error();
-				if (local_error && local_error[0]) {
-					clear_error();
-					camera_transform.set_position(saved_camera_position);
-					camera_transform.set_rotation(saved_camera_rotation);
-				}
-				const char* restore_error = last_error();
-				restored = !(restore_error && restore_error[0]);
-				clear_error();
-			}
-			Inspect::FreeObjectHandle(focused_camera_handle_);
-			focused_camera_handle_ = {};
-		}
-		Inspect::FreeObjectHandle(focused_target_handle_);
-		focused_target_handle_ = {};
-		camera_focus_active_ = false;
+		std::string error;
+		const bool restored = camera_focus_.stop(error);
 		working_.camera_focus_active = false;
-		set_status(restored ? "Camera restored" : "Camera focus ended; the original camera was unavailable");
+		set_status(restored ? "Camera restored" :
+			"Camera focus ended; " + (error.empty() ? std::string("the original camera was unavailable") : error));
 	}
-
 	void RuntimeModel::update_highlight() {
 		if (!highlight_enabled_) {
 			if (highlight_id_ != 0) {
@@ -4543,7 +4284,7 @@ namespace Explorer {
 	}
 
 	void RuntimeModel::clear_selection() {
-		if (camera_focus_active_)
+		if (camera_focus_.active())
 			restore_focused_camera();
 		if (highlight_id_ != 0) {
 			ModUI::Highlight::enqueue_remove(highlight_id_);
@@ -4572,12 +4313,7 @@ namespace Explorer {
 			ModUI::Highlight::enqueue_remove(highlight_locator_id_);
 		highlight_id_ = 0;
 		highlight_locator_id_ = 0;
-		Inspect::FreeObjectHandle(focused_camera_handle_);
-		focused_camera_handle_ = {};
-		Inspect::FreeObjectHandle(focused_target_handle_);
-		focused_target_handle_ = {};
-		camera_focus_active_ = false;
-		camera_transition_active_ = false;
+		camera_focus_.abandon_after_native_fault();
 
 		selected_ = {};
 		Inspect::FreeObjectHandle(selected_handle_);
@@ -4701,9 +4437,11 @@ namespace Explorer {
 		working_.class_browser_catalog = class_browser_catalog_;
 		working_.live_data = live_data_;
 		working_.highlight_enabled = highlight_enabled_;
-		working_.camera_focus_distance = camera_focus_distance_;
-		working_.camera_focus_tilt = camera_focus_tilt_;
-		working_.camera_focus_top_down = camera_focus_top_down_;
+		const CameraFocus::Settings& camera_settings = camera_focus_.settings();
+		working_.camera_focus_distance = camera_settings.distance;
+		working_.camera_focus_tilt = camera_settings.top_down_tilt;
+		working_.camera_focus_top_down = camera_settings.top_down;
+		working_.camera_focus_active = camera_focus_.active();
 		working_.method_traces = MethodTracer::snapshots();
 		working_.field_watches.clear();
 		working_.field_watches.reserve(field_watches_.size());
@@ -4760,15 +4498,15 @@ namespace Explorer {
 		working_.hierarchy_census_active = hierarchy_census_ != nullptr;
 		working_.hierarchy_census_processed = hierarchy_census_ ? hierarchy_census_->candidate_index : 0;
 		working_.hierarchy_census_candidates = hierarchy_census_ ? hierarchy_census_->candidate_count : 0;
-		working_.managed_used_bytes = URK::il2cpp::gc_get_used_size();
-		working_.managed_heap_bytes = URK::il2cpp::gc_get_heap_size();
+		working_.managed_used_bytes = URK::managed::gc_get_used_size();
+		working_.managed_heap_bytes = URK::managed::gc_get_heap_size();
 		++working_.revision;
 		published_.store(std::make_shared<const Snapshot>(working_));
 	}
 
 	void RuntimeModel::publish_recovery_snapshot() {
 		// Keep this strictly native-only.  In particular, gc_get_* and trace
-		// display formatting call IL2CPP and are not safe immediately after SEH.
+		// display formatting call the managed runtime and are not safe immediately after SEH.
 		working_.hierarchy = hierarchy_;
 		working_.strong_handle_count = component_handles_.size();
 		working_.weak_handle_count = 0;

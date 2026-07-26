@@ -11,6 +11,8 @@ namespace URK::Unity {
 // URK_UNITY_INSPECT_BEGIN
 namespace Inspect {
 inline constexpr std::uint32_t kStaticMemberFlag = 0x0010u;
+inline constexpr std::uint32_t kInitOnlyFieldFlag = 0x0020u;
+inline constexpr std::uint32_t kLiteralFieldFlag = 0x0040u;
 inline constexpr std::size_t kMaxMetadataInheritanceDepth = 128;
 inline constexpr std::size_t kMaxMetadataMembers = 131072;
 inline constexpr std::size_t kMaxMetadataMembersPerClass = 32768;
@@ -122,7 +124,17 @@ struct FieldInfo {
     bool is_value_type = false;
     bool is_enum = false;
     bool type_is_opaque = false;
+    bool is_delegate = false;
 };
+
+inline constexpr bool FieldFlagsWritable(std::uint32_t flags) {
+    return (flags & (kInitOnlyFieldFlag | kLiteralFieldFlag)) == 0;
+}
+
+inline bool FieldCanWrite(const FieldInfo& field) {
+    return FieldFlagsWritable(field.flags) &&
+        !field.type_is_opaque && !field.is_delegate;
+}
 struct MethodParamInfo {
     const void* type = nullptr;
     std::string name;
@@ -197,7 +209,7 @@ struct ObjectRefInfo {
     bool expandable = false;
 };
 struct ObjectHandle {
-    URK::il2cpp::GCHandle handle = 0;
+    URK::managed::GCHandle handle = 0;
     bool weak = false;
     bool pinned = false;
 };
@@ -213,14 +225,14 @@ inline std::string type_name(const void* type) {
     // component is being initialized. A failed type name must not poison the
     // whole reflection pass (or escape the host's main-thread callback).
     __try {
-        return URK::il2cpp::type_get_name(static_cast<const URK::il2cpp::Type*>(type), out, sizeof(out))
+        return URK::managed::type_get_name(static_cast<const URK::managed::Type*>(type), out, sizeof(out))
             ? std::string(out) : std::string{};
     } __except (metadata_exception_filter(_exception_code())) {
         detail::set_error("Unity Inspect type_get_name raised a native access fault for an invalid type record");
         return {};
     }
 #else
-    return URK::il2cpp::type_get_name(static_cast<const URK::il2cpp::Type*>(type), out, sizeof(out))
+    return URK::managed::type_get_name(static_cast<const URK::managed::Type*>(type), out, sizeof(out))
         ? std::string(out) : std::string{};
 #endif
 }
@@ -231,12 +243,12 @@ inline std::int32_t metadata_type_code(const void* type) {
     // rendering; a foreign type record must remain displayable even when it
     // does not implement IL2CPP's class-resolution contract.
     __try {
-        return URK::il2cpp::type_get_type(static_cast<const URK::il2cpp::Type*>(type));
+        return URK::managed::type_get_type(static_cast<const URK::managed::Type*>(type));
     } __except (metadata_exception_filter(_exception_code())) {
         return -1;
     }
 #else
-    return URK::il2cpp::type_get_type(static_cast<const URK::il2cpp::Type*>(type));
+    return URK::managed::type_get_type(static_cast<const URK::managed::Type*>(type));
 #endif
 }
 inline MemberTypeInfo describe_member_type(const void* type) {
@@ -293,18 +305,18 @@ inline TypeInfo DescribeClass(const void* klass) {
     TypeInfo out{};
     out.handle = klass;
     if (!klass) return out;
-    const auto* k = static_cast<const URK::il2cpp::Class*>(klass);
+    const auto* k = static_cast<const URK::managed::Class*>(klass);
 #if defined(_WIN32)
     __try {
 #endif
-    const char* ns = URK::il2cpp::class_get_namespace(k);
-    const char* name = URK::il2cpp::class_get_name(k);
+    const char* ns = URK::managed::class_get_namespace(k);
+    const char* name = URK::managed::class_get_name(k);
     out.namespc = ns ? ns : "";
     out.name = name ? name : "";
     out.full_name = out.namespc.empty() ? out.name : out.namespc + "." + out.name;
-    out.flags = URK::il2cpp::class_get_flags(k);
-    out.is_value_type = URK::il2cpp::class_is_valuetype(k);
-    out.is_enum = URK::il2cpp::class_is_enum(k);
+    out.flags = URK::managed::class_get_flags(k);
+    out.is_value_type = URK::managed::class_is_valuetype(k);
+    out.is_enum = URK::managed::class_is_enum(k);
 #if defined(_WIN32)
     } __except (metadata_exception_filter(_exception_code())) {
         detail::set_error("Unity Inspect DescribeClass raised a native access fault for an invalid class record");
@@ -317,16 +329,39 @@ inline TypeInfo DescribeType(const void* type) {
     if (!type) return {};
 #if defined(_WIN32)
     __try {
-        return DescribeClass(URK::il2cpp::type_get_class_or_element_class(
-            static_cast<const URK::il2cpp::Type*>(type)));
+        return DescribeClass(URK::managed::type_get_class_or_element_class(
+            static_cast<const URK::managed::Type*>(type)));
     } __except (metadata_exception_filter(_exception_code())) {
         detail::set_error("Unity Inspect type_get_class_or_element_class raised a native access fault for an invalid type record");
         return {};
     }
 #else
-    return DescribeClass(URK::il2cpp::type_get_class_or_element_class(
-        static_cast<const URK::il2cpp::Type*>(type)));
+    return DescribeClass(URK::managed::type_get_class_or_element_class(
+        static_cast<const URK::managed::Type*>(type)));
 #endif
+}
+
+inline bool IsDelegateType(const void* type) {
+    if (!type) return false;
+#if defined(_WIN32)
+    __try {
+#endif
+    const auto* current = URK::managed::type_get_class_or_element_class(
+        static_cast<const URK::managed::Type*>(type));
+    for (std::size_t depth = 0; current && depth < 64; ++depth) {
+        const char* namespc = URK::managed::class_get_namespace(current);
+        const char* name = URK::managed::class_get_name(current);
+        if (namespc && name && std::string_view(namespc) == "System" &&
+            (std::string_view(name) == "Delegate" || std::string_view(name) == "MulticastDelegate"))
+            return true;
+        current = URK::managed::class_get_parent(current);
+    }
+#if defined(_WIN32)
+    } __except (metadata_exception_filter(_exception_code())) {
+        return false;
+    }
+#endif
+    return false;
 }
 inline TypeInfo TypeOf(Object object) {
     detail::clear_error();
@@ -354,21 +389,21 @@ inline ObjectRefInfo DescribeObject(Object object) {
 }
 inline bool IsAssignableTo(Object object, const void* targetType) {
     if (!object.handle() || !targetType) return false;
-    const auto* target = URK::il2cpp::type_get_class_or_element_class(
-        static_cast<const URK::il2cpp::Type*>(targetType));
-    const auto* actual = static_cast<const URK::il2cpp::Class*>(detail::Backend::object_get_class(object.handle()));
-    return target && actual && URK::il2cpp::class_is_assignable_from(target, actual) != 0;
+    const auto* target = URK::managed::type_get_class_or_element_class(
+        static_cast<const URK::managed::Type*>(targetType));
+    const auto* actual = static_cast<const URK::managed::Class*>(detail::Backend::object_get_class(object.handle()));
+    return target && actual && URK::managed::class_is_assignable_from(target, actual) != 0;
 }
 // Value types are passed to IL2CPP as unboxed memory.  A boxed source must
 // therefore match the exact value-type class; assignability is only valid for
 // managed reference types.
 inline bool IsBoxedValueOfType(Object object, const void* targetType) {
     if (!object.handle() || !targetType) return false;
-    const auto* target = URK::il2cpp::type_get_class_or_element_class(
-        static_cast<const URK::il2cpp::Type*>(targetType));
-    const auto* actual = static_cast<const URK::il2cpp::Class*>(
+    const auto* target = URK::managed::type_get_class_or_element_class(
+        static_cast<const URK::managed::Type*>(targetType));
+    const auto* actual = static_cast<const URK::managed::Class*>(
         detail::Backend::object_get_class(object.handle()));
-    return target && actual && target == actual && URK::il2cpp::class_is_valuetype(target);
+    return target && actual && target == actual && URK::managed::class_is_valuetype(target);
 }
 inline ObjectRefInfo ExpandValue(const ValueInfo& value) {
     if (value.kind == ValueKind::Null) {
@@ -417,7 +452,7 @@ inline Object ResolveObjectHandle(const ObjectHandle& handle) {
 inline void FreeObjectHandle(ObjectHandle& handle) {
     detail::clear_error();
     if (!handle.handle) return;
-    const URK::il2cpp::GCHandle raw_handle = handle.handle;
+    const URK::managed::GCHandle raw_handle = handle.handle;
     // Consume ownership before calling the backend. If a damaged runtime table
     // faults while freeing this one handle, retrying it every recovery tick is
     // worse than an observable, bounded one-handle leak.
@@ -435,11 +470,11 @@ inline void FreeObjectHandle(ObjectHandle& handle) {
     handle.weak = false;
     handle.pinned = false;
 }
-inline std::vector<FieldInfo> fields_from_class(const URK::il2cpp::Class* klass, bool includeInherited) {
+inline std::vector<FieldInfo> fields_from_class(const URK::managed::Class* klass, bool includeInherited) {
     std::vector<FieldInfo> out;
     std::unordered_set<const void*> visited;
     std::size_t depth = 0;
-    for (const void* current = klass; current; current = includeInherited ? URK::il2cpp::class_get_parent(static_cast<const URK::il2cpp::Class*>(current)) : nullptr) {
+    for (const void* current = klass; current; current = includeInherited ? URK::managed::class_get_parent(static_cast<const URK::managed::Class*>(current)) : nullptr) {
         if (depth++ >= kMaxMetadataInheritanceDepth || !visited.insert(current).second) {
             detail::set_error("Unity Inspect::Fields rejected a cyclic or excessive inheritance chain");
             break;
@@ -449,7 +484,7 @@ inline std::vector<FieldInfo> fields_from_class(const URK::il2cpp::Class* klass,
         void* it = nullptr;
         std::unordered_set<const void*> members;
         std::size_t member_count = 0;
-        while (const auto* field = URK::il2cpp::class_get_fields(static_cast<const URK::il2cpp::Class*>(current), &it)) {
+        while (const auto* field = URK::managed::class_get_fields(static_cast<const URK::managed::Class*>(current), &it)) {
             if (++member_count > kMaxMetadataMembersPerClass || !members.insert(field).second) {
                 detail::set_error("Unity Inspect::Fields rejected a cyclic or excessive field iterator");
                 return out;
@@ -461,9 +496,9 @@ inline std::vector<FieldInfo> fields_from_class(const URK::il2cpp::Class* klass,
             FieldInfo info{};
             info.handle = field;
             info.declaring_type = declaring;
-            const char* name = URK::il2cpp::field_get_name(field);
+            const char* name = URK::managed::field_get_name(field);
             info.name = metadata_display_name(name);
-            const void* fieldType = URK::il2cpp::field_get_type(field);
+            const void* fieldType = URK::managed::field_get_type(field);
             const MemberTypeInfo fieldTypeInfo = describe_member_type(fieldType);
             // Keep readable foreign signatures. They can be copied and shown,
             // but their value traits remain deliberately conservative.
@@ -471,11 +506,12 @@ inline std::vector<FieldInfo> fields_from_class(const URK::il2cpp::Class* klass,
                 continue;
             info.type = fieldType;
             info.type_name = std::move(fieldTypeInfo.name);
-            info.flags = URK::il2cpp::field_get_flags(field);
+            info.flags = URK::managed::field_get_flags(field);
             info.is_static = (info.flags & kStaticMemberFlag) != 0;
             info.is_value_type = fieldTypeInfo.is_value_type;
             info.is_enum = fieldTypeInfo.is_enum;
             info.type_is_opaque = fieldTypeInfo.is_opaque;
+            info.is_delegate = IsDelegateType(fieldType);
             out.push_back(info);
         }
     }
@@ -485,32 +521,32 @@ inline std::vector<FieldInfo> Fields(TypeRef type, bool includeInherited = true)
     detail::clear_error();
     const void* klass = type.resolve_class();
     if (!klass) { detail::set_error("Unity Inspect::Fields failed: type lookup failure"); detail::append_backend_error(); return {}; }
-    return fields_from_class(static_cast<const URK::il2cpp::Class*>(klass), includeInherited);
+    return fields_from_class(static_cast<const URK::managed::Class*>(klass), includeInherited);
 }
 inline std::vector<FieldInfo> Fields(Object object, bool includeInherited = true) {
     detail::clear_error();
     const void* klass = detail::Backend::object_get_class(object.handle());
     if (!klass) { detail::set_error("Unity Inspect::Fields failed: object_get_class failed"); detail::append_backend_error(); return {}; }
-    return fields_from_class(static_cast<const URK::il2cpp::Class*>(klass), includeInherited);
+    return fields_from_class(static_cast<const URK::managed::Class*>(klass), includeInherited);
 }
 inline std::vector<FieldInfo> Fields(const ObjectRefInfo& object, bool includeInherited = true) {
     return object.handle ? Fields(Object{object.handle}, includeInherited) : std::vector<FieldInfo>{};
 }
-inline MethodInfo method_info(const URK::il2cpp::Method* method, TypeInfo declaring) {
+inline MethodInfo method_info(const URK::managed::Method* method, TypeInfo declaring) {
     MethodInfo info{};
     info.handle = method;
     info.declaring_type = std::move(declaring);
-    const char* name = URK::il2cpp::method_get_name(method);
+    const char* name = URK::managed::method_get_name(method);
     info.name = metadata_display_name(name);
-    info.flags = URK::il2cpp::method_get_flags(method, &info.iflags);
+    info.flags = URK::managed::method_get_flags(method, &info.iflags);
     info.is_static = (info.flags & kStaticMemberFlag) != 0;
-    info.return_type_handle = URK::il2cpp::method_get_return_type(method);
+    info.return_type_handle = URK::managed::method_get_return_type(method);
     const MemberTypeInfo return_type_info = describe_member_type(info.return_type_handle);
     info.return_type = return_type_info.name;
     info.return_is_value_type = return_type_info.is_value_type;
     info.return_is_enum = return_type_info.is_enum;
     info.return_type_is_opaque = return_type_info.is_opaque;
-    const std::uint32_t count = URK::il2cpp::method_get_param_count(method);
+    const std::uint32_t count = URK::managed::method_get_param_count(method);
     if (count > kMaxMethodParameters) {
         detail::set_error("Unity Inspect::Methods rejected an excessive parameter count");
         return {};
@@ -519,10 +555,10 @@ inline MethodInfo method_info(const URK::il2cpp::Method* method, TypeInfo declar
         return {};
     info.parameters.reserve(count);
     for (std::uint32_t i = 0; i < count; ++i) {
-        const void* paramType = URK::il2cpp::method_get_param(method, i);
+        const void* paramType = URK::managed::method_get_param(method, i);
         if (!paramType)
             return {};
-        const char* paramName = URK::il2cpp::method_get_param_name(method, i);
+        const char* paramName = URK::managed::method_get_param_name(method, i);
         const MemberTypeInfo parameter_type_info = describe_member_type(paramType);
         if (!parameter_type_info.readable)
             return {};
@@ -532,11 +568,11 @@ inline MethodInfo method_info(const URK::il2cpp::Method* method, TypeInfo declar
     }
     return info;
 }
-inline std::vector<MethodInfo> methods_from_class(const URK::il2cpp::Class* klass, bool includeInherited) {
+inline std::vector<MethodInfo> methods_from_class(const URK::managed::Class* klass, bool includeInherited) {
     std::vector<MethodInfo> out;
     std::unordered_set<const void*> visited;
     std::size_t depth = 0;
-    for (const void* current = klass; current; current = includeInherited ? URK::il2cpp::class_get_parent(static_cast<const URK::il2cpp::Class*>(current)) : nullptr) {
+    for (const void* current = klass; current; current = includeInherited ? URK::managed::class_get_parent(static_cast<const URK::managed::Class*>(current)) : nullptr) {
         if (depth++ >= kMaxMetadataInheritanceDepth || !visited.insert(current).second) {
             detail::set_error("Unity Inspect::Methods rejected a cyclic or excessive inheritance chain");
             break;
@@ -546,7 +582,7 @@ inline std::vector<MethodInfo> methods_from_class(const URK::il2cpp::Class* klas
         void* it = nullptr;
         std::unordered_set<const void*> members;
         std::size_t member_count = 0;
-        while (const auto* method = URK::il2cpp::class_get_methods(static_cast<const URK::il2cpp::Class*>(current), &it)) {
+        while (const auto* method = URK::managed::class_get_methods(static_cast<const URK::managed::Class*>(current), &it)) {
             if (++member_count > kMaxMetadataMembersPerClass || !members.insert(method).second) {
                 detail::set_error("Unity Inspect::Methods rejected a cyclic or excessive method iterator");
                 return out;
@@ -566,39 +602,39 @@ inline std::vector<MethodInfo> Methods(TypeRef type, bool includeInherited = tru
     detail::clear_error();
     const void* klass = type.resolve_class();
     if (!klass) { detail::set_error("Unity Inspect::Methods failed: type lookup failure"); detail::append_backend_error(); return {}; }
-    return methods_from_class(static_cast<const URK::il2cpp::Class*>(klass), includeInherited);
+    return methods_from_class(static_cast<const URK::managed::Class*>(klass), includeInherited);
 }
 inline std::vector<MethodInfo> Methods(Object object, bool includeInherited = true) {
     detail::clear_error();
     const void* klass = detail::Backend::object_get_class(object.handle());
     if (!klass) { detail::set_error("Unity Inspect::Methods failed: object_get_class failed"); detail::append_backend_error(); return {}; }
-    return methods_from_class(static_cast<const URK::il2cpp::Class*>(klass), includeInherited);
+    return methods_from_class(static_cast<const URK::managed::Class*>(klass), includeInherited);
 }
 inline std::vector<MethodInfo> Methods(const ObjectRefInfo& object, bool includeInherited = true) {
     return object.handle ? Methods(Object{object.handle}, includeInherited) : std::vector<MethodInfo>{};
 }
-inline PropertyInfo property_info(const URK::il2cpp::Property* property, TypeInfo declaring) {
+inline PropertyInfo property_info(const URK::managed::Property* property, TypeInfo declaring) {
     PropertyInfo info{};
     info.handle = property;
     info.declaring_type = std::move(declaring);
-    const char* name = URK::il2cpp::property_get_name(property);
+    const char* name = URK::managed::property_get_name(property);
     info.name = metadata_display_name(name);
-    info.flags = URK::il2cpp::property_get_flags(property);
-    info.get_method = URK::il2cpp::property_get_get_method(property);
-    info.set_method = URK::il2cpp::property_get_set_method(property);
-    if (info.get_method && URK::il2cpp::method_get_param_count(static_cast<const URK::il2cpp::Method*>(info.get_method)) != 0)
+    info.flags = URK::managed::property_get_flags(property);
+    info.get_method = URK::managed::property_get_get_method(property);
+    info.set_method = URK::managed::property_get_set_method(property);
+    if (info.get_method && URK::managed::method_get_param_count(static_cast<const URK::managed::Method*>(info.get_method)) != 0)
         info.get_method = nullptr; // Indexers cannot be invoked without arguments by the explorer.
-    if (info.set_method && URK::il2cpp::method_get_param_count(static_cast<const URK::il2cpp::Method*>(info.set_method)) != 1)
+    if (info.set_method && URK::managed::method_get_param_count(static_cast<const URK::managed::Method*>(info.set_method)) != 1)
         info.set_method = nullptr;
     info.can_read = info.get_method != nullptr;
     info.can_write = info.set_method != nullptr;
     if (const void* accessor = info.get_method ? info.get_method : info.set_method) {
         std::uint32_t iflags = 0;
-        info.is_static = (URK::il2cpp::method_get_flags(
-            static_cast<const URK::il2cpp::Method*>(accessor), &iflags) & kStaticMemberFlag) != 0;
+        info.is_static = (URK::managed::method_get_flags(
+            static_cast<const URK::managed::Method*>(accessor), &iflags) & kStaticMemberFlag) != 0;
     }
-    const void* propertyType = info.get_method ? URK::il2cpp::method_get_return_type(static_cast<const URK::il2cpp::Method*>(info.get_method))
-                                               : (info.set_method ? URK::il2cpp::method_get_param(static_cast<const URK::il2cpp::Method*>(info.set_method), 0) : nullptr);
+    const void* propertyType = info.get_method ? URK::managed::method_get_return_type(static_cast<const URK::managed::Method*>(info.get_method))
+                                               : (info.set_method ? URK::managed::method_get_param(static_cast<const URK::managed::Method*>(info.set_method), 0) : nullptr);
     const MemberTypeInfo propertyTypeInfo = describe_member_type(propertyType);
     if (!propertyType || !propertyTypeInfo.readable)
         return {};
@@ -609,11 +645,11 @@ inline PropertyInfo property_info(const URK::il2cpp::Property* property, TypeInf
     info.type_is_opaque = propertyTypeInfo.is_opaque;
     return info;
 }
-inline std::vector<PropertyInfo> properties_from_class(const URK::il2cpp::Class* klass, bool includeInherited) {
+inline std::vector<PropertyInfo> properties_from_class(const URK::managed::Class* klass, bool includeInherited) {
     std::vector<PropertyInfo> out;
     std::unordered_set<const void*> visited;
     std::size_t depth = 0;
-    for (const void* current = klass; current; current = includeInherited ? URK::il2cpp::class_get_parent(static_cast<const URK::il2cpp::Class*>(current)) : nullptr) {
+    for (const void* current = klass; current; current = includeInherited ? URK::managed::class_get_parent(static_cast<const URK::managed::Class*>(current)) : nullptr) {
         if (depth++ >= kMaxMetadataInheritanceDepth || !visited.insert(current).second) {
             detail::set_error("Unity Inspect::Properties rejected a cyclic or excessive inheritance chain");
             break;
@@ -623,7 +659,7 @@ inline std::vector<PropertyInfo> properties_from_class(const URK::il2cpp::Class*
         void* it = nullptr;
         std::unordered_set<const void*> members;
         std::size_t member_count = 0;
-        while (const auto* property = URK::il2cpp::class_get_properties(static_cast<const URK::il2cpp::Class*>(current), &it)) {
+        while (const auto* property = URK::managed::class_get_properties(static_cast<const URK::managed::Class*>(current), &it)) {
             if (++member_count > kMaxMetadataMembersPerClass || !members.insert(property).second) {
                 detail::set_error("Unity Inspect::Properties rejected a cyclic or excessive property iterator");
                 return out;
@@ -643,13 +679,13 @@ inline std::vector<PropertyInfo> Properties(TypeRef type, bool includeInherited 
     detail::clear_error();
     const void* klass = type.resolve_class();
     if (!klass) { detail::set_error("Unity Inspect::Properties failed: type lookup failure"); detail::append_backend_error(); return {}; }
-    return properties_from_class(static_cast<const URK::il2cpp::Class*>(klass), includeInherited);
+    return properties_from_class(static_cast<const URK::managed::Class*>(klass), includeInherited);
 }
 inline std::vector<PropertyInfo> Properties(Object object, bool includeInherited = true) {
     detail::clear_error();
     const void* klass = detail::Backend::object_get_class(object.handle());
     if (!klass) { detail::set_error("Unity Inspect::Properties failed: object_get_class failed"); detail::append_backend_error(); return {}; }
-    return properties_from_class(static_cast<const URK::il2cpp::Class*>(klass), includeInherited);
+    return properties_from_class(static_cast<const URK::managed::Class*>(klass), includeInherited);
 }
 inline std::vector<PropertyInfo> Properties(const ObjectRefInfo& object, bool includeInherited = true) {
     return object.handle ? Properties(Object{object.handle}, includeInherited) : std::vector<PropertyInfo>{};
@@ -679,14 +715,14 @@ inline ValueInfo enum_placeholder(std::string typeName) {
     return out;
 }
 inline std::string enum_underlying_type_name(const void* type) {
-    const void* klass = type ? URK::il2cpp::type_get_class_or_element_class(static_cast<const URK::il2cpp::Type*>(type)) : nullptr;
+    const void* klass = type ? URK::managed::type_get_class_or_element_class(static_cast<const URK::managed::Type*>(type)) : nullptr;
     if (!klass) return {};
-    const void* underlying = URK::il2cpp::class_enum_basetype(static_cast<const URK::il2cpp::Class*>(klass));
+    const void* underlying = URK::managed::class_enum_basetype(static_cast<const URK::managed::Class*>(klass));
     if (underlying) return type_name(underlying);
     void* it = nullptr;
-    while (const auto* field = URK::il2cpp::class_get_fields(static_cast<const URK::il2cpp::Class*>(klass), &it)) {
-        const char* name = URK::il2cpp::field_get_name(field);
-        if (name && std::string_view{name} == "value__") return type_name(URK::il2cpp::field_get_type(field));
+    while (const auto* field = URK::managed::class_get_fields(static_cast<const URK::managed::Class*>(klass), &it)) {
+        const char* name = URK::managed::field_get_name(field);
+        if (name && std::string_view{name} == "value__") return type_name(URK::managed::field_get_type(field));
     }
     return {};
 }
@@ -1095,10 +1131,10 @@ inline ValueInfo ReadArrayElement(const ValueInfo& array, std::size_t index) {
     if (elementType.empty()) return unavailable_value(array.type_name, std::string("array element type unsupported or not single-dimensional: ") + array.type_name);
     int elementSize = scalar_element_size(elementType);
     if (elementSize == 0) elementSize = structured_element_size(elementType);
-    const auto* arrayClass = static_cast<const URK::il2cpp::Class*>(
+    const auto* arrayClass = static_cast<const URK::managed::Class*>(
         detail::Backend::object_get_class(array.object));
-    const auto* elementClass = arrayClass ? URK::il2cpp::class_get_element_class(arrayClass) : nullptr;
-    if (elementSize == 0 && elementClass && URK::il2cpp::class_is_valuetype(elementClass)) {
+    const auto* elementClass = arrayClass ? URK::managed::class_get_element_class(arrayClass) : nullptr;
+    if (elementSize == 0 && elementClass && URK::managed::class_is_valuetype(elementClass)) {
         std::uint32_t alignment = 0;
         elementSize = detail::Backend::class_value_size(elementClass, &alignment);
         if (elementSize <= 0) {
@@ -1132,10 +1168,10 @@ inline bool SetArrayElement(const ValueInfo& array, std::size_t index, const Val
     WriteStorage storage{};
     int elementSize = scalar_element_size(elementType);
     if (elementSize == 0) elementSize = structured_element_size(elementType);
-    const auto* arrayClass = static_cast<const URK::il2cpp::Class*>(
+    const auto* arrayClass = static_cast<const URK::managed::Class*>(
         detail::Backend::object_get_class(array.object));
-    const auto* elementClass = arrayClass ? URK::il2cpp::class_get_element_class(arrayClass) : nullptr;
-    if (elementSize == 0 && elementClass && URK::il2cpp::class_is_valuetype(elementClass)) {
+    const auto* elementClass = arrayClass ? URK::managed::class_get_element_class(arrayClass) : nullptr;
+    if (elementSize == 0 && elementClass && URK::managed::class_is_valuetype(elementClass)) {
         if (value.kind != ValueKind::ValueType || !value.object ||
             detail::Backend::object_get_class(value.object) != elementClass) {
             detail::set_error(std::string("Unity Inspect::SetArrayElement failed: expected boxed ") + elementType);
@@ -1259,6 +1295,8 @@ inline bool read_field_scalar_pointer(Object object, const FieldInfo& field, std
 }
 inline ValueInfo ReadField(Object object, const FieldInfo& field) {
     detail::clear_error();
+    if (field.is_delegate)
+        return unavailable_value(field.type_name, "delegate/event fields are metadata-only");
     if (field.type_is_opaque)
         return unavailable_value(field.type_name, "field type requires runtime-specific marshalling");
     const std::string normalized = detail::normalized_type_name(field.type_name);
@@ -1325,6 +1363,10 @@ inline ValueInfo ReadProperty(Object object, const PropertyInfo& property) {
 }
 inline bool SetField(Object object, const FieldInfo& field, const ValueInfo& value) {
     detail::clear_error();
+    if (!FieldCanWrite(field)) {
+        detail::set_error(std::string("Unity Inspect::SetField failed: field is readonly, literal, or unsafe: ") + field.name);
+        return false;
+    }
     if (field.type_is_opaque) {
         detail::set_error(std::string("Unity Inspect::SetField cannot marshal runtime-specific type: ") + field.type_name);
         return false;
