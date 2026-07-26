@@ -6,6 +6,7 @@ live view of the game's scenes, GameObjects, components, fields, properties,
 and methods.
 
 ![UnityRuntimeExplorer showcase](showcase/ss1.png)
+![UnityRuntimeExplorer showcase](showcase/ss2.png)
 
 The project is still early. The current release remains focused on **Windows
 x64 IL2CPP games**, while the source tree and build targets are separated for

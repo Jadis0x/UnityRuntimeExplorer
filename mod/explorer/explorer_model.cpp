@@ -22,6 +22,7 @@
 #include <deque>
 #include <functional>
 #include <limits>
+#include <optional>
 #include <unordered_set>
 #include <utility>
 
@@ -37,9 +38,14 @@ namespace Explorer {
 		constexpr auto kTracePublishInterval = std::chrono::milliseconds(250);
 		constexpr auto kEventRefreshDebounce = std::chrono::milliseconds(180);
 		constexpr int kMaxSceneCount = 128;
+		constexpr int kMaxBuildSceneCount = 4096;
 		constexpr int kMaxHierarchyDepth = 256;
 		constexpr std::size_t kMaxCensusCandidates = 250000;
 		constexpr std::size_t kArrayPageSize = 128;
+		// The byte decoder receives a native copy of managed data. Keep that copy
+		// bounded so a large asset cannot create an unbounded inspector snapshot.
+		constexpr std::size_t kMaxByteArrayInspectionBytes = 256 * 1024;
+		constexpr std::size_t kLiveByteArrayRefreshLimit = 4096;
 		constexpr std::size_t kMaxHighlightRenderers = 48;
 		constexpr int kHideAndDontSaveMask = 1 | 4 | 8 | 16 | 32;
 		constexpr TypeRef kSceneType{ "", "UnityEngine.SceneManagement", "Scene" };
@@ -53,10 +59,8 @@ namespace Explorer {
 			member.is_read_only = !Inspect::FieldCanWrite(field);
 			member.is_value_type = field.is_value_type;
 			member.is_enum = field.is_enum;
-			member.runtime_safe = !field.type_is_opaque && !field.is_delegate;
-			if (field.is_delegate)
-				member.capability_reason = "Delegate/event fields are metadata-only; generic access can dereference runtime-owned callback state.";
-			else if (field.type_is_opaque)
+			member.runtime_safe = !field.type_is_opaque;
+			if (field.type_is_opaque)
 				member.capability_reason = "Runtime-specific type; metadata is available but generic read/write is unsafe.";
 			return member;
 		}
@@ -90,6 +94,7 @@ namespace Explorer {
 			int instance_id = 0;
 			int parent_id = 0;
 			std::string name;
+			std::string tag;
 			bool active = false;
 		};
 
@@ -139,6 +144,19 @@ namespace Explorer {
 			return detail::InvokeStatic<std::string>(kSceneType, "GetNameInternal", handle);
 		}
 
+		std::string scene_display_name(std::string_view path, int build_index) {
+			if (!path.empty()) {
+				const std::size_t slash = path.find_last_of("/\\");
+				const std::size_t start = slash == std::string_view::npos ? 0 : slash + 1;
+				std::string name(path.substr(start));
+				if (const std::size_t extension = name.rfind('.'); extension != std::string::npos)
+					name.resize(extension);
+				if (!name.empty())
+					return name;
+			}
+			return "Build scene " + std::to_string(build_index);
+		}
+
 		bool is_hide_and_dont_save(GameObject object) {
 			const int flags = object.hideFlags();
 			return (flags & kHideAndDontSaveMask) == kHideAndDontSaveMask;
@@ -146,6 +164,14 @@ namespace Explorer {
 
 		std::string normalized_type(std::string_view name) {
 			return detail::normalized_type_name(name);
+		}
+
+		std::string lowercase_ascii(std::string_view text) {
+			std::string result(text);
+			std::transform(result.begin(), result.end(), result.begin(), [](unsigned char value) {
+				return static_cast<char>(std::tolower(value));
+			});
+			return result;
 		}
 
 		std::string pointer_text(void* pointer);
@@ -296,6 +322,11 @@ namespace Explorer {
 					value.readable = true;
 					value.display = pointer_text(resolved.handle());
 				}
+				else if (rooted.handle && resolved && destination_type) {
+					const Inspect::ObjectRefInfo actual = Inspect::DescribeObject(resolved);
+					detail::set_error("Reference type mismatch: expected " + std::string(type_name) +
+						", received " + (actual.type.full_name.empty() ? std::string("<unknown>") : actual.type.full_name));
+				}
 #if defined(_WIN32)
 			}
 			__except (capture_native_fault(_exception_info())) {
@@ -307,6 +338,60 @@ namespace Explorer {
 				return true;
 			Inspect::FreeObjectHandle(rooted);
 			return false;
+		}
+
+		std::optional<TypeObject> generic_type_from_text(std::string_view text, std::string& error,
+			const ClassBrowserCatalog* catalog) {
+			const std::size_t image_separator = text.find(':');
+			if (image_separator == std::string_view::npos) {
+				if (!catalog) {
+					error = "Generic type search is not ready; use image:Namespace.Type or open the suggestion list";
+					return std::nullopt;
+				}
+				const BrowserClassInfo* match = nullptr;
+				for (const BrowserClassInfo& entry : catalog->classes) {
+					const bool same_full_name = entry.full_name == text;
+					const bool same_class_name = entry.class_name == text;
+					if (!same_full_name && !same_class_name)
+						continue;
+					if (match) {
+						error = "Generic type is ambiguous; choose a fully qualified suggestion";
+						return std::nullopt;
+					}
+					match = &entry;
+				}
+				if (!match) {
+					error = "Generic type was not found in loaded assemblies: " + std::string(text);
+					return std::nullopt;
+				}
+				TypeRef type{ match->image, match->namespc, match->class_name };
+				void* type_object = type.resolve_type_object();
+				if (!type_object) {
+					const char* detail = last_error();
+					error = detail && detail[0] ? detail : "Generic type could not be resolved: " + std::string(text);
+					return std::nullopt;
+				}
+				return TypeObject{ type_object };
+			}
+			if (image_separator == 0 || image_separator + 1 >= text.size()) {
+				error = "Generic type must use image:Namespace.Type (example: bolt.user.dll:Photon.Bolt.IPlayerState)";
+				return std::nullopt;
+			}
+			const std::string_view image = text.substr(0, image_separator);
+			const std::string_view full_name = text.substr(image_separator + 1);
+			const std::size_t type_separator = full_name.rfind('.');
+			if (type_separator == std::string_view::npos || type_separator == 0 || type_separator + 1 >= full_name.size()) {
+				error = "Generic type must include both namespace and class name";
+				return std::nullopt;
+			}
+			TypeRef type{ image, full_name.substr(0, type_separator), full_name.substr(type_separator + 1) };
+			void* type_object = type.resolve_type_object();
+			if (!type_object) {
+				const char* detail = last_error();
+				error = detail && detail[0] ? detail : "Generic type could not be resolved: " + std::string(text);
+				return std::nullopt;
+			}
+			return TypeObject{ type_object };
 		}
 
 		bool enum_value_from_text(std::string_view type_name, std::string_view text, Inspect::ValueInfo& value) {
@@ -756,6 +841,7 @@ namespace Explorer {
 		process_commands();
 		if (native_faulted_.load(std::memory_order_acquire))
 			return;
+		update_pending_scene_load();
 
 		const Clock::time_point now = Clock::now();
 		update_camera_focus();
@@ -819,12 +905,15 @@ namespace Explorer {
 		hierarchy_instance_ids_.clear();
 		clear_component_cache();
 		clear_object_inspector();
+		managed_references_.clear();
+		release_all_field_watches();
 		for (auto& [_, handle] : class_browser_handles_)
 			Inspect::FreeObjectHandle(handle);
 		class_browser_handles_.clear();
 		for (auto& [_, handle] : class_browser_static_handles_)
 			Inspect::FreeObjectHandle(handle);
 		class_browser_static_handles_.clear();
+		class_browser_reflection_ = {};
 		clear_highlight_renderer_cache();
 		clear_highlight_camera_cache();
 		highlight_enabled_ = true;
@@ -1029,7 +1118,8 @@ namespace Explorer {
 	void RuntimeModel::process_command(const Command& command) {
 		const bool lifecycle_command = command.kind == CommandKind::SceneHint ||
 			command.kind == CommandKind::ObjectDestroyRequested;
-		if (!lifecycle_command && command.scene_generation != 0 && command.scene_generation != scene_generation_) {
+		if (!lifecycle_command && command.kind != CommandKind::LoadScene &&
+			command.scene_generation != 0 && command.scene_generation != scene_generation_) {
 			set_status("Ignored a command from an expired scene generation");
 			ModLog::warn("Dropped stale command: kind=%d sequence=%llu queued_generation=%llu current_generation=%llu",
 				static_cast<int>(command.kind), static_cast<unsigned long long>(command.sequence),
@@ -1047,10 +1137,13 @@ namespace Explorer {
 			command.kind == CommandKind::LoadComponentMetadata || command.kind == CommandKind::LoadComponentClassCatalog ||
 			command.kind == CommandKind::LoadClassBrowserCatalog || command.kind == CommandKind::FindClassInstances ||
 			command.kind == CommandKind::LoadClassBrowserStaticState ||
-			command.kind == CommandKind::LoadClassBrowserMembers || command.kind == CommandKind::DeleteComponent ||
+			command.kind == CommandKind::LoadClassBrowserMembers ||
+			command.kind == CommandKind::SetClassBrowserStaticField || command.kind == CommandKind::DeleteComponent ||
+			command.kind == CommandKind::CreateClassInstance ||
 			command.kind == CommandKind::SetComponentEnabled || command.kind == CommandKind::SetFieldValue ||
 			command.kind == CommandKind::SetPropertyValue || command.kind == CommandKind::SampleMemberValue ||
-			command.kind == CommandKind::SetArrayPage || command.kind == CommandKind::InvokeMethod ||
+			command.kind == CommandKind::SetArrayPage || command.kind == CommandKind::RefreshByteArrayInspection ||
+			command.kind == CommandKind::InvokeMethod ||
 			command.kind == CommandKind::SetMethodTrace || command.kind == CommandKind::ClearMethodTrace ||
 			command.kind == CommandKind::CloseMethodTrace || command.kind == CommandKind::SetFieldWatch ||
 			command.kind == CommandKind::ClearFieldWatch || command.kind == CommandKind::CloseFieldWatch ||
@@ -1061,7 +1154,10 @@ namespace Explorer {
 			command.kind == CommandKind::SetHighlightEnabled ||
 			command.kind == CommandKind::SetCameraFocusDistance ||
 			command.kind == CommandKind::SetCameraFocusTopDown ||
-			command.kind == CommandKind::SetCameraFocusTilt;
+			command.kind == CommandKind::SetCameraFocusTilt ||
+			command.kind == CommandKind::SetCameraFocusOffset ||
+			command.kind == CommandKind::LoadScene || command.kind == CommandKind::PinManagedReference ||
+			command.kind == CommandKind::ReleaseManagedReference || command.kind == CommandKind::ClearManagedReferences;
 		const bool event_command = command.kind == CommandKind::ObjectDestroyRequested;
 		ScopedObjectRoot command_root;
 		GameObject object{};
@@ -1156,6 +1252,26 @@ namespace Explorer {
 			return;
 		case CommandKind::Refresh:
 			request_refresh();
+			return;
+		case CommandKind::LoadScene:
+			load_scene(command.int_value, command.text);
+			publish();
+			return;
+		case CommandKind::PinManagedReference:
+			pin_managed_reference(command);
+			publish();
+			return;
+		case CommandKind::ReleaseManagedReference:
+			if (managed_references_.erase(command.reference_token))
+				set_status("Pinned reference removed");
+			else
+				set_status("Pinned reference was already removed");
+			publish();
+			return;
+		case CommandKind::ClearManagedReferences:
+			managed_references_.clear();
+			set_status("Pinned reference shelf cleared");
+			publish();
 			return;
 		case CommandKind::DeleteObject:
 			if (working_.selected_instance_id == command.instance_id)
@@ -1262,6 +1378,14 @@ namespace Explorer {
 			load_class_browser_members(command);
 			publish();
 			return;
+		case CommandKind::SetClassBrowserStaticField:
+			set_class_browser_static_field(command);
+			publish();
+			return;
+		case CommandKind::CreateClassInstance:
+			create_class_instance(command);
+			publish();
+			return;
 		case CommandKind::DeleteComponent:
 			delete_component(command.instance_id);
 			return;
@@ -1341,6 +1465,7 @@ namespace Explorer {
 			publish();
 			return;
 		}
+
 		case CommandKind::SetCameraFocusTopDown: {
 			CameraFocus::Settings settings = camera_focus_.settings();
 			settings.top_down = command.bool_value;
@@ -1356,6 +1481,17 @@ namespace Explorer {
 			camera_focus_.set_settings(settings);
 			update_camera_focus();
 			set_status("Camera top-down tilt set to " + std::to_string(settings.top_down_tilt) + " units");
+			publish();
+			return;
+		}
+		case CommandKind::SetCameraFocusOffset: {
+			CameraFocus::Settings settings = camera_focus_.settings();
+			settings.offset_x = std::clamp(command.vector_value.x, -10000.0f, 10000.0f);
+			settings.offset_y = std::clamp(command.vector_value.y, -10000.0f, 10000.0f);
+			settings.offset_z = std::clamp(command.vector_value.z, -10000.0f, 10000.0f);
+			camera_focus_.set_settings(settings);
+			update_camera_focus();
+			set_status("Camera focus offset updated");
 			publish();
 			return;
 		}
@@ -1382,6 +1518,17 @@ namespace Explorer {
 				command.int_value < 0 ? 0u : static_cast<std::size_t>(command.int_value);
 			refresh_object_inspector_values();
 			set_status("Array page loaded");
+			publish();
+			return;
+		case CommandKind::RefreshByteArrayInspection:
+			if (!working_.object_inspector.valid || !working_.object_inspector.is_array ||
+				command.object_inspector_token == 0 ||
+				command.object_inspector_token != working_.object_inspector.token) {
+				set_status("Byte array target is no longer available");
+				return;
+			}
+			refresh_object_inspector_values(true);
+			set_status("Byte array decoded from a fresh snapshot");
 			publish();
 			return;
 		case CommandKind::InvokeMethod:
@@ -1463,9 +1610,35 @@ namespace Explorer {
 			if (active_handle == 0)
 				active_handle = active_scene_handle_hint_;
 
+			const int build_scene_count =
+				std::clamp(SceneManager::sceneCountInBuildSettings(), 0, kMaxBuildSceneCount);
+			const bool scene_utility_available = SceneUtility::available();
+			clear_error();
+			next.available_scenes.reserve(static_cast<std::size_t>(build_scene_count));
+			for (int build_index = 0; build_index < build_scene_count; ++build_index) {
+				SceneLoadInfo scene{};
+				scene.build_index = build_index;
+				if (scene_utility_available)
+					scene.path = SceneUtility::GetScenePathByBuildIndex(build_index);
+				clear_error();
+				scene.name = scene_display_name(scene.path, build_index);
+				next.available_scenes.push_back(std::move(scene));
+			}
+
 			const int scene_count = std::clamp(SceneManager::sceneCount(), 0, kMaxSceneCount);
 			for (int index = 0; index < scene_count; ++index) {
 				const Scene scene = SceneManager::GetSceneAt(index);
+				const int build_index = scene.buildIndex();
+				if (build_index >= 0 && static_cast<std::size_t>(build_index) < next.available_scenes.size()) {
+					next.available_scenes[static_cast<std::size_t>(build_index)].loaded = scene.isLoaded();
+					next.available_scenes[static_cast<std::size_t>(build_index)].active = scene.handle_value() == active_handle;
+					const std::string loaded_name = scene.name();
+					if (!loaded_name.empty()) {
+						next.available_scenes[static_cast<std::size_t>(build_index)].name = loaded_name;
+						if (next.available_scenes[static_cast<std::size_t>(build_index)].path.empty())
+							next.available_scenes[static_cast<std::size_t>(build_index)].path = loaded_name;
+					}
+				}
 				const int handle = boxed_scene_handle(scene);
 				if (handle == 0 || state.loaded_scene_indices.contains(handle))
 					continue;
@@ -1562,6 +1735,7 @@ namespace Explorer {
 			record.name = object.name();
 			if (record.name.empty())
 				record.name = "<unnamed>";
+			record.tag = object.tag();
 			record.active = object.activeSelf();
 			flat_indices.emplace(instance_id, flat.size());
 			flat.push_back(std::move(record));
@@ -1602,6 +1776,7 @@ namespace Explorer {
 			node.instance_id = source.instance_id;
 			node.object_address = reinterpret_cast<std::uintptr_t>(source.object.handle());
 			node.name = source.name;
+			node.tag = source.tag;
 			node.pointer_text = pointer_text(source.object.handle());
 			node.active = source.active;
 			node.children.reserve(children[index].size());
@@ -1827,18 +2002,18 @@ namespace Explorer {
 				Inspect::FreeObjectHandle(handle);
 			}
 		component_handles_.clear();
-		for (auto& [_, handle] : reference_handles_)
-			if (handle.handle) {
-				Inspect::FreeObjectHandle(handle);
+		for (auto it = reference_handles_.begin(); it != reference_handles_.end();) {
+			if ((it->first & 0xF000000000000000ull) == 0xb000000000000000ull) {
+				++it;
+				continue;
 			}
-		reference_handles_.clear();
+			Inspect::FreeObjectHandle(it->second);
+			it = reference_handles_.erase(it);
+		}
 		working_.method_results.clear();
+		working_.member_write_results.clear();
 		component_reflection_.clear();
 		sampled_component_members_.clear();
-		// Discard watches when their selected component changes.
-		for (auto& [_, state] : field_watches_)
-			release_field_watch_references(state.snapshot);
-		field_watches_.clear();
 	}
 
 	void RuntimeModel::clear_object_inspector() {
@@ -1988,28 +2163,36 @@ namespace Explorer {
 		active_metadata_stage_.clear();
 
 		component->dynamic_bridge = {};
+		const std::string bridge_type = normalized_type(component->type_name);
+		if (bridge_type.find("dynamicmonobehaviour") != std::string::npos ||
+			bridge_type.find("dynamicbehaviour") != std::string::npos ||
+			bridge_type.find("dynamicbehavior") != std::string::npos)
+			component->dynamic_bridge.detected = true;
 		for (std::size_t method_index = 0; method_index < reflection.methods.size(); ++method_index) {
 			const Inspect::MethodInfo& method = reflection.methods[method_index];
+			const std::string method_name = lowercase_ascii(method.name);
 			const bool parameterless_instance = !method.is_static && method.parameters.empty();
-			if (parameterless_instance && method.return_type == "System.String" &&
-				(method.name == "GetBehaviourType" || method.name == "GetBehaviorType" ||
-					method.name == "GetScriptType")) {
+			if (parameterless_instance && normalized_type(method.return_type) == "system.string" &&
+				(method_name == "getbehaviourtype" || method_name == "getbehaviortype" ||
+					method_name == "getscripttype" ||
+					(method_name.find("behaviour") != std::string::npos && method_name.find("type") != std::string::npos) ||
+					(method_name.find("behavior") != std::string::npos && method_name.find("type") != std::string::npos))) {
 				component->dynamic_bridge.detected = true;
 				component->dynamic_bridge.type_getter = method.name + "()";
 				component->dynamic_bridge.type_getter_method_index = static_cast<int>(method_index);
 			}
-			if (method.name == "GetSerializedData" || method.name == "GetSerializedDataRef" ||
-				method.name == "GetSerializedDataInternal") {
+			const bool serialized_data_method = method_name.find("serialized") != std::string::npos &&
+				(method_name.find("data") != std::string::npos || method_name.find("payload") != std::string::npos);
+			if (serialized_data_method) {
 				component->dynamic_bridge.detected = true;
-				component->dynamic_bridge.serialized_data_methods.push_back(
-					method.name + "(" + std::to_string(method.parameters.size()) + " arg" +
-					(method.parameters.size() == 1 ? ")" : "s)"));
+				component->dynamic_bridge.serialized_data_method_indices.push_back(static_cast<int>(method_index));
 			}
-			if (method.name == "GetObject" && !method.is_static) {
+			const bool object_reference_method = !method.is_static &&
+				(method_name == "getobject" || method_name == "getobjectreference" ||
+					method_name == "getreferencedobject" || method_name == "getgameobject");
+			if (object_reference_method) {
 				component->dynamic_bridge.detected = true;
-				component->dynamic_bridge.object_reference_methods.push_back(
-					method.name + "(" + std::to_string(method.parameters.size()) + " arg" +
-					(method.parameters.size() == 1 ? ")" : "s)"));
+				component->dynamic_bridge.object_reference_method_indices.push_back(static_cast<int>(method_index));
 			}
 		}
 
@@ -2038,7 +2221,11 @@ namespace Explorer {
 			member.is_static = method.is_static;
 			member.return_is_value_type = method.return_is_value_type;
 			member.return_is_enum = method.return_is_enum;
-			member.runtime_callable = !method.return_type_is_opaque &&
+			member.uses_generic_parameter = method.return_type_is_generic_parameter ||
+				std::any_of(method.parameters.begin(), method.parameters.end(), [](const Inspect::MethodParamInfo& parameter) {
+					return parameter.is_generic_parameter;
+				});
+			member.runtime_callable = (!method.return_type_is_opaque || method.return_type_is_generic_parameter) &&
 				std::none_of(method.parameters.begin(), method.parameters.end(), [](const Inspect::MethodParamInfo& parameter) {
 					return parameter.is_opaque;
 					});
@@ -2456,16 +2643,21 @@ namespace Explorer {
 			set_status("Selected type could no longer be resolved");
 			return;
 		}
-		for (const Inspect::FieldInfo& field : Inspect::fields_from_class(klass, true)) {
+		const std::vector<Inspect::FieldInfo> fields = Inspect::fields_from_class(klass, true);
+		for (std::size_t index = 0; index < fields.size(); ++index) {
+			const Inspect::FieldInfo& field = fields[index];
 			if (!field.is_static)
 				continue;
 			const Inspect::ValueInfo value = Inspect::ReadField({}, field);
 			ClassBrowserStaticFieldInfo result{};
+			result.member_index = index;
 			result.name = field.name;
 			result.type_name = field.type_name;
 			result.declaring_type = field.declaring_type.full_name;
 			result.display = value.display.empty() ? "<unavailable>" : value.display;
+			result.value = value;
 			result.readable = value.readable;
+			result.writable = Inspect::FieldCanWrite(field);
 			result.is_reference =
 				value.kind == Inspect::ValueKind::ObjectReference || value.kind == Inspect::ValueKind::ArrayReference;
 			if (result.is_reference && value.object) {
@@ -2478,11 +2670,231 @@ namespace Explorer {
 			}
 			working_.class_browser_static_fields.push_back(std::move(result));
 		}
-		set_status("Loaded " + std::to_string(working_.class_browser_static_fields.size()) + " static field(s) from " +
+		const std::vector<Inspect::PropertyInfo> properties = Inspect::properties_from_class(klass, true);
+		for (std::size_t index = 0; index < properties.size(); ++index) {
+			const Inspect::PropertyInfo& property = properties[index];
+			if (!property.is_static)
+				continue;
+			const Inspect::ValueInfo value =
+				property.can_read ? Inspect::ReadProperty({}, property) : Inspect::ValueInfo{};
+			ClassBrowserStaticFieldInfo result{};
+			result.member_index = index;
+			result.name = property.name;
+			result.type_name = property.type_name;
+			result.declaring_type = property.declaring_type.full_name;
+			result.display = property.can_read
+				? (value.display.empty() ? "<unavailable>" : value.display)
+				: "<write-only>";
+			result.value = value;
+			result.is_property = true;
+			result.readable = property.can_read && value.readable;
+			result.writable = property.can_write;
+			result.is_reference =
+				value.kind == Inspect::ValueKind::ObjectReference || value.kind == Inspect::ValueKind::ArrayReference;
+			if (result.is_reference && value.object) {
+				Inspect::ObjectHandle handle = Inspect::PinObject(Object{value.object});
+				if (handle.handle) {
+					result.token = 0xa000000000000000ull | (next_reference_token_++ & 0x0fffffffffffffffull);
+					result.pointer_text = pointer_text(value.object);
+					class_browser_static_handles_[result.token] = handle;
+				}
+			}
+			working_.class_browser_static_fields.push_back(std::move(result));
+		}
+		set_status("Loaded " + std::to_string(working_.class_browser_static_fields.size()) + " static member(s) from " +
 			working_.class_browser_static_query.full_name);
 	}
 
+	void RuntimeModel::set_class_browser_static_field(const Command& command) {
+		const URK::managed::Class* klass =
+			URK::managed::find_class(command.image.c_str(), command.namespc.c_str(), command.class_name.c_str());
+		if (!klass) {
+			set_status("Static field write failed: selected type could no longer be resolved");
+			return;
+		}
+		Inspect::ValueInfo requested{};
+		Inspect::ObjectHandle root{};
+		bool written = false;
+		bool verified = false;
+		std::string member_name;
+		if (command.int_value != 0) {
+			const std::vector<Inspect::PropertyInfo> properties = Inspect::properties_from_class(klass, true);
+			if (command.member_index < 0 || static_cast<std::size_t>(command.member_index) >= properties.size()) {
+				set_status("Static property write failed: member metadata changed");
+				return;
+			}
+			const Inspect::PropertyInfo& property = properties[static_cast<std::size_t>(command.member_index)];
+			member_name = property.name;
+			if (!property.is_static || !property.can_write) {
+				set_status("Static property " + property.name + " is not writable");
+				return;
+			}
+			const bool parsed = command_value(property.type_name, command, requested) ||
+				(property.is_enum && enum_value_from_text(property.type_name, command.text, requested)) ||
+				(!property.is_enum && (managed_reference_value_from_text(property.type_name, property.type, command.text, requested) || reference_value_from_text(
+					property.type_name, property.type, command.text, requested, root)));
+			if (!parsed) {
+				Inspect::FreeObjectHandle(root);
+				set_status("Static property " + property.name + " rejected the value; expected " + property.type_name);
+				return;
+			}
+			written = Inspect::SetProperty({}, property, requested);
+			if (written && property.can_read)
+				verified = values_equivalent(requested, guarded_managed_read(property.type_name, [&] {
+					return Inspect::ReadProperty({}, property);
+				}));
+			else
+				verified = written;
+		}
+		else {
+			const std::vector<Inspect::FieldInfo> fields = Inspect::fields_from_class(klass, true);
+			if (command.member_index < 0 || static_cast<std::size_t>(command.member_index) >= fields.size()) {
+				set_status("Static field write failed: member metadata changed");
+				return;
+			}
+			const Inspect::FieldInfo& field = fields[static_cast<std::size_t>(command.member_index)];
+			member_name = field.name;
+			if (!field.is_static || !Inspect::FieldCanWrite(field)) {
+				set_status("Static field " + field.name + " is not writable");
+				return;
+			}
+			const bool parsed = command_value(field.type_name, command, requested) ||
+				(field.is_enum && enum_value_from_text(field.type_name, command.text, requested)) ||
+				(!field.is_enum &&
+				 (managed_reference_value_from_text(field.type_name, field.type, command.text, requested) || reference_value_from_text(field.type_name, field.type, command.text, requested, root)));
+			if (!parsed) {
+				Inspect::FreeObjectHandle(root);
+				set_status("Static field " + field.name + " rejected the value; expected " + field.type_name);
+				return;
+			}
+			written = Inspect::SetField({}, field, requested);
+			if (written)
+				verified = values_equivalent(requested, guarded_managed_read(field.type_name, [&] {
+					return Inspect::ReadField({}, field);
+				}));
+		}
+		Inspect::FreeObjectHandle(root);
+		if (!written) {
+			capture_last_error(std::string("Set static member ") + member_name);
+			return;
+		}
+		load_class_browser_static_state(command);
+		set_status(verified ? "Set static member " + member_name + " (verified)"
+			: "Static member " + member_name + " changed, but read-back differs from the requested value");
+	}
+
+	void RuntimeModel::create_class_instance(const Command& command) {
+		if (working_.class_browser_members_query.image != command.image ||
+			working_.class_browser_members_query.namespc != command.namespc ||
+			working_.class_browser_members_query.class_name != command.class_name) {
+			set_status("Create instance failed: Class Browser selection changed");
+			return;
+		}
+		if (command.member_index < 0 || static_cast<std::size_t>(command.member_index) >= class_browser_reflection_.methods.size()) {
+			set_status("Create instance failed: constructor metadata changed");
+			return;
+		}
+		const Inspect::MethodInfo& constructor = class_browser_reflection_.methods[static_cast<std::size_t>(command.member_index)];
+		if (constructor.name != ".ctor" || constructor.is_static || constructor.is_abstract) {
+			set_status("Create instance failed: selected member is not an instance constructor");
+			return;
+		}
+		if (command.method_arguments.size() != constructor.parameters.size()) {
+			set_status("Create instance failed: argument count does not match the constructor");
+			return;
+		}
+		const URK::managed::Class* klass = URK::managed::find_class(command.image.c_str(), command.namespc.c_str(), command.class_name.c_str());
+		const URK::managed::Class* component_base = URK::managed::find_class("", "UnityEngine", "Component");
+		const URK::managed::Class* scriptable_base = URK::managed::find_class("", "UnityEngine", "ScriptableObject");
+		const URK::managed::Class* object_base = URK::managed::find_class("", "UnityEngine", "Object");
+		if (!klass) {
+			set_status("Create instance failed: selected class could no longer be resolved");
+			return;
+		}
+		if (component_base && URK::managed::class_is_assignable_from(component_base, klass) != 0) {
+			set_status("Create instance requires a GameObject owner for Components; use Add Component from that GameObject's Inspector");
+			return;
+		}
+		Object created{};
+		Inspect::ObjectHandle constructor_root{};
+		if (scriptable_base && URK::managed::class_is_assignable_from(scriptable_base, klass) != 0) {
+			if (!constructor.parameters.empty()) {
+				set_status("Create instance failed: ScriptableObject constructors are not Unity creation APIs; use a parameterless ScriptableObject type");
+				return;
+			}
+			created = ScriptableObject::CreateInstance(TypeRef{ command.image, command.namespc, command.class_name });
+			if (!created) {
+				capture_last_error("Create ScriptableObject instance");
+				return;
+			}
+		}
+		else if (object_base && URK::managed::class_is_assignable_from(object_base, klass) != 0) {
+			set_status("Create instance failed: this UnityEngine.Object subtype needs its own Unity factory; raw constructors are unsafe");
+			return;
+		}
+		else {
+			std::vector<Inspect::ValueInfo> arguments;
+			std::vector<Inspect::ObjectHandle> roots;
+			const auto release_roots = [&] {
+				for (Inspect::ObjectHandle& root : roots)
+					Inspect::FreeObjectHandle(root);
+				roots.clear();
+			};
+			arguments.reserve(constructor.parameters.size());
+			for (std::size_t index = 0; index < constructor.parameters.size(); ++index) {
+				const Inspect::MethodParamInfo& parameter = constructor.parameters[index];
+				Command argument{};
+				argument.text = command.method_arguments[index];
+				argument.bool_value = normalized_type(parameter.type_name) == "system.boolean" &&
+					(argument.text == "true" || argument.text == "1");
+				Inspect::ValueInfo value{};
+				if (command_value(parameter.type_name, argument, value) ||
+					(Inspect::DescribeType(parameter.type).is_enum && enum_value_from_text(parameter.type_name, argument.text, value))) {
+					arguments.push_back(std::move(value));
+					continue;
+				}
+				Inspect::ObjectHandle root{};
+				if (managed_reference_value_from_text(parameter.type_name, parameter.type, argument.text, value) ||
+					reference_value_from_text(parameter.type_name, parameter.type, argument.text, value, root)) {
+					if (root.handle)
+						roots.push_back(root);
+					arguments.push_back(std::move(value));
+					continue;
+				}
+				Inspect::FreeObjectHandle(root);
+				release_roots();
+				set_status("Create instance failed: constructor argument " + std::to_string(index + 1) + " is invalid for " + parameter.type_name);
+				return;
+			}
+			const Inspect::ValueInfo result = guarded_managed_read(constructor.declaring_type.full_name, [&] {
+				return Inspect::ConstructObject(constructor, arguments, constructor_root);
+			});
+			release_roots();
+			if (!result.readable || !constructor_root.handle) {
+				Inspect::FreeObjectHandle(constructor_root);
+				const char* error = last_error();
+				set_status(std::string("Create instance failed: ") +
+					(error && error[0] ? error : (result.display.empty() ? "constructor returned no object" : result.display)));
+				return;
+			}
+			created = Inspect::ResolveObjectHandle(constructor_root);
+		}
+		std::string error;
+		std::uint64_t token = 0;
+		if (!managed_references_.capture(created, "Class Browser constructor", error, token)) {
+			Inspect::FreeObjectHandle(constructor_root);
+			set_status("Create instance failed after construction: " + error);
+			return;
+		}
+		Inspect::FreeObjectHandle(constructor_root);
+		set_status("Created " + command.namespc + "." + command.class_name + " and saved it as reference #" +
+			std::to_string(token & 0x0fffffffffffffffull));
+		// Open the new object in the inspector.
+		inspect_reference(token);
+	}
+
 	void RuntimeModel::load_class_browser_members(const Command& command) {
+		class_browser_reflection_ = {};
 		working_.class_browser_members = {};
 		working_.class_browser_members_query = {};
 		working_.class_browser_members_query.image = command.image;
@@ -2507,17 +2919,21 @@ namespace Explorer {
 		}
 		auto members = std::make_shared<ComponentInfo::Metadata>();
 		for (const Inspect::FieldInfo& field : Inspect::fields_from_class(klass, true)) {
+			class_browser_reflection_.fields.push_back(field);
 			ComponentInfo::Field member = field_metadata(field);
 			member.pointer_text = pointer_text(const_cast<void*>(field.handle));
 			members->fields.push_back(std::move(member));
 		}
-		for (const Inspect::PropertyInfo& property : Inspect::properties_from_class(klass, true))
+		for (const Inspect::PropertyInfo& property : Inspect::properties_from_class(klass, true)) {
+			class_browser_reflection_.properties.push_back(property);
 			members->properties.push_back({ property.name, property.type_name, property.declaring_type.full_name,
 									 property.can_read, property.can_write,
 									 pointer_text(const_cast<void*>(property.handle)), property.is_value_type, property.is_enum,
 									 !property.type_is_opaque,
 									 property.type_is_opaque ? "Runtime-specific type; metadata only." : "" });
+		}
 		for (const Inspect::MethodInfo& method : Inspect::methods_from_class(klass, true)) {
+			class_browser_reflection_.methods.push_back(method);
 			ComponentInfo::Method entry{};
 			entry.name = method.name;
 			entry.return_type = method.return_type;
@@ -2526,7 +2942,11 @@ namespace Explorer {
 			entry.pointer_text = pointer_text(const_cast<void*>(method.handle));
 			entry.return_is_value_type = method.return_is_value_type;
 			entry.return_is_enum = method.return_is_enum;
-			entry.runtime_callable = !method.return_type_is_opaque &&
+			entry.uses_generic_parameter = method.return_type_is_generic_parameter ||
+				std::any_of(method.parameters.begin(), method.parameters.end(), [](const Inspect::MethodParamInfo& parameter) {
+					return parameter.is_generic_parameter;
+				});
+			entry.runtime_callable = (!method.return_type_is_opaque || method.return_type_is_generic_parameter) &&
 				std::none_of(method.parameters.begin(), method.parameters.end(), [](const Inspect::MethodParamInfo& parameter) {
 					return parameter.is_opaque;
 					});
@@ -2611,8 +3031,10 @@ namespace Explorer {
 				else
 					values->fields[index] =
 					Inspect::unavailable_value(component.metadata->fields[index].type_name, "Not sampled");
-				record_value_error(component.type_name + "." + component.metadata->fields[index].name,
-					values->fields[index]);
+				if (component.metadata->fields[index].runtime_safe && sampled &&
+					index < reflection->second.fields.size())
+					record_value_error(component.type_name + "." + component.metadata->fields[index].name,
+						values->fields[index]);
 				capture_reference(values->fields[index], member_reference_token(component.instance_id, false, index),
 					values->field_references[index]);
 			}
@@ -2632,7 +3054,9 @@ namespace Explorer {
 				else
 					values->properties[index] =
 					Inspect::unavailable_value(component.metadata->properties[index].type_name, "Not sampled");
-				if (component.metadata->properties[index].can_read)
+				if (component.metadata->properties[index].runtime_safe &&
+					component.metadata->properties[index].can_read && sampled &&
+					index < reflection->second.properties.size())
 					record_value_error(component.type_name + "." + component.metadata->properties[index].name,
 						values->properties[index]);
 				capture_reference(values->properties[index], member_reference_token(component.instance_id, true, index),
@@ -2700,8 +3124,9 @@ namespace Explorer {
 			const auto* element_class = array_class ? URK::managed::class_get_element_class(array_class) : nullptr;
 			const void* element_type = element_class ? URK::managed::class_get_type(element_class) : nullptr;
 			const bool parsed = command_value(working_.object_inspector.array_element_type, command, value) ||
-				reference_value_from_text(working_.object_inspector.array_element_type, element_type,
-					command.text, value, argument_root);
+				(managed_reference_value_from_text(working_.object_inspector.array_element_type, element_type, command.text, value) ||
+				 reference_value_from_text(working_.object_inspector.array_element_type, element_type,
+					command.text, value, argument_root));
 			if (!parsed) {
 				set_status("Unsupported array element type: " + working_.object_inspector.array_element_type);
 				return;
@@ -2755,6 +3180,28 @@ namespace Explorer {
 		Inspect::ValueInfo value{};
 		Inspect::ObjectHandle argument_root{};
 		bool written = false;
+		bool failure_reported = false;
+		auto publish_write_result = [&](bool succeeded) {
+			Snapshot::MemberWriteResult record{};
+			record.component_instance_id = command.instance_id;
+			record.member_index = static_cast<std::size_t>(command.member_index);
+			record.property = property;
+			record.object_inspector_token = nested ? command.object_inspector_token : 0;
+			record.succeeded = succeeded;
+			record.display = working_.status.empty() ?
+				(succeeded ? "Write completed" : "Write failed") : working_.status;
+			for (auto it = working_.member_write_results.begin(); it != working_.member_write_results.end();) {
+				const Snapshot::MemberWriteResult& previous = it->second;
+				if (previous.component_instance_id != record.component_instance_id ||
+					previous.member_index != record.member_index || previous.property != record.property ||
+					previous.object_inspector_token != record.object_inspector_token) {
+					++it;
+					continue;
+				}
+				it = working_.member_write_results.erase(it);
+			}
+			working_.member_write_results[next_method_result_id_++] = std::move(record);
+		};
 		const bool keep_locked = !prepared && lock_key != 0 && (command.lock_value || locked_members_.contains(lock_key));
 		auto apply_member = [&](const auto& member) {
 			constexpr bool is_property = requires { member.can_write; };
@@ -2763,6 +3210,7 @@ namespace Explorer {
 					"runtime-specific type");
 				set_status(std::string(is_property ? "Property " : "Field ") + member.name +
 					" is metadata-only: " + member.type_name);
+				failure_reported = true;
 				return;
 			}
 			record_flight("TARGET", std::string(is_property ? "Write property " : "Write field ") + member.name,
@@ -2774,18 +3222,19 @@ namespace Explorer {
 			else {
 				const bool parsed = command_value(member.type_name, command, value) ||
 					(member.is_enum && enum_value_from_text(member.type_name, command.text, value)) ||
-					(!member.is_enum && reference_value_from_text(member.type_name, member.type,
-						command.text, value, argument_root));
+					(!member.is_enum && (managed_reference_value_from_text(member.type_name, member.type, command.text, value) ||
+						reference_value_from_text(member.type_name, member.type, command.text, value, argument_root)));
 				if (!parsed) {
 					if (!member.is_enum) {
 						set_status(std::string("Invalid reference for ") + (is_property ? "property " : "field ") +
 							member.name + ": expected " + member.type_name +
-							" (paste Copy Ptr; 0x prefix is optional)");
+							" (paste a Copy Ptr or choose a pinned reference)");
 					}
 					else {
 						set_status(std::string("Unsupported ") + (is_property ? "property" : "field") +
 							" type: " + member.type_name);
 					}
+					failure_reported = true;
 					return;
 				}
 				if (keep_locked && value.kind == Inspect::ValueKind::String && !value.object) {
@@ -2796,6 +3245,7 @@ namespace Explorer {
 					if (!argument_root.handle) {
 						capture_last_error("Lock string value");
 						value.object = nullptr;
+						failure_reported = true;
 						return;
 					}
 				}
@@ -2815,6 +3265,7 @@ namespace Explorer {
 				clear_error();
 				set_status(std::string("Set ") + (is_property ? "property" : "field") +
 					" blocked an invalid native access");
+				failure_reported = true;
 				return;
 			}
 #endif
@@ -2882,20 +3333,33 @@ namespace Explorer {
 			working_.object_inspector.value_origin_component_id != 0) {
 			write_back_value_type_object_inspector();
 		}
+		if (written && prepared && !verify)
+			return;
 		if (written) {
-			// Refresh immediately so the next snapshot includes the written value.
+			// Keep the write result before refreshing the component.
+			publish_write_result(true);
+			// Refresh the component so the new value is visible.
 			if (nested)
 				refresh_object_inspector_values(true);
 			else
 				refresh_live_member_values(true);
 		}
-		else {
+		else if (!failure_reported) {
 			capture_last_error(property ? "Set property" : "Set field");
+			publish_write_result(false);
+		}
+		else {
+			publish_write_result(false);
 		}
 	}
 
 	void RuntimeModel::apply_locked_members() {
-		clear_locked_members();
+		for (auto& [_, locked] : locked_members_) {
+			const bool property = locked.command.kind == CommandKind::SetPropertyValue;
+			set_member_value(locked.command, property, &locked.value, false);
+			if (native_faulted_.load(std::memory_order_acquire))
+				return;
+		}
 	}
 
 	void RuntimeModel::clear_locked_members(bool nested_only) {
@@ -2949,13 +3413,22 @@ namespace Explorer {
 
 	void RuntimeModel::invoke_method(const Command& command) {
 		const bool nested = command.object_inspector_target;
+		const bool browser = command.class_browser_target;
 		if (nested && (!working_.object_inspector.valid || command.object_inspector_token == 0 ||
 			command.object_inspector_token != working_.object_inspector.token)) {
 			set_status("Object Inspector tab changed before the method could be invoked");
 			return;
 		}
-		const ComponentReflection* reflection = nested ? &object_inspector_reflection_ : nullptr;
-		if (!nested) {
+		if (browser &&
+			(working_.class_browser_members_query.image != command.image ||
+			 working_.class_browser_members_query.namespc != command.namespc ||
+			 working_.class_browser_members_query.class_name != command.class_name)) {
+			set_status("Class Browser selection changed before the method could be invoked");
+			return;
+		}
+		const ComponentReflection* reflection =
+			browser ? &class_browser_reflection_ : nested ? &object_inspector_reflection_ : nullptr;
+		if (!nested && !browser) {
 			const auto found = component_reflection_.find(command.instance_id);
 			if (found != component_reflection_.end())
 				reflection = &found->second;
@@ -2966,23 +3439,78 @@ namespace Explorer {
 			return;
 		}
 		const Inspect::MethodInfo& method = reflection->methods[command.member_index];
-		if (method.return_type_is_opaque || std::any_of(method.parameters.begin(), method.parameters.end(),
+		const auto invocation_started = Clock::now();
+		auto publish_method_result = [&](bool succeeded, std::string display, const Inspect::ValueInfo* value = nullptr) {
+			Snapshot::MethodResult record{};
+			record.component_instance_id = command.instance_id;
+			record.method_index = static_cast<std::size_t>(command.member_index);
+			record.object_inspector_token = browser ? command.object_inspector_token
+				: nested ? command.object_inspector_token : 0;
+			record.return_type = method.return_type;
+			record.succeeded = succeeded;
+			record.elapsed_milliseconds = std::chrono::duration<double, std::milli>(Clock::now() - invocation_started).count();
+			record.display = std::move(display);
+			for (auto it = working_.method_results.begin(); it != working_.method_results.end();) {
+				const Snapshot::MethodResult& previous = it->second;
+				if (previous.component_instance_id != record.component_instance_id ||
+					previous.method_index != record.method_index ||
+					previous.object_inspector_token != record.object_inspector_token) {
+					++it;
+					continue;
+				}
+				if (previous.reference.token != 0)
+					release_reference_handle(previous.reference.token);
+				it = working_.method_results.erase(it);
+			}
+			if (value && (value->kind == Inspect::ValueKind::ObjectReference ||
+				value->kind == Inspect::ValueKind::ArrayReference || value->kind == Inspect::ValueKind::String) && value->object) {
+				std::uint64_t reference_token = 0;
+				do {
+					reference_token = 0x1000000000000000ull | (next_reference_token_++ & 0x0fffffffffffffffull);
+				} while (reference_handles_.contains(reference_token));
+				Inspect::ObjectHandle rooted = tracked_reference_handle(*value);
+				const Object returned = Inspect::ResolveObjectHandle(rooted);
+				if (rooted.handle && returned) {
+					reference_handles_[reference_token] = rooted;
+					record.reference = { reference_token, value->type_name, value->display, pointer_text(returned.handle()), false };
+				}
+				else {
+					Inspect::FreeObjectHandle(rooted);
+					record.display += " (object could not be retained for inspection)";
+				}
+			}
+			working_.method_results[next_method_result_id_++] = std::move(record);
+		};
+		if ((method.return_type_is_opaque && !method.return_type_is_generic_parameter) || std::any_of(method.parameters.begin(), method.parameters.end(),
 			[](const Inspect::MethodParamInfo& parameter) { return parameter.is_opaque; })) {
 			record_flight("BLOCKED", "Execute " + method.name, "runtime-specific signature");
-			set_status("Method is metadata-only because its signature needs runtime-specific marshalling");
+			const std::string message = "Method requires runtime-specific marshalling";
+			publish_method_result(false, message);
+			set_status("Invoke " + method.name + " failed: " + message);
 			return;
 		}
 		record_flight("TARGET", "Execute " + method.name,
 			method.declaring_type.full_name.empty() ? method.return_type
 				: method.declaring_type.full_name + " -> " + method.return_type);
-		const Object target =
-			nested ? Inspect::ResolveObjectHandle(object_inspector_handle_) : resolve_component(command.instance_id);
-		if (!method.is_static && (!target || (!nested && !safe_object_alive(target)))) {
-			set_status("Method target is no longer available");
+		Object target{};
+		if (browser) {
+			if (command.reference_token != 0) {
+				const auto found = class_browser_handles_.find(command.reference_token);
+				if (found != class_browser_handles_.end())
+					target = Inspect::ResolveObjectHandle(found->second);
+			}
+		}
+		else {
+			target = nested ? Inspect::ResolveObjectHandle(object_inspector_handle_) : resolve_component(command.instance_id);
+		}
+		if (!method.is_static && (!target || (!nested && !browser && !safe_object_alive(target)))) {
+			publish_method_result(false, "Method target is no longer available");
+			set_status("Invoke " + method.name + " failed: method target is no longer available");
 			return;
 		}
 		if (command.method_arguments.size() != method.parameters.size()) {
-			set_status("Method argument count does not match");
+			publish_method_result(false, "Argument count does not match the method signature");
+			set_status("Invoke " + method.name + " failed: argument count does not match");
 			return;
 		}
 		std::vector<Inspect::ValueInfo> arguments;
@@ -3013,7 +3541,8 @@ namespace Explorer {
 			}
 			Inspect::ObjectHandle rooted{};
 			if (!parameter_type.is_enum &&
-				reference_value_from_text(parameter.type_name, parameter.type, argument_command.text, value, rooted)) {
+				(managed_reference_value_from_text(parameter.type_name, parameter.type, argument_command.text, value) ||
+				 reference_value_from_text(parameter.type_name, parameter.type, argument_command.text, value, rooted))) {
 				if (rooted.handle)
 					roots.push_back(rooted);
 				arguments.push_back(std::move(value));
@@ -3023,24 +3552,57 @@ namespace Explorer {
 				Inspect::FreeObjectHandle(rooted);
 			{
 				release_roots();
-				set_status("Invalid reference argument " + std::to_string(index + 1) + ": expected " + parameter.type_name +
-					" (paste Copy Ptr; 0x prefix is optional)");
+				const char* conversion_error = last_error();
+				const std::string message = "Argument " + std::to_string(index + 1) + " is invalid: expected " +
+					parameter.type_name + " (use a value, null/default, a pinned reference, or Copy Ptr address)" +
+					(conversion_error && conversion_error[0] ? std::string("; ") + conversion_error : std::string{});
+				publish_method_result(false, message);
+				set_status("Invoke " + method.name + " failed: " + message);
 				return;
 			}
 		}
-		const Inspect::ValueInfo result =
-			guarded_managed_read(method.return_type, [&] { return Inspect::InvokeMethod(target, method, arguments); });
+		std::vector<TypeObject> generic_types;
+		if (method.return_type_is_generic_parameter || std::any_of(method.parameters.begin(), method.parameters.end(),
+			[](const Inspect::MethodParamInfo& parameter) { return parameter.is_generic_parameter; })) {
+			if (command.generic_type_arguments.empty()) {
+				release_roots();
+				const std::string message = "Generic method requires a concrete type (for example bolt.user.dll:Photon.Bolt.IPlayerState)";
+				publish_method_result(false, message);
+				set_status("Invoke " + method.name + " failed: " + message);
+				return;
+			}
+			for (const std::string& text : command.generic_type_arguments) {
+				std::string error;
+				const std::optional<TypeObject> resolved = generic_type_from_text(text, error,
+					class_browser_catalog_.get());
+				if (!resolved) {
+					release_roots();
+					publish_method_result(false, error);
+					set_status("Invoke " + method.name + " failed: " + error);
+					return;
+				}
+				generic_types.push_back(*resolved);
+			}
+		}
+		const Inspect::ValueInfo result = guarded_managed_read(method.return_type, [&] {
+			return generic_types.empty() ? Inspect::InvokeMethod(target, method, arguments)
+				: Inspect::InvokeGenericMethod(target, method, generic_types, arguments);
+		});
 		release_roots();
 		if (!result.readable) {
 			const char* error = last_error();
 			if (error && is_expected_empty_container_error(error)) {
-				set_status("Method skipped: map is empty");
+				publish_method_result(false, "Skipped: map is empty");
+				set_status("Invoke " + method.name + " skipped: map is empty");
 				return;
 			}
-			capture_last_error("Invoke method");
+			const std::string message = error && error[0] ? error :
+				(result.display.empty() ? "runtime invocation failed without an error message" : result.display);
+			publish_method_result(false, message);
+			set_status("Invoke " + method.name + " failed: " + message);
 			return;
 		}
-		if (!nested) {
+		if (!nested && !browser) {
 			const auto component = std::find_if(working_.inspector.components.begin(), working_.inspector.components.end(),
 				[&command](const ComponentInfo& info) { return info.instance_id == command.instance_id; });
 			if (component != working_.inspector.components.end() &&
@@ -3051,45 +3613,7 @@ namespace Explorer {
 					component->dynamic_bridge.diagnostic = "Type getter completed but did not return a managed string.";
 			}
 		}
-		Snapshot::MethodResult record{};
-		record.component_instance_id = command.instance_id;
-		record.method_index = static_cast<std::size_t>(command.member_index);
-		record.object_inspector_token = nested ? command.object_inspector_token : 0;
-		record.return_type = method.return_type;
-		record.display = result.display.empty() ? "<no display value>" : result.display;
-		for (auto it = working_.method_results.begin(); it != working_.method_results.end();) {
-			const Snapshot::MethodResult& previous = it->second;
-			if (previous.component_instance_id != record.component_instance_id ||
-				previous.method_index != record.method_index ||
-				previous.object_inspector_token != record.object_inspector_token) {
-				++it;
-				continue;
-			}
-			if (previous.reference.token != 0)
-				release_reference_handle(previous.reference.token);
-			it = working_.method_results.erase(it);
-		}
-		const bool is_reference = result.kind == Inspect::ValueKind::ObjectReference ||
-			result.kind == Inspect::ValueKind::ArrayReference || result.kind == Inspect::ValueKind::String;
-		if (is_reference && result.object) {
-			// Allocate a token that cannot clash with a component/member reference.
-			std::uint64_t reference_token = 0;
-			do {
-				reference_token = 0x1000000000000000ull | (next_reference_token_++ & 0x0fffffffffffffffull);
-			} while (reference_handles_.contains(reference_token));
-			Inspect::ObjectHandle rooted = tracked_reference_handle(result);
-			const Object returned = Inspect::ResolveObjectHandle(rooted);
-			if (rooted.handle && returned) {
-				reference_handles_[reference_token] = rooted;
-				record.reference = { reference_token, result.type_name, result.display, pointer_text(returned.handle()),
-									false };
-			}
-			else {
-				Inspect::FreeObjectHandle(rooted);
-				record.display += " (object could not be retained for inspection)";
-			}
-		}
-		working_.method_results[next_method_result_id_++] = std::move(record);
+		publish_method_result(true, result.display.empty() ? "<no display value>" : result.display, &result);
 		set_status("Invoked " + method.name + " -> " + result.display);
 	}
 
@@ -3106,6 +3630,141 @@ namespace Explorer {
 		event_refresh_due_ = Clock::now() + kEventRefreshDebounce;
 	}
 
+	bool RuntimeModel::managed_reference_value_from_text(std::string_view type_name, const void* destination_type,
+		std::string_view text, Inspect::ValueInfo& value) {
+		constexpr std::string_view kPrefix = "@ref:";
+		if (!text.starts_with(kPrefix))
+			return false;
+		const std::string token_text(text.substr(kPrefix.size()));
+		char* end = nullptr;
+		errno = 0;
+		const unsigned long long parsed = std::strtoull(token_text.c_str(), &end, 10);
+		if (errno != 0 || end == token_text.c_str() || *end != '\0' || parsed == 0) {
+			detail::set_error("Pinned reference token is malformed");
+			return false;
+		}
+		std::string error;
+		if (managed_references_.resolve(static_cast<std::uint64_t>(parsed), destination_type, type_name, value, error))
+			return true;
+		detail::set_error(error.empty() ? "Pinned reference could not be resolved" : error);
+		return false;
+	}
+
+	void RuntimeModel::pin_managed_reference(const Command& command) {
+		Object source{};
+		std::string source_name;
+		if (command.reference_token != 0) {
+			const auto found = reference_handles_.find(command.reference_token);
+			if (found == reference_handles_.end()) {
+				set_status("Save reference failed: the inspected value changed before it could be saved");
+				return;
+			}
+			source = Inspect::ResolveObjectHandle(found->second);
+			source_name = "Inspector value";
+		}
+		else if (command.object_inspector_target) {
+			source = Inspect::ResolveObjectHandle(object_inspector_handle_);
+			source_name = "Object Inspector target";
+		}
+		else {
+			source = resolve_selected_object();
+			source_name = "Selected GameObject";
+		}
+		if (!source) {
+			const char* detail = last_error();
+			set_status(std::string("Save reference failed: ") +
+				(detail && detail[0] ? detail : "target is no longer available"));
+			return;
+		}
+		std::string error;
+		std::uint64_t token = 0;
+		if (!managed_references_.capture(source, source_name, error, token)) {
+			set_status("Save reference failed: " + error);
+			return;
+		}
+		set_status("Saved " + source_name + " as reference #" + std::to_string(token & 0x0fffffffffffffffull));
+	}
+
+	void RuntimeModel::load_scene(int build_index, std::string_view scene_key) {
+		clear_error();
+		const Scene before = SceneManager::GetActiveScene();
+		const int previous_build_index = before && before.IsValid() ? before.buildIndex() : -1;
+		const std::string previous_name = before && before.IsValid() ? before.name() : std::string{};
+		if (const char* error = last_error(); error && error[0]) {
+			set_status(std::string("Load scene failed before dispatch: could not query the active scene: ") + error);
+			return;
+		}
+		if (!scene_key.empty()) {
+			if (!SceneManager::HasLoadSceneByName()) {
+				set_status("Load scene failed: this runtime exposes neither a usable scene name overload nor a build-index mapping");
+				return;
+			}
+			clear_error();
+			SceneManager::LoadSceneByName(scene_key);
+			if (const char* error = last_error(); error && error[0]) {
+				set_status(std::string("Load scene failed: ") + error);
+				return;
+			}
+			pending_scene_load_ = { true, -1, previous_build_index, std::string(scene_key), previous_name, Clock::now() };
+			set_status("Load request dispatched for " + std::string(scene_key) + "; waiting for scene activation");
+			request_refresh();
+			return;
+		}
+
+		const int scene_count = SceneManager::sceneCountInBuildSettings();
+		if (build_index < 0 || build_index >= scene_count) {
+			set_status("Load scene failed: enter a scene path or name, or select a current build scene");
+			return;
+		}
+		if (!SceneManager::HasLoadSceneByBuildIndex()) {
+			set_status("This game exposes LoadScene(string), not LoadScene(int). Enter the scene path or name in the manual loader.");
+			return;
+		}
+		clear_error();
+		SceneManager::LoadSceneByBuildIndex(build_index);
+		if (const char* error = last_error(); error && error[0]) {
+			set_status(std::string("Load scene failed: ") + error);
+			return;
+		}
+		pending_scene_load_ = { true, build_index, previous_build_index, {}, previous_name, Clock::now() };
+		set_status("Load request dispatched for build scene " + std::to_string(build_index) + "; waiting for scene activation");
+		request_refresh();
+	}
+
+	void RuntimeModel::update_pending_scene_load() {
+		if (!pending_scene_load_.active)
+			return;
+		clear_error();
+		const Scene active = SceneManager::GetActiveScene();
+		const char* error = last_error();
+		if (active && active.IsValid()) {
+			const int active_index = active.buildIndex();
+			const std::string active_name = active.name();
+			const bool index_match = pending_scene_load_.build_index >= 0 && active_index == pending_scene_load_.build_index;
+			const bool name_match = !pending_scene_load_.key.empty() &&
+				(active_name == pending_scene_load_.key ||
+				 active_name == scene_display_name(pending_scene_load_.key, -1));
+			if (index_match || name_match) {
+				const bool unchanged = active_index == pending_scene_load_.previous_build_index &&
+					active_name == pending_scene_load_.previous_name;
+				set_status(unchanged ? "Scene load request targeted the already active scene: " + active_name
+					: "Scene activated: " + active_name + " (build index " + std::to_string(active_index) + ")");
+				pending_scene_load_ = {};
+				request_refresh();
+				return;
+			}
+		}
+		if (Clock::now() - pending_scene_load_.requested < std::chrono::seconds(5))
+			return;
+		const std::string requested = pending_scene_load_.build_index >= 0
+			? "build scene " + std::to_string(pending_scene_load_.build_index)
+			: pending_scene_load_.key;
+		const std::string active_name = active && active.IsValid() ? active.name() : "<unavailable>";
+		set_status("Load scene failed: " + requested + " was not activated within 5 seconds; active scene is " +
+			active_name + (error && error[0] ? std::string("; ") + error : std::string{}));
+		pending_scene_load_ = {};
+	}
+
 	void RuntimeModel::set_method_trace(const Command& command) {
 		if (!command.bool_value && command.reference_token != 0) {
 			if (MethodTracer::stop(command.reference_token))
@@ -3115,13 +3774,22 @@ namespace Explorer {
 			return;
 		}
 		const bool nested = command.object_inspector_target;
+		const bool browser = command.class_browser_target;
 		if (nested && (!working_.object_inspector.valid || command.object_inspector_token == 0 ||
 			command.object_inspector_token != working_.object_inspector.token)) {
 			set_status("Object Inspector tab changed before tracing could start");
 			return;
 		}
-		const ComponentReflection* reflection = nested ? &object_inspector_reflection_ : nullptr;
-		if (!nested) {
+		if (browser &&
+			(working_.class_browser_members_query.image != command.image ||
+			 working_.class_browser_members_query.namespc != command.namespc ||
+			 working_.class_browser_members_query.class_name != command.class_name)) {
+			set_status("Class Browser selection changed before tracing could start");
+			return;
+		}
+		const ComponentReflection* reflection =
+			browser ? &class_browser_reflection_ : nested ? &object_inspector_reflection_ : nullptr;
+		if (!nested && !browser) {
 			const auto found = component_reflection_.find(command.instance_id);
 			if (found != component_reflection_.end())
 				reflection = &found->second;
@@ -3210,21 +3878,9 @@ namespace Explorer {
 			return;
 		}
 		const std::size_t field_index = static_cast<std::size_t>(command.member_index);
-		const auto component = std::find_if(working_.inspector.components.begin(), working_.inspector.components.end(),
-			[&command](const ComponentInfo& info) {
-				return info.instance_id == command.instance_id;
-			});
-		const auto reflection = component_reflection_.find(command.instance_id);
-		const Object target = resolve_component(command.instance_id);
-		if (component == working_.inspector.components.end() || !component->metadata ||
-			reflection == component_reflection_.end() || !target || field_index >= component->metadata->fields.size() ||
-			field_index >= reflection->second.fields.size()) {
-			set_status("Field is no longer available to watch");
-			return;
-		}
-
 		auto found = std::find_if(field_watches_.begin(), field_watches_.end(), [&](const auto& entry) {
 			return entry.second.snapshot.component_instance_id == command.instance_id &&
+				entry.second.snapshot.object_inspector_token == command.object_inspector_token &&
 				entry.second.snapshot.field_index == field_index;
 			});
 		if (!command.bool_value) {
@@ -3237,20 +3893,74 @@ namespace Explorer {
 			return;
 		}
 
+		const bool nested = command.object_inspector_target;
+		const ComponentInfo::Metadata* metadata = nullptr;
+		const ComponentReflection* reflection = nullptr;
+		Object target{};
+		std::string component_type;
+		if (nested) {
+			if (!working_.object_inspector.valid || command.object_inspector_token == 0 ||
+				command.object_inspector_token != working_.object_inspector.token ||
+				!working_.object_inspector.component.metadata) {
+				set_status("Object Inspector field is no longer available to watch");
+				return;
+			}
+			metadata = working_.object_inspector.component.metadata.get();
+			reflection = &object_inspector_reflection_;
+			target = Inspect::ResolveObjectHandle(object_inspector_handle_);
+			component_type = working_.object_inspector.type_name;
+		}
+		else {
+			const auto component =
+				std::find_if(working_.inspector.components.begin(), working_.inspector.components.end(),
+					[&command](const ComponentInfo& info) { return info.instance_id == command.instance_id; });
+			const auto component_reflection = component_reflection_.find(command.instance_id);
+			if (component == working_.inspector.components.end() || !component->metadata ||
+				component_reflection == component_reflection_.end()) {
+				set_status("Component field is no longer available to watch");
+				return;
+			}
+			metadata = component->metadata.get();
+			reflection = &component_reflection->second;
+			target = resolve_component(command.instance_id);
+			component_type = component->type_name;
+		}
+		if (!target || !metadata || !reflection || field_index >= metadata->fields.size() ||
+			field_index >= reflection->fields.size()) {
+			set_status("Field is no longer available to watch");
+			return;
+		}
+
 		FieldWatchState* state = nullptr;
 		if (found == field_watches_.end()) {
 			FieldWatchState created{};
 			created.snapshot.id = next_field_watch_id_++;
 			created.snapshot.component_instance_id = command.instance_id;
+			created.snapshot.object_inspector_token = nested ? command.object_inspector_token : 0;
 			created.snapshot.field_index = field_index;
-			created.snapshot.component_type = component->type_name;
-			created.snapshot.field_name = component->metadata->fields[field_index].name;
-			created.snapshot.field_type = component->metadata->fields[field_index].type_name;
+			created.snapshot.component_type = component_type;
+			created.snapshot.field_name = metadata->fields[field_index].name;
+			created.snapshot.field_type = metadata->fields[field_index].type_name;
+			created.field = reflection->fields[field_index];
+			created.target_handle = Inspect::WeakObject(target);
+			if (!created.target_handle.handle) {
+				set_status("Field watch could not retain its runtime target");
+				return;
+			}
 			const auto inserted = field_watches_.emplace(created.snapshot.id, std::move(created));
 			state = &inserted.first->second;
 		}
 		else {
 			state = &found->second;
+			state->field = reflection->fields[field_index];
+			if (!Inspect::ResolveObjectHandle(state->target_handle)) {
+				Inspect::FreeObjectHandle(state->target_handle);
+				state->target_handle = Inspect::WeakObject(target);
+			}
+			if (!state->target_handle.handle) {
+				set_status("Field watch could not retain its runtime target");
+				return;
+			}
 			state->snapshot.active = true;
 			release_field_watch_references(state->snapshot);
 			state->snapshot.events.clear();
@@ -3258,7 +3968,7 @@ namespace Explorer {
 		}
 
 		const Inspect::ValueInfo value = guarded_managed_read(state->snapshot.field_type, [&] {
-			return Inspect::ReadField(target, reflection->second.fields[field_index]);
+			return Inspect::ReadField(Inspect::ResolveObjectHandle(state->target_handle), state->field);
 			});
 		state->started = Clock::now();
 		state->last_value = value;
@@ -3267,7 +3977,10 @@ namespace Explorer {
 		state->snapshot.value_available = value.readable;
 		state->snapshot.current_value = watched_value_display(value);
 		state->snapshot.current_reference = watch_reference_for(value);
-		sampled_component_members_.insert(component_sample_token(command.instance_id, false, field_index));
+		if (nested)
+			sampled_object_fields_.insert(field_index);
+		else
+			sampled_component_members_.insert(component_sample_token(command.instance_id, false, field_index));
 		set_status("Watching " + state->snapshot.component_type + "." + state->snapshot.field_name +
 			" for value changes");
 	}
@@ -3299,8 +4012,18 @@ namespace Explorer {
 			return;
 		}
 		release_field_watch_references(found->second.snapshot);
+		Inspect::FreeObjectHandle(found->second.target_handle);
 		field_watches_.erase(found);
 		set_status("Closed field watch tab");
+	}
+
+	void RuntimeModel::release_all_field_watches() {
+		for (auto& [_, state] : field_watches_) {
+			release_field_watch_references(state.snapshot);
+			Inspect::FreeObjectHandle(state.target_handle);
+		}
+		field_watches_.clear();
+		working_.field_watches.clear();
 	}
 
 	void RuntimeModel::refresh_field_watches() {
@@ -3310,18 +4033,16 @@ namespace Explorer {
 			Snapshot::FieldWatch& watch = state.snapshot;
 			if (!watch.active)
 				continue;
-			const auto reflection = component_reflection_.find(watch.component_instance_id);
-			const Object target = resolve_component(watch.component_instance_id);
-			if (reflection == component_reflection_.end() || !target ||
-				watch.field_index >= reflection->second.fields.size()) {
+			const Object target = Inspect::ResolveObjectHandle(state.target_handle);
+			if (!target || !state.field.handle) {
 				watch.active = false;
 				watch.value_available = false;
-				watch.current_value = "<component is no longer available>";
-				set_status("Field watch stopped because its component was released");
+				watch.current_value = "<runtime target is no longer available>";
+				set_status("Field watch stopped because its runtime target was released");
 				continue;
 			}
 			const Inspect::ValueInfo value = guarded_managed_read(watch.field_type, [&] {
-				return Inspect::ReadField(target, reflection->second.fields[watch.field_index]);
+				return Inspect::ReadField(target, state.field);
 				});
 			watch.value_available = value.readable;
 			watch.current_value = watched_value_display(value);
@@ -3377,13 +4098,24 @@ namespace Explorer {
 
 	void RuntimeModel::inspect_reference(std::uint64_t token) {
 		const auto retained = object_inspector_history_.find(token);
-		const auto reference = reference_handles_.find(token);
+		auto reference = reference_handles_.find(token);
 		const auto browser_reference = class_browser_handles_.find(token);
 		const auto static_reference = class_browser_static_handles_.find(token);
 		if (retained == object_inspector_history_.end() && reference == reference_handles_.end() &&
 			browser_reference == class_browser_handles_.end() && static_reference == class_browser_static_handles_.end()) {
-			set_status("Referenced object is no longer available");
-			return;
+			std::string error;
+			const Object saved = managed_references_.object(token, error);
+			if (!saved) {
+				set_status(error.empty() ? "Referenced object is no longer available" : error);
+				return;
+			}
+			Inspect::ObjectHandle tracked = Inspect::WeakObject(saved);
+			if (!tracked.handle) {
+				set_status("Saved reference could not be opened in the Object Inspector");
+				return;
+			}
+			reference_handles_[token] = tracked;
+			reference = reference_handles_.find(token);
 		}
 		const Inspect::ObjectHandle& source = retained != object_inspector_history_.end() ? retained->second
 			: reference != reference_handles_.end() ? reference->second
@@ -3448,6 +4180,7 @@ namespace Explorer {
 		inspector.namespace_name = type.namespc;
 		inspector.class_name = type.name;
 		inspector.pointer_text = pointer_text(rooted.handle());
+		inspector.instance_id = rooted.GetInstanceID();
 		inspector.is_value_type = type.is_value_type;
 		inspector.is_array = Inspect::type_name_looks_array(inspector.type_name);
 		if (inspector.is_array)
@@ -3510,7 +4243,11 @@ namespace Explorer {
 			member.is_static = method.is_static;
 			member.return_is_value_type = method.return_is_value_type;
 			member.return_is_enum = method.return_is_enum;
-			member.runtime_callable = !method.return_type_is_opaque &&
+			member.uses_generic_parameter = method.return_type_is_generic_parameter ||
+				std::any_of(method.parameters.begin(), method.parameters.end(), [](const Inspect::MethodParamInfo& parameter) {
+					return parameter.is_generic_parameter;
+				});
+			member.runtime_callable = (!method.return_type_is_opaque || method.return_type_is_generic_parameter) &&
 				std::none_of(method.parameters.begin(), method.parameters.end(), [](const Inspect::MethodParamInfo& parameter) {
 					return parameter.is_opaque;
 					});
@@ -3552,6 +4289,8 @@ namespace Explorer {
 				: std::min(working_.object_inspector.array_offset,
 					((length - 1) / kArrayPageSize) * kArrayPageSize);
 			const std::size_t sampled = std::min(kArrayPageSize, length - offset);
+			const std::string element_type = normalized_type(working_.object_inspector.array_element_type);
+			const bool is_byte_array = element_type == "system.byte" || element_type == "byte";
 			working_.object_inspector.array_offset = offset;
 			values->fields.resize(sampled);
 			values->field_references.resize(sampled);
@@ -3594,6 +4333,43 @@ namespace Explorer {
 						value = Inspect::unavailable_value(value.type_name, "could not track array element");
 					}
 				}
+			}
+			// Only byte arrays have a format-independent representation. Copy their
+			// contents while the object is rooted on the game thread, then decode the
+			// native snapshot without retaining any managed pointer. Small arrays stay live; larger arrays are
+			// refreshed on demand to avoid repeated managed calls.
+			const bool capture_bytes = is_byte_array &&
+				(force || !working_.object_inspector.byte_array || length <= kLiveByteArrayRefreshLimit);
+			if (capture_bytes) {
+				auto byte_array = std::make_shared<ObjectInspectorInfo::ByteArrayInspection>();
+				const std::size_t byte_count = std::min(length, kMaxByteArrayInspectionBytes);
+				byte_array->truncated = byte_count < length;
+				byte_array->bytes.reserve(byte_count);
+				for (std::size_t index = 0; index < byte_count; ++index) {
+					const Inspect::ValueInfo value = guarded_managed_read("System.Byte", [&] {
+						return Inspect::ReadArrayElement(array, index);
+					});
+					if (!value.readable ||
+						(value.kind != Inspect::ValueKind::UnsignedInteger && value.kind != Inspect::ValueKind::SignedInteger)) {
+						byte_array->read_error = value.display.empty()
+							? "Could not read a byte from the managed array."
+							: value.display;
+						break;
+					}
+					const std::uint64_t raw = value.kind == Inspect::ValueKind::SignedInteger
+						? static_cast<std::uint64_t>(value.signed_value) : value.unsigned_value;
+					if (raw > std::numeric_limits<std::uint8_t>::max()) {
+						byte_array->read_error = "Managed array element is outside the byte range.";
+						break;
+					}
+					byte_array->bytes.push_back(static_cast<std::uint8_t>(raw));
+				}
+				if (byte_array->read_error.empty())
+					byte_array->decoded = ByteData::decode(byte_array->bytes);
+				working_.object_inspector.byte_array = std::move(byte_array);
+			}
+			else if (!is_byte_array) {
+				working_.object_inspector.byte_array.reset();
 			}
 			working_.object_inspector.array_length = length;
 			working_.object_inspector.array_values = std::move(values);
@@ -3649,8 +4425,10 @@ namespace Explorer {
 					metadata.fields[index].type_name,
 					[&] { return Inspect::ReadField(object, object_inspector_reflection_.fields[index]); })
 				: Inspect::unavailable_value(metadata.fields[index].type_name, "Not sampled");
-			record_value_error(working_.object_inspector.type_name + "." + metadata.fields[index].name,
-				values->fields[index]);
+			if (metadata.fields[index].runtime_safe && sampled &&
+				index < object_inspector_reflection_.fields.size())
+				record_value_error(working_.object_inspector.type_name + "." + metadata.fields[index].name,
+					values->fields[index]);
 			capture_reference(values->fields[index], 0x4000000000000000ull | index, values->field_references[index]);
 		}
 		for (std::size_t index = 0; index < values->properties.size(); ++index) {
@@ -3665,7 +4443,8 @@ namespace Explorer {
 					metadata.properties[index].type_name,
 					[&] { return Inspect::ReadProperty(object, object_inspector_reflection_.properties[index]); })
 				: Inspect::unavailable_value(metadata.properties[index].type_name, "Not sampled");
-			if (metadata.properties[index].can_read)
+			if (metadata.properties[index].runtime_safe && metadata.properties[index].can_read && sampled &&
+				index < object_inspector_reflection_.properties.size())
 				record_value_error(working_.object_inspector.type_name + "." + metadata.properties[index].name,
 					values->properties[index]);
 			capture_reference(values->properties[index], 0x5000000000000000ull | index, values->property_references[index]);
@@ -4200,23 +4979,22 @@ namespace Explorer {
 			ModUI::Highlight::Style locator_style = style;
 			locator_style.color = IM_COL32(255, 120, 48, 255);
 			locator_style.fill_color = IM_COL32(255, 120, 48, 96);
-			locator_style.corner_box = true;
-			locator_style.filled = true;
+			locator_style.corner_box = false;
+			locator_style.filled = false;
 			locator_style.thickness = 2.0f;
-			locator_style.corner_length = 8.0f;
+			locator_style.corner_length = 4.0f;
 			locator_style.draw_label = true;
 			locator_style.label_above_box = false;
 			locator_style.offscreen_indicator = true;
 			locator_style.indicator_color = IM_COL32(255, 145, 48, 255);
-			locator_style.indicator_thickness = 3.5f;
-			locator_style.indicator_head_size = 14.0f;
-			locator_style.indicator_center_gap = 10.0f;
-			// Zero keeps the arrow connected to the edge marker.
-			locator_style.indicator_length = 0.0f;
-			locator_style.indicator_center_dot_radius = 4.5f;
-			const ImVec2 min(edge_x - 10.0f, edge_y - 10.0f);
-			const ImVec2 max(edge_x + 10.0f, edge_y + 10.0f);
-			const std::string locator_label = "OFFSCREEN  " + label;
+			locator_style.indicator_thickness = 3.0f;
+			locator_style.indicator_head_size = 10.0f;
+			locator_style.indicator_center_gap = 0.0f;
+			locator_style.indicator_length = 34.0f;
+			locator_style.indicator_center_dot_radius = 0.0f;
+			const ImVec2 min(edge_x - 3.0f, edge_y - 3.0f);
+			const ImVec2 max(edge_x + 3.0f, edge_y + 3.0f);
+			const std::string locator_label = label;
 			if (highlight_locator_id_ == 0) {
 				highlight_locator_id_ = ModUI::Highlight::enqueue_add_screen_rect(
 					min, max, locator_label.c_str(), locator_style);
@@ -4226,6 +5004,17 @@ namespace Explorer {
 				ModUI::Highlight::enqueue_set_label(highlight_locator_id_, locator_label.c_str());
 			}
 			};
+
+			// Use the selected transform; child renderer bounds are unreliable here.
+		if (!is_overlay_canvas && camera &&
+			!valid_screen_point(camera.WorldToScreenPoint(selected_position))) {
+			if (highlight_id_ != 0) {
+				ModUI::Highlight::enqueue_remove(highlight_id_);
+				highlight_id_ = 0;
+			}
+			update_offscreen_locator();
+			return;
+		}
 
 		// Never carry a screen-dominating renderer rectangle into the draw list.
 		// If the pivot is not projectable, discard the rectangle and use the
@@ -4314,6 +5103,8 @@ namespace Explorer {
 		highlight_id_ = 0;
 		highlight_locator_id_ = 0;
 		camera_focus_.abandon_after_native_fault();
+		managed_references_.abandon_after_native_fault();
+		traced_return_references_.clear();
 
 		selected_ = {};
 		Inspect::FreeObjectHandle(selected_handle_);
@@ -4321,6 +5112,7 @@ namespace Explorer {
 		clear_locked_members();
 		clear_component_cache();
 		clear_object_inspector();
+		release_all_field_watches();
 		for (auto& [_, handle] : class_browser_handles_)
 			Inspect::FreeObjectHandle(handle);
 		class_browser_handles_.clear();
@@ -4328,6 +5120,7 @@ namespace Explorer {
 			Inspect::FreeObjectHandle(handle);
 		class_browser_static_handles_.clear();
 		component_reflection_.clear();
+		class_browser_reflection_ = {};
 		active_metadata_stage_.clear();
 		detail::clear_metadata_caches();
 		object_inspector_reflection_ = {};
@@ -4341,9 +5134,13 @@ namespace Explorer {
 		working_.camera_focus_active = false;
 		working_.object_inspector = {};
 		working_.method_results.clear();
+		working_.member_write_results.clear();
 		working_.field_watches.clear();
 		working_.locked_member_keys.clear();
 		working_.class_browser_instances.clear();
+		working_.class_browser_static_fields.clear();
+		working_.class_browser_members = {};
+		working_.managed_references.clear();
 
 		// HierarchyInfo and its strings are native snapshot data and remain safe
 		// to render. Keeping them avoids a blank workspace while the next census
@@ -4389,6 +5186,14 @@ namespace Explorer {
 		case CommandKind::SetCameraFocusDistance: return "Set camera focus distance";
 		case CommandKind::SetCameraFocusTopDown: return "Set camera focus orientation";
 		case CommandKind::SetCameraFocusTilt: return "Set camera focus tilt";
+		case CommandKind::SetCameraFocusOffset: return "Set camera focus offset";
+		case CommandKind::SetClassBrowserStaticField: return "Set Class Browser static member";
+		case CommandKind::LoadScene: return "Load build scene";
+		case CommandKind::PinManagedReference: return "Pin managed reference";
+		case CommandKind::ReleaseManagedReference: return "Release managed reference";
+		case CommandKind::ClearManagedReferences: return "Clear managed references";
+		case CommandKind::CreateClassInstance: return "Create class instance";
+		case CommandKind::RefreshByteArrayInspection: return "Refresh byte array inspection";
 		case CommandKind::SceneHint: return "Scene transition";
 		case CommandKind::ClearFlightRecorder: return "Clear flight recorder";
 		default: return "Explorer command";
@@ -4440,9 +5245,12 @@ namespace Explorer {
 		const CameraFocus::Settings& camera_settings = camera_focus_.settings();
 		working_.camera_focus_distance = camera_settings.distance;
 		working_.camera_focus_tilt = camera_settings.top_down_tilt;
+		working_.camera_focus_offset =
+			Vector3{camera_settings.offset_x, camera_settings.offset_y, camera_settings.offset_z};
 		working_.camera_focus_top_down = camera_settings.top_down;
 		working_.camera_focus_active = camera_focus_.active();
 		working_.method_traces = MethodTracer::snapshots();
+		working_.managed_references = managed_references_.snapshot();
 		working_.field_watches.clear();
 		working_.field_watches.reserve(field_watches_.size());
 		for (const auto& [_, state] : field_watches_)
@@ -4469,12 +5277,77 @@ namespace Explorer {
 				}
 			}
 		}
+		std::unordered_set<TraceReturnKey, TraceReturnKeyHash> live_trace_returns;
+		for (MethodTracer::Snapshot& trace : working_.method_traces) {
+			if (!trace.return_value_class || trace.return_value_size == 0)
+				continue;
+			for (MethodTracer::Record& record : trace.records) {
+				if (!record.return_captured || record.return_value_bytes.size() != trace.return_value_size)
+					continue;
+				const TraceReturnKey key{trace.id, record.sequence};
+				live_trace_returns.insert(key);
+				const auto existing = traced_return_references_.find(key);
+				if (existing != traced_return_references_.end()) {
+					record.return_reference_token = existing->second;
+					const auto handle = reference_handles_.find(existing->second);
+					if (handle != reference_handles_.end()) {
+						const Object value = Inspect::ResolveObjectHandle(handle->second);
+						record.return_display = value ? describe_traced_reference(
+							static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(value.handle())), trace.return_type)
+							: "boxed trace result was released";
+					}
+					continue;
+				}
+				void* boxed = nullptr;
+#if defined(_WIN32)
+				__try {
+#endif
+					boxed = URK::managed::value_box(static_cast<const URK::managed::Class*>(trace.return_value_class),
+						record.return_value_bytes.data());
+#if defined(_WIN32)
+				}
+				__except (capture_native_fault(_exception_info())) {
+					record.return_display = "IL2CPP value_box raised a native access fault";
+					continue;
+				}
+#endif
+				if (!boxed) {
+					record.return_display = "IL2CPP value_box failed for returned " + trace.return_type;
+					continue;
+				}
+				Inspect::ObjectHandle root = Inspect::PinObject(Object{boxed});
+				const Object value = Inspect::ResolveObjectHandle(root);
+				if (!root.handle || !value) {
+					Inspect::FreeObjectHandle(root);
+					record.return_display = "Could not root boxed trace result";
+					continue;
+				}
+				std::uint64_t token = 0;
+				do {
+					token = 0xc000000000000000ull | (next_reference_token_++ & 0x0fffffffffffffffull);
+				} while (reference_handles_.contains(token));
+				reference_handles_[token] = root;
+				traced_return_references_.emplace(key, token);
+				record.return_reference_token = token;
+				record.return_display = describe_traced_reference(
+					static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(value.handle())), trace.return_type);
+			}
+		}
+		for (auto it = traced_return_references_.begin(); it != traced_return_references_.end();) {
+			if (live_trace_returns.contains(it->first)) {
+				++it;
+				continue;
+			}
+			release_reference_handle(it->second);
+			it = traced_return_references_.erase(it);
+		}
 		working_.strong_handle_count = component_handles_.size();
 		working_.weak_handle_count = 0;
 		if (selected_handle_.handle)
 			++(selected_handle_.weak ? working_.weak_handle_count : working_.strong_handle_count);
 		for (const auto& [_, handle] : reference_handles_)
 			++(handle.weak ? working_.weak_handle_count : working_.strong_handle_count);
+		working_.strong_handle_count += managed_references_.size();
 		for (const auto& [_, handle] : object_inspector_history_)
 			++(handle.weak ? working_.weak_handle_count : working_.strong_handle_count);
 		for (const auto& [_, handle] : class_browser_handles_)
@@ -4517,6 +5390,7 @@ namespace Explorer {
 		count_handle(selected_handle_);
 		for (const auto& [_, handle] : reference_handles_)
 			count_handle(handle);
+		working_.managed_references.clear();
 		for (const auto& [_, handle] : object_inspector_history_)
 			count_handle(handle);
 		for (const auto& [_, handle] : class_browser_handles_)

@@ -24,7 +24,10 @@ struct Record {
     std::uint64_t return_rax = 0;
     std::uint64_t return_xmm_low = 0;
     std::uint64_t return_xmm_high = 0;
+    std::uintptr_t return_buffer_address = 0;
     bool return_captured = false;
+    std::uint64_t return_reference_token = 0;
+    std::vector<std::uint8_t> return_value_bytes;
     // Resolved on the Explorer thread; the detour never follows managed pointers.
     std::string return_display;
     std::vector<std::uint64_t> arguments;
@@ -55,6 +58,8 @@ struct Snapshot {
     bool return_is_reference = false;
     bool return_is_value_type = false;
     bool return_is_opaque = false;
+    const void* return_value_class = nullptr;
+    std::size_t return_value_size = 0;
     // Struct returns can use a hidden Win64 output buffer; RAX is not the result.
     bool return_uses_indirect_abi = false;
     bool return_is_floating = false;

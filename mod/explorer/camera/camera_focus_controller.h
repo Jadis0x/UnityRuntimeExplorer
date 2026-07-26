@@ -14,6 +14,9 @@ struct Settings {
     float distance = 8.0f;
     float top_down_tilt = 3.0f;
     float transition_seconds = 0.32f;
+    float offset_x = 0.0f;
+    float offset_y = 0.0f;
+    float offset_z = 0.0f;
     bool top_down = false;
 };
 

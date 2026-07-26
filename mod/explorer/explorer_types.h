@@ -1,6 +1,7 @@
 // Copyright (c) 2026 Jadis0x. All rights reserved.
 #pragma once
 
+#include "byte_data_decoder.h"
 #include "method_tracer.h"
 #include "sdk/unity/unity.h"
 #include "sdk/unity/unity_inspect.h"
@@ -18,6 +19,7 @@ struct HierarchyNode {
     int instance_id = 0;
     std::uintptr_t object_address = 0;
     std::string name;
+    std::string tag;
     std::string pointer_text;
     bool active = false;
     std::vector<HierarchyNode> children;
@@ -32,8 +34,17 @@ struct SceneNode {
     std::vector<HierarchyNode> roots;
 };
 
+struct SceneLoadInfo {
+    int build_index = -1;
+    std::string name;
+    std::string path;
+    bool loaded = false;
+    bool active = false;
+};
+
 struct HierarchyInfo {
     std::vector<SceneNode> scenes;
+    std::vector<SceneLoadInfo> available_scenes;
     std::string source;
     std::size_t roots = 0;
     std::size_t objects = 0;
@@ -60,8 +71,8 @@ struct ComponentInfo {
         std::string behaviour_type;
         std::string type_getter;
         int type_getter_method_index = -1;
-        std::vector<std::string> serialized_data_methods;
-        std::vector<std::string> object_reference_methods;
+        std::vector<int> serialized_data_method_indices;
+        std::vector<int> object_reference_method_indices;
         std::string diagnostic;
     } dynamic_bridge;
     struct Field {
@@ -100,6 +111,7 @@ struct ComponentInfo {
         std::string pointer_text;
         bool return_is_value_type = false;
         bool return_is_enum = false;
+        bool uses_generic_parameter = false;
         bool runtime_callable = true;
         std::string capability_reason;
     };
@@ -173,12 +185,16 @@ struct ClassBrowserInstanceInfo {
 
 struct ClassBrowserStaticFieldInfo {
     std::uint64_t token = 0;
+    std::size_t member_index = 0;
     std::string name;
     std::string type_name;
     std::string declaring_type;
     std::string display;
     std::string pointer_text;
+    URK::Unity::Inspect::ValueInfo value;
+    bool is_property = false;
     bool readable = false;
+    bool writable = false;
     bool is_reference = false;
 };
 
@@ -187,6 +203,7 @@ struct ObjectInspectorInfo {
     bool is_value_type = false;
     bool is_array = false;
     std::uint64_t token = 0;
+    int instance_id = 0;
     std::size_t array_length = 0;
     std::size_t array_offset = 0;
     std::string type_name;
@@ -195,6 +212,15 @@ struct ObjectInspectorInfo {
     std::string class_name;
     std::string pointer_text;
     std::string array_element_type;
+    struct ByteArrayInspection {
+        // Native snapshot copied on the game thread. UI-side decoding never
+        // reads a managed array or retains its raw managed address.
+        std::vector<std::uint8_t> bytes;
+        ByteData::DecodeResult decoded;
+        std::string read_error;
+        bool truncated = false;
+    };
+    std::shared_ptr<const ByteArrayInspection> byte_array;
     // For arrays, `fields`/`field_references` are element values/references.
     std::shared_ptr<const ComponentInfo::LiveValues> array_values;
     // Boxed values are copied back to their source member after editing.
@@ -202,6 +228,14 @@ struct ObjectInspectorInfo {
     int value_origin_member_index = -1;
     bool value_origin_property = false;
     ComponentInfo component;
+};
+
+struct ManagedReferenceInfo {
+    std::uint64_t token = 0;
+    std::string type_name;
+    std::string display;
+    std::string pointer_text;
+    std::string source;
 };
 
 struct InspectorInfo {
@@ -244,6 +278,7 @@ struct Snapshot {
     struct FieldWatch {
         std::uint64_t id = 0;
         int component_instance_id = 0;
+        std::uint64_t object_inspector_token = 0;
         std::size_t field_index = 0;
         std::string component_type;
         std::string field_name;
@@ -258,12 +293,24 @@ struct Snapshot {
     struct MethodResult {
         int component_instance_id = 0;
         std::size_t method_index = 0;
-        // Zero is a component invocation; non-zero scopes a result to one tab.
+        // Non-zero scopes a result to an Object Inspector or Class Browser target.
         std::uint64_t object_inspector_token = 0;
         std::string return_type;
+        bool succeeded = false;
+        double elapsed_milliseconds = 0.0;
         std::string display;
         ComponentInfo::LiveValues::Reference reference;
     };
+    // Strong references available to argument editors.
+    std::vector<ManagedReferenceInfo> managed_references;
+	struct MemberWriteResult {
+		int component_instance_id = 0;
+		std::size_t member_index = 0;
+		bool property = false;
+		std::uint64_t object_inspector_token = 0;
+		bool succeeded = false;
+		std::string display;
+	};
     std::shared_ptr<const HierarchyInfo> hierarchy;
     std::shared_ptr<const ComponentClassCatalog> component_class_catalog;
     std::shared_ptr<const ClassBrowserCatalog> class_browser_catalog;
@@ -284,6 +331,7 @@ struct Snapshot {
     // widely between games and object scales.
     float camera_focus_distance = 8.0f;
     float camera_focus_tilt = 3.0f;
+    URK::Unity::Vector3 camera_focus_offset{};
     bool camera_focus_top_down = false;
     bool camera_focus_active = false;
     int selected_instance_id = 0;
@@ -295,6 +343,7 @@ struct Snapshot {
     // The most recent result of each executed method.  Object results retain a
     // tracked reference so the UI can open them in the Object Inspector.
     std::unordered_map<std::uint64_t, MethodResult> method_results;
+	std::unordered_map<std::uint64_t, MemberWriteResult> member_write_results;
     std::vector<MethodTracer::Snapshot> method_traces;
     std::vector<FieldWatch> field_watches;
     std::unordered_set<std::uint64_t> locked_member_keys;

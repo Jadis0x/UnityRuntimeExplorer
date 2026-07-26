@@ -54,6 +54,14 @@ enum class CommandKind {
     SetCameraFocusDistance = 45,
     SetCameraFocusTopDown = 46,
     SetCameraFocusTilt = 47,
+    SetCameraFocusOffset = 48,
+    SetClassBrowserStaticField = 49,
+    LoadScene = 50,
+    PinManagedReference = 51,
+    ReleaseManagedReference = 52,
+    ClearManagedReferences = 53,
+    CreateClassInstance = 54,
+    RefreshByteArrayInspection = 55,
 };
 
 struct Command {
@@ -62,9 +70,7 @@ struct Command {
     int int_value = 0;
     int member_index = -1;
     std::uint64_t reference_token = 0;
-    // Identifies the Object Inspector tab that originated a nested command.
-    // It prevents a queued command from being applied after the user switches
-    // to another inspected object.
+    // Scopes nested Object Inspector and Class Browser command results.
     std::uint64_t object_inspector_token = 0;
     // Captured from the immutable UI snapshot. Zero means that the producer is
     // a lifecycle hook rather than a hierarchy/inspector interaction.
@@ -74,6 +80,7 @@ struct Command {
     std::uint64_t sequence = 0;
     bool bool_value = false;
     bool object_inspector_target = false;
+    bool class_browser_target = false;
     bool lock_value = false;
     bool unlock_value = false;
     float float_value = 0.0f;
@@ -83,6 +90,7 @@ struct Command {
     std::string namespc;
     std::string class_name;
     std::vector<std::string> method_arguments;
+    std::vector<std::string> generic_type_arguments;
 };
 
 } // namespace Explorer

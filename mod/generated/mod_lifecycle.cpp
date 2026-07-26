@@ -1,6 +1,7 @@
 // Copyright (c) 2026 Jadis0x. All rights reserved.
 #include "mod_lifecycle.h"
 
+#include "config/user_settings.h"
 #include "lifecycle/mod_runtime.h"
 #include "hooks/mod_hooks.h"
 #include "support/mod_log.h"
@@ -118,6 +119,8 @@ bool initialize(const URK_ModContext* ctx) {
   }
   g_ctx = ctx;
   ModLog::initialize(ctx);
+  if (!ModConfig::UserSettings::load() && !ModConfig::UserSettings::last_error().empty())
+    ModLog::warn("user settings: %s", ModConfig::UserSettings::last_error().c_str());
   if (!validate_required_backend(ctx)) { g_ctx = nullptr; ModLog::shutdown(); return false; }
 
   URK::set_context(ctx);

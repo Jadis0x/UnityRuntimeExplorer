@@ -58,6 +58,7 @@ endif()
 urk_disable_vs_vcpkg_integration(imgui)
 
 set(URK_COMMON_SOURCES
+        mod/config/user_settings.cpp
         mod/support/mod_log.cpp
         mod/hooks/mod_hooks.cpp
         mod/hooks/render_imgui_hook.cpp
@@ -68,6 +69,8 @@ set(URK_COMMON_SOURCES
         mod/generated/mod_entry.cpp
         mod/explorer/explorer_model.cpp
         mod/explorer/explorer_ui.cpp
+        mod/explorer/byte_data_decoder.cpp
+        mod/explorer/managed_reference_store.cpp
         mod/explorer/method_tracer.cpp
         mod/explorer/camera/camera_focus_controller.cpp
         mod/ui/highlight.cpp
@@ -105,6 +108,8 @@ set(URK_COMMON_HEADERS
         mod/explorer/explorer_commands.h
         mod/explorer/explorer_model.h
         mod/explorer/explorer_ui.h
+        mod/explorer/byte_data_decoder.h
+        mod/explorer/managed_reference_store.h
         mod/explorer/method_tracer.h
         mod/explorer/camera/camera_focus_controller.h
         mod/hooks/mod_hooks.h
@@ -112,6 +117,7 @@ set(URK_COMMON_HEADERS
         mod/lifecycle/mod_runtime.h
         mod/support/mod_log.h
         mod/config/mod_config.h
+        mod/config/user_settings.h
 )
 
 set(URK_IL2CPP_BACKEND_SOURCES

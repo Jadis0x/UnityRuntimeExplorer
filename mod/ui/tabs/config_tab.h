@@ -1,6 +1,8 @@
 // Copyright (c) 2026 Jadis0x. All rights reserved.
 #pragma once
 #include "config/mod_config.h"
+#include "config/user_settings.h"
+#include <Windows.h>
 #include <cstdio>
 #include <imgui.h>
 #include <string>
@@ -20,10 +22,34 @@ namespace ModUI::Tabs::Config {
     }
 
     inline void render_controls(const char* hotkey) {
+        static bool waiting_for_key = false;
         section_label(ModUI::Localization::translate("config.controls"));
         ModUI::Widgets::toggle(ModUI::Localization::translate("config.show_menu"), &ModConfig::show_menu);
         ImGui::Dummy(ImVec2(0.0f, 10.0f));
         ModUI::Widgets::key_value(ModUI::Localization::translate("config.toggle_key"), hotkey);
+        if (ImGui::Button(waiting_for_key ? "Press a keyboard key..." : "Change toggle key")) {
+            waiting_for_key = !waiting_for_key;
+            if (waiting_for_key)
+                ModConfig::UserSettings::begin_toggle_key_capture();
+            else
+                ModConfig::UserSettings::end_toggle_key_capture();
+        }
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Reset to F7")) {
+            waiting_for_key = false;
+            ModConfig::UserSettings::end_toggle_key_capture();
+            ModConfig::UserSettings::save_toggle_key(VK_F7);
+        }
+        if (waiting_for_key) {
+            const int key = ModConfig::UserSettings::poll_toggle_key_capture();
+            if (key != 0 && ModConfig::UserSettings::save_toggle_key(key)) {
+                waiting_for_key = false;
+                ModConfig::UserSettings::end_toggle_key_capture();
+            }
+        }
+        if (!ModConfig::UserSettings::last_error().empty())
+            ImGui::TextColored(ImVec4(1.0f, 0.48f, 0.34f, 1.0f), "%s",
+                               ModConfig::UserSettings::last_error().c_str());
     }
 
     inline void render_language_selector() {
@@ -52,13 +78,8 @@ namespace ModUI::Tabs::Config {
     }
 
     inline void render() {
-        char hotkey[32]{};
-        if (ModConfig::menu_toggle_key == VK_F7) {
-            std::snprintf(hotkey, sizeof(hotkey), "F7 (0x%02X)", ModConfig::menu_toggle_key);
-        } else {
-            std::snprintf(hotkey, sizeof(hotkey), "0x%02X", ModConfig::menu_toggle_key);
-        }
-        render_controls(hotkey);
+        const std::string hotkey = ModConfig::UserSettings::virtual_key_name(ModConfig::menu_toggle_key);
+        render_controls(hotkey.c_str());
         if (ModConfig::enable_localization) {
             ImGui::Dummy(ImVec2(0.0f, 12.0f));
             section_label(ModUI::Localization::translate("config.localization"));

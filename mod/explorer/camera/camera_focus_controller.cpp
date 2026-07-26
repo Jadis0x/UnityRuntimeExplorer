@@ -132,54 +132,6 @@ struct HandleOwner {
     }
 };
 
-struct FocusBounds {
-    Vector3 center{};
-    float radius = 1.0f;
-};
-
-FocusBounds measure_target(GameObject target, Vector3 target_position) {
-    FocusBounds result{target_position, 1.0f};
-    std::string ignored;
-    detail::RootedObjectArray<Renderer> renderers;
-    if (!guarded("renderer discovery", ignored, [&] {
-            renderers = target.GetComponentsInChildrenRooted<Renderer>(true);
-        }))
-        return result;
-
-    bool has_bounds = false;
-    Vector3 minimum{};
-    Vector3 maximum{};
-    for (const Renderer& renderer : renderers) {
-        if (!alive(renderer))
-            continue;
-        Bounds bounds{};
-        if (!guarded("renderer bounds", ignored, [&] { bounds = renderer.bounds(); }))
-            continue;
-        const Vector3 current_min = bounds.min();
-        const Vector3 current_max = bounds.max();
-        if (!finite(current_min) || !finite(current_max))
-            continue;
-        if (!has_bounds) {
-            minimum = current_min;
-            maximum = current_max;
-            has_bounds = true;
-        } else {
-            minimum.x = std::min(minimum.x, current_min.x);
-            minimum.y = std::min(minimum.y, current_min.y);
-            minimum.z = std::min(minimum.z, current_min.z);
-            maximum.x = std::max(maximum.x, current_max.x);
-            maximum.y = std::max(maximum.y, current_max.y);
-            maximum.z = std::max(maximum.z, current_max.z);
-        }
-    }
-    if (!has_bounds)
-        return result;
-
-    result.center = (minimum + maximum) * 0.5f;
-    result.radius = std::max(0.25f, (maximum - minimum).magnitude() * 0.5f);
-    return result;
-}
-
 double camera_score(Camera camera, int target_layer, bool target_layer_known,
                     std::string& error) {
     bool enabled = false;
@@ -221,19 +173,14 @@ double camera_score(Camera camera, int target_layer, bool target_layer_known,
 }
 
 Camera select_camera(GameObject target, HandleOwner& camera_owner, std::string& error) {
-    int target_layer = 0;
-    std::string layer_error;
-    const bool target_layer_known = guarded(
-        "target layer lookup", layer_error,
-        [&] { target_layer = target.GetProperty<int>("layer"); });
+    (void)target;
 
     Camera main{};
     std::string main_error;
-    if (guarded("Camera.main lookup", main_error, [&] { main = Camera::main(); }) &&
-        alive(main)) {
+    if (guarded("Camera.main lookup", main_error, [&] { main = Camera::main(); }) && alive(main)) {
         std::string score_error;
-        if (std::isfinite(camera_score(
-                main, target_layer, target_layer_known, score_error))) {
+        // Use the active gameplay camera for focus.
+        if (std::isfinite(camera_score(main, 0, false, score_error))) {
             camera_owner = HandleOwner{Inspect::PinObject(Object{main.handle()})};
             if (camera_owner.value.handle) {
                 Camera rooted{
@@ -259,8 +206,7 @@ Camera select_camera(GameObject target, HandleOwner& camera_owner, std::string& 
         if (!alive(candidate))
             continue;
         std::string score_error;
-        const double score = camera_score(
-            candidate, target_layer, target_layer_known, score_error);
+        const double score = camera_score(candidate, 0, false, score_error);
         if (score > best_score) {
             best = candidate;
             best_score = score;
@@ -299,7 +245,6 @@ struct Controller::Impl {
     float saved_orthographic_size = 0.0f;
     bool saved_orthographic = false;
     Vector3 target_center_offset{};
-    float target_radius = 1.0f;
     Vector3 view_back{0.0f, 0.0f, -1.0f};
     Vector3 horizontal_back{0.0f, 0.0f, -1.0f};
     Vector3 transition_start{};
@@ -316,30 +261,14 @@ struct Controller::Impl {
     }
 
     Vector3 focus_offset(Camera camera) const {
+        const Vector3 manual_offset{settings.offset_x, settings.offset_y, settings.offset_z};
         if (settings.top_down)
             return horizontal_back * settings.top_down_tilt +
-                   Vector3{0.0f, settings.distance, 0.0f};
+                   Vector3{0.0f, settings.distance, 0.0f} + manual_offset;
 
-        float fitted_distance = settings.distance;
-        if (!saved_orthographic) {
-            std::string ignored;
-            float field_of_view = 60.0f;
-            float aspect = 1.0f;
-            float near_clip = 0.3f;
-            guarded("camera framing properties", ignored, [&] {
-                field_of_view = camera.fieldOfView();
-                aspect = camera.aspect();
-                near_clip = camera.nearClipPlane();
-            });
-            constexpr float pi = 3.14159265358979323846f;
-            const float vertical_half = std::clamp(field_of_view, 1.0f, 179.0f) * pi / 360.0f;
-            const float horizontal_half = std::atan(std::tan(vertical_half) * std::max(0.1f, aspect));
-            const float limiting_half = std::max(0.01f, std::min(vertical_half, horizontal_half));
-            const float bounds_distance = target_radius / std::tan(limiting_half);
-            fitted_distance = std::max(fitted_distance,
-                                       bounds_distance * 1.2f + target_radius + std::max(0.0f, near_clip));
-        }
-        return view_back * fitted_distance;
+        // Keep the offset relative to the selected transform.
+        (void)camera;
+        return view_back * settings.distance + manual_offset;
     }
 };
 
@@ -434,7 +363,6 @@ bool Controller::start(GameObject target, std::string& error) {
         }
     }
 
-    const FocusBounds bounds = measure_target(rooted_target, target_position);
     impl_->camera_handle = camera_owner.release();
     impl_->target_handle = target_owner.release();
     impl_->original_parent_handle = parent_owner.release();
@@ -444,8 +372,8 @@ bool Controller::start(GameObject target, std::string& error) {
     impl_->saved_local_rotation = local_rotation;
     impl_->saved_orthographic = orthographic;
     impl_->saved_orthographic_size = orthographic_size;
-    impl_->target_center_offset = bounds.center - target_position;
-    impl_->target_radius = bounds.radius;
+    // Focus follows the selected Transform, not renderer bounds.
+    impl_->target_center_offset = {};
     impl_->view_back = normalized_or(-forward, Vector3{0.0f, 0.0f, -1.0f});
     impl_->horizontal_back = normalized_or(
         Vector3{impl_->view_back.x, 0.0f, impl_->view_back.z},
@@ -453,16 +381,6 @@ bool Controller::start(GameObject target, std::string& error) {
     impl_->transition_start = world_position;
     impl_->transition_started = Clock::now();
     impl_->is_active = true;
-
-    if (orthographic) {
-        const float desired_size = std::max(bounds.radius * 1.2f, impl_->settings.distance * 0.5f);
-        if (!guarded("orthographic framing", error,
-                     [&] { rooted_camera.set_orthographicSize(desired_size); })) {
-            std::string restore_error;
-            stop(restore_error);
-            return false;
-        }
-    }
 
     if (!update(error)) {
         std::string restore_error;
@@ -477,6 +395,15 @@ bool Controller::update(std::string& error) {
     if (!impl_->is_active)
         return true;
 
+    const auto end_session = [&](std::string reason) {
+        std::string restore_error;
+        const bool restored = stop(restore_error);
+        if (!restored && !restore_error.empty())
+            reason += "; " + restore_error;
+        error = std::move(reason);
+        return false;
+    };
+
     Camera camera{Inspect::ResolveObjectHandle(impl_->camera_handle).handle()};
     GameObject target{Inspect::ResolveObjectHandle(impl_->target_handle).handle()};
     const bool camera_alive = alive(camera);
@@ -485,10 +412,7 @@ bool Controller::update(std::string& error) {
         const std::string reason = !camera_alive
             ? "Camera focus ended: camera was destroyed"
             : "Camera focus ended: target was destroyed";
-        std::string restore_error;
-        stop(restore_error);
-        error = restore_error.empty() ? reason : reason + "; " + restore_error;
-        return false;
+        return end_session(reason);
     }
 
     Transform camera_transform{};
@@ -501,7 +425,7 @@ bool Controller::update(std::string& error) {
         }) || !alive(camera_transform) || !alive(target_transform) || !finite(target_position)) {
         if (error.empty())
             error = "Camera focus update failed: camera or target Transform is unavailable";
-        return false;
+        return end_session(std::move(error));
     }
 
     const Vector3 center = target_position + impl_->target_center_offset;
@@ -512,15 +436,12 @@ bool Controller::update(std::string& error) {
     const float smooth = linear * linear * (3.0f - 2.0f * linear);
     const Vector3 position = impl_->transition_start * (1.0f - smooth) + desired * smooth;
 
-    return guarded("camera pose update", error, [&] {
+    if (!guarded("camera pose update", error, [&] {
         camera_transform.set_position(position);
         camera_transform.LookAt(center);
-        if (impl_->saved_orthographic) {
-            const float desired_size =
-                std::max(impl_->target_radius * 1.2f, impl_->settings.distance * 0.5f);
-            camera.set_orthographicSize(desired_size);
-        }
-    });
+    }))
+        return end_session(std::move(error));
+    return true;
 }
 
 bool Controller::stop(std::string& error) {
@@ -589,6 +510,9 @@ const Settings& Controller::settings() const {
 void Controller::set_settings(Settings settings) {
     settings.distance = std::clamp(settings.distance, 1.0f, 100.0f);
     settings.top_down_tilt = std::clamp(settings.top_down_tilt, 0.0f, 100.0f);
+    settings.offset_x = std::clamp(settings.offset_x, -10000.0f, 10000.0f);
+    settings.offset_y = std::clamp(settings.offset_y, -10000.0f, 10000.0f);
+    settings.offset_z = std::clamp(settings.offset_z, -10000.0f, 10000.0f);
     settings.transition_seconds = std::clamp(settings.transition_seconds, 0.0f, 5.0f);
     impl_->settings = settings;
 }

@@ -11,6 +11,7 @@
 
 #include <array>
 #include <atomic>
+#include <algorithm>
 #include <cstddef>
 #include <cstdio>
 #include <cstring>
@@ -37,6 +38,7 @@ struct RingRecord {
     std::atomic<std::uint32_t> thread_id{0};
     std::atomic<std::uintptr_t> caller_address{0}, target_address{0};
     std::atomic<std::uint64_t> return_rax{0}, return_xmm_low{0}, return_xmm_high{0};
+    std::atomic<std::uintptr_t> return_buffer_address{0};
     std::atomic<bool> return_published{false};
 };
 
@@ -58,12 +60,16 @@ struct HookSession {
     std::vector<bool> argument_is_reference;
     std::vector<bool> argument_is_value_type;
     std::vector<bool> argument_is_opaque;
+    std::unique_ptr<std::atomic<std::uint64_t>[]> return_value_words;
     std::size_t argument_count = 0;
     bool is_static = false;
     bool target_is_reference = false;
     bool return_is_reference = false;
     bool return_is_value_type = false;
     bool return_is_opaque = false;
+    const void* return_value_class = nullptr;
+    std::size_t return_value_size = 0;
+    std::size_t return_value_word_count = 0;
     bool return_uses_indirect_abi = false;
     bool return_is_floating = false;
     std::uint64_t start_timestamp_ticks = 0;
@@ -96,19 +102,34 @@ bool is_floating(std::string_view type) {
            type == "Double" || type == "double";
 }
 
-bool is_register_scalar(std::string_view type) {
-    return type == "System.Boolean" || type == "Boolean" || type == "bool" ||
-           type == "System.Char" || type == "Char" || type == "char" ||
-           type == "System.SByte" || type == "SByte" || type == "std::int8_t" ||
-           type == "System.Byte" || type == "Byte" || type == "std::uint8_t" ||
-           type == "System.Int16" || type == "Int16" || type == "short" ||
-           type == "System.UInt16" || type == "UInt16" || type == "unsigned short" ||
-           type == "System.Int32" || type == "Int32" || type == "int" ||
-           type == "System.UInt32" || type == "UInt32" || type == "unsigned int" ||
-           type == "System.Int64" || type == "Int64" || type == "long" ||
-           type == "System.UInt64" || type == "UInt64" || type == "unsigned long" ||
-           type == "System.IntPtr" || type == "IntPtr" || type == "System.UIntPtr" || type == "UIntPtr" ||
-           is_floating(type);
+#if defined(_WIN32)
+int trace_exception_filter(unsigned long code);
+#endif
+
+bool resolve_value_return_layout(const URK::Unity::Inspect::MethodInfo& method, HookSession& session) {
+    if (!method.return_is_value_type || method.return_is_enum || method.return_type_is_opaque ||
+        !method.return_type_handle)
+        return false;
+#if defined(_WIN32)
+    __try {
+#endif
+        const auto* klass = URK::managed::type_get_class_or_element_class(
+            static_cast<const URK::managed::Type*>(method.return_type_handle));
+        std::uint32_t alignment = 0;
+        const std::int32_t size = klass ? URK::managed::class_value_size(klass, &alignment) : 0;
+        if (size <= 0)
+            return false;
+        session.return_value_class = klass;
+        session.return_value_size = static_cast<std::size_t>(size);
+        session.return_uses_indirect_abi = session.return_value_size != 1 && session.return_value_size != 2 &&
+            session.return_value_size != 4 && session.return_value_size != 8;
+        return true;
+#if defined(_WIN32)
+    }
+    __except (trace_exception_filter(GetExceptionCode())) {
+        return false;
+    }
+#endif
 }
 
 std::uint64_t register_value(const TraceRegisterFrame *frame, std::size_t slot, ArgumentKind kind) {
@@ -166,9 +187,13 @@ extern "C" std::uintptr_t trace_record_from_stub(const TraceRegisterFrame *frame
     record.timestamp_ticks.store(static_cast<std::uint64_t>(now.QuadPart), std::memory_order_relaxed);
     record.thread_id.store(GetCurrentThreadId(), std::memory_order_relaxed);
     record.caller_address.store(static_cast<std::uintptr_t>(frame->return_address), std::memory_order_relaxed);
-    record.target_address.store(session->is_static ? 0 : static_cast<std::uintptr_t>(frame->rcx), std::memory_order_relaxed);
+    const std::size_t return_slot = session->return_uses_indirect_abi ? 1 : 0;
+    record.target_address.store(session->is_static ? 0 : static_cast<std::uintptr_t>(
+        register_value(frame, return_slot, ArgumentKind::Integer)), std::memory_order_relaxed);
+    record.return_buffer_address.store(session->return_uses_indirect_abi
+        ? static_cast<std::uintptr_t>(register_value(frame, 0, ArgumentKind::Integer)) : 0, std::memory_order_relaxed);
     for (std::size_t index = 0; index < session->argument_count; ++index) {
-        const std::size_t slot = index + (session->is_static ? 0 : 1);
+        const std::size_t slot = index + return_slot + (session->is_static ? 0 : 1);
         const std::size_t storage = argument_slot(*session, sequence, index);
         session->arguments[storage].store(register_value(frame, slot, session->argument_kinds[index]),
                                           std::memory_order_relaxed);
@@ -204,6 +229,19 @@ extern "C" std::uintptr_t trace_record_return_from_stub(HookSession* session, st
             record.return_rax.store(rax, std::memory_order_relaxed);
             record.return_xmm_low.store(xmm_low, std::memory_order_relaxed);
             record.return_xmm_high.store(xmm_high, std::memory_order_relaxed);
+            if (session->return_uses_indirect_abi && session->return_value_words) {
+                const std::uintptr_t buffer = record.return_buffer_address.load(std::memory_order_relaxed);
+                if (buffer != 0) {
+                    const std::size_t base = static_cast<std::size_t>(context.sequence % max_records) * session->return_value_word_count;
+                    for (std::size_t index = 0; index < session->return_value_word_count; ++index) {
+                        const std::size_t offset = index * sizeof(std::uint64_t);
+                        const std::size_t bytes = std::min(sizeof(std::uint64_t), session->return_value_size - offset);
+                        std::uint64_t value = 0;
+                        std::memcpy(&value, reinterpret_cast<const void*>(buffer + offset), bytes);
+                        session->return_value_words[base + index].store(value, std::memory_order_relaxed);
+                    }
+                }
+            }
             record.return_published.store(true, std::memory_order_release);
         }
 #if defined(_WIN32)
@@ -311,6 +349,8 @@ Snapshot copy_snapshot(const HookSession &session) {
     out.return_is_reference = session.return_is_reference;
     out.return_is_value_type = session.return_is_value_type;
     out.return_is_opaque = session.return_is_opaque;
+    out.return_value_class = session.return_value_class;
+    out.return_value_size = session.return_value_size;
     out.return_uses_indirect_abi = session.return_uses_indirect_abi;
     out.return_is_floating = session.return_is_floating;
     out.timestamp_frequency = static_cast<std::uint64_t>(g_state.frequency.QuadPart);
@@ -330,11 +370,26 @@ Snapshot copy_snapshot(const HookSession &session) {
         record.thread_id = source.thread_id.load(std::memory_order_relaxed);
         record.caller_address = source.caller_address.load(std::memory_order_relaxed);
         record.target_address = source.target_address.load(std::memory_order_relaxed);
+        record.return_buffer_address = source.return_buffer_address.load(std::memory_order_relaxed);
         record.return_captured = source.return_published.load(std::memory_order_acquire);
         if (record.return_captured) {
             record.return_rax = source.return_rax.load(std::memory_order_relaxed);
             record.return_xmm_low = source.return_xmm_low.load(std::memory_order_relaxed);
             record.return_xmm_high = source.return_xmm_high.load(std::memory_order_relaxed);
+            if (session.return_uses_indirect_abi && session.return_value_words && session.return_value_size != 0) {
+                record.return_value_bytes.resize(session.return_value_size);
+                const std::size_t base = static_cast<std::size_t>(sequence % max_records) * session.return_value_word_count;
+                for (std::size_t index = 0; index < session.return_value_word_count; ++index) {
+                    const std::size_t offset = index * sizeof(std::uint64_t);
+                    const std::size_t bytes = std::min(sizeof(std::uint64_t), session.return_value_size - offset);
+                    const std::uint64_t value = session.return_value_words[base + index].load(std::memory_order_relaxed);
+                    std::memcpy(record.return_value_bytes.data() + offset, &value, bytes);
+                }
+            }
+            else if (session.return_value_class && session.return_value_size != 0 && session.return_value_size <= sizeof(record.return_rax)) {
+                record.return_value_bytes.resize(session.return_value_size);
+                std::memcpy(record.return_value_bytes.data(), &record.return_rax, session.return_value_size);
+            }
         }
         record.arguments.reserve(session.argument_count);
         record.argument_xmm_low.reserve(session.argument_count);
@@ -392,8 +447,7 @@ bool start(const URK::Unity::Inspect::MethodInfo &method, std::string &error) {
     session->return_is_floating = is_floating(method.return_type);
     session->return_is_value_type = method.return_is_value_type;
     session->return_is_opaque = method.return_type_is_opaque;
-    session->return_uses_indirect_abi = method.return_is_value_type && !method.return_is_enum &&
-                                        !method.return_type_is_opaque && !is_register_scalar(method.return_type);
+    resolve_value_return_layout(method, *session);
     session->return_is_reference = !method.return_is_value_type && method.return_type != "System.Void" &&
                                    method.return_type != "Void" && method.return_type != "void";
     if (session->argument_count > 0) {
@@ -409,6 +463,21 @@ bool start(const URK::Unity::Inspect::MethodInfo &method, std::string &error) {
         }
         catch (const std::bad_alloc &) {
             error = "Method tracer could not allocate argument capture storage";
+            return false;
+        }
+    }
+    if (session->return_uses_indirect_abi && session->return_value_size != 0) {
+        session->return_value_word_count = (session->return_value_size + sizeof(std::uint64_t) - 1) / sizeof(std::uint64_t);
+        if (session->return_value_word_count > std::numeric_limits<std::size_t>::max() / max_records) {
+            error = "Method tracer return storage size overflow";
+            return false;
+        }
+        try {
+            session->return_value_words = std::make_unique<std::atomic<std::uint64_t>[]>(
+                session->return_value_word_count * max_records);
+        }
+        catch (const std::bad_alloc&) {
+            error = "Method tracer could not allocate return capture storage";
             return false;
         }
     }

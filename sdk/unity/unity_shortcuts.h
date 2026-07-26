@@ -55,6 +55,29 @@ inline std::vector<GameObject> canonicalize_game_objects(const std::vector<GameO
 }
 namespace SceneManager {
 inline TypeRef type() { return {"", "UnityEngine.SceneManagement", "SceneManager"}; }
+inline int sceneCountInBuildSettings() {
+    return detail::InvokeStatic<int>(type(), "get_sceneCountInBuildSettings");
+}
+inline bool HasLoadSceneByBuildIndex() {
+    const void* klass = type().resolve_class();
+    if (!klass)
+        return false;
+    const std::vector<const char*> signature{"System.Int32"};
+    return detail::Backend::find_method_exact(klass, "LoadScene", signature) != nullptr;
+}
+inline bool HasLoadSceneByName() {
+    const void* klass = type().resolve_class();
+    if (!klass)
+        return false;
+    const std::vector<const char*> signature{"System.String"};
+    return detail::Backend::find_method_exact(klass, "LoadScene", signature) != nullptr;
+}
+inline void LoadSceneByBuildIndex(int buildIndex) {
+    detail::InvokeStatic<void>(type(), "LoadScene", buildIndex);
+}
+inline void LoadSceneByName(std::string_view name) {
+    detail::InvokeStatic<void>(type(), "LoadScene", name);
+}
 inline Scene GetActiveScene() {
     return Scene{detail::InvokeStatic<void*>(type(), "GetActiveScene")};
 }
@@ -105,6 +128,13 @@ inline std::vector<GameObject> FindSceneGameObjects(bool includeInactive = true)
     return FindSceneGameObjectsFiltered(
         includeInactive ? static_cast<std::uint32_t>(ObjectFilterFlags::IncludeInactive)
                         : static_cast<std::uint32_t>(ObjectFilterFlags::None));
+}
+}
+namespace SceneUtility {
+inline TypeRef type() { return {"", "UnityEngine.SceneManagement", "SceneUtility"}; }
+inline bool available() { return type().resolve_class() != nullptr; }
+inline std::string GetScenePathByBuildIndex(int buildIndex) {
+    return detail::InvokeStatic<std::string>(type(), "GetScenePathByBuildIndex", buildIndex);
 }
 }
 namespace Time {

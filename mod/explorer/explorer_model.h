@@ -4,6 +4,7 @@
 #include "camera/camera_focus_controller.h"
 #include "explorer_commands.h"
 #include "method_tracer.h"
+#include "managed_reference_store.h"
 #include "sdk/unity/unity.h"
 #include "sdk/unity/unity_inspect.h"
 
@@ -13,6 +14,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -47,6 +49,8 @@ class RuntimeModel {
     void find_class_instances(const Command &command);
     void load_class_browser_static_state(const Command &command);
     void load_class_browser_members(const Command &command);
+    void set_class_browser_static_field(const Command &command);
+    void create_class_instance(const Command &command);
     void refresh_live_member_values(bool force = false);
     void clear_component_cache();
     void clear_object_inspector();
@@ -63,6 +67,7 @@ class RuntimeModel {
     void set_field_watch(const Command &command);
     void clear_field_watch(std::uint64_t id);
     void close_field_watch(std::uint64_t id);
+    void release_all_field_watches();
     void refresh_field_watches();
     bool has_active_field_watches() const;
     ComponentInfo::LiveValues::Reference watch_reference_for(const URK::Unity::Inspect::ValueInfo &value);
@@ -71,6 +76,11 @@ class RuntimeModel {
     void inspect_reference(std::uint64_t token);
     void inspect_raw_reference(std::uint64_t address);
     void close_object_inspector_tab(std::uint64_t token);
+    void load_scene(int build_index, std::string_view scene_key);
+    void update_pending_scene_load();
+    void pin_managed_reference(const Command &command);
+    bool managed_reference_value_from_text(std::string_view type_name, const void* destination_type,
+                                           std::string_view text, URK::Unity::Inspect::ValueInfo& value);
     void refresh_object_inspector_values(bool force = false);
     void release_reference_handle(std::uint64_t token);
     void update_highlight();
@@ -112,6 +122,21 @@ class RuntimeModel {
     // Keeps cached selected components alive.
     std::unordered_map<int, URK::Unity::Inspect::ObjectHandle> component_handles_;
     std::unordered_map<std::uint64_t, URK::Unity::Inspect::ObjectHandle> reference_handles_;
+    struct TraceReturnKey {
+        MethodTracer::TraceId trace_id = 0;
+        std::uint64_t sequence = 0;
+        bool operator==(const TraceReturnKey&) const = default;
+    };
+    struct TraceReturnKeyHash {
+        std::size_t operator()(const TraceReturnKey& key) const {
+            return std::hash<std::uint64_t>{}(key.trace_id) ^
+                (std::hash<std::uint64_t>{}(key.sequence) + 0x9e3779b9u +
+                 (std::hash<std::uint64_t>{}(key.trace_id) << 6u) +
+                 (std::hash<std::uint64_t>{}(key.trace_id) >> 2u));
+        }
+    };
+    std::unordered_map<TraceReturnKey, std::uint64_t, TraceReturnKeyHash> traced_return_references_;
+    ManagedReferenceStore managed_references_;
     // Object Inspector tabs retain their own managed handles.
     std::unordered_map<std::uint64_t, URK::Unity::Inspect::ObjectHandle> object_inspector_history_;
     std::uint64_t next_reference_token_ = 1;
@@ -132,11 +157,14 @@ class RuntimeModel {
     std::string active_metadata_stage_;
     std::shared_ptr<const ComponentClassCatalog> component_class_catalog_;
     std::shared_ptr<const ClassBrowserCatalog> class_browser_catalog_;
+    ComponentReflection class_browser_reflection_;
     std::unordered_map<std::uint64_t, URK::Unity::Inspect::ObjectHandle> class_browser_handles_;
     std::unordered_map<std::uint64_t, URK::Unity::Inspect::ObjectHandle> class_browser_static_handles_;
     std::unordered_set<std::uint64_t> sampled_component_members_;
     struct FieldWatchState {
         Snapshot::FieldWatch snapshot;
+        URK::Unity::Inspect::FieldInfo field;
+        URK::Unity::Inspect::ObjectHandle target_handle;
         URK::Unity::Inspect::ValueInfo last_value;
         bool has_baseline = false;
         Clock::time_point started{};
@@ -167,6 +195,14 @@ class RuntimeModel {
     CameraFocus::Controller camera_focus_;
     int active_scene_handle_hint_ = 0;
     std::string active_scene_name_hint_;
+    struct PendingSceneLoad {
+        bool active = false;
+        int build_index = -1;
+        int previous_build_index = -1;
+        std::string key;
+        std::string previous_name;
+        Clock::time_point requested{};
+    } pending_scene_load_;
     std::string logged_hierarchy_signature_;
     Clock::time_point next_inspector_refresh_{};
     // Highlight bounds refresh more often than reflective inspector data.

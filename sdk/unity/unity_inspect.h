@@ -13,6 +13,7 @@ namespace Inspect {
 inline constexpr std::uint32_t kStaticMemberFlag = 0x0010u;
 inline constexpr std::uint32_t kInitOnlyFieldFlag = 0x0020u;
 inline constexpr std::uint32_t kLiteralFieldFlag = 0x0040u;
+inline constexpr std::uint32_t kAbstractMethodFlag = 0x0400u;
 inline constexpr std::size_t kMaxMetadataInheritanceDepth = 128;
 inline constexpr std::size_t kMaxMetadataMembers = 131072;
 inline constexpr std::size_t kMaxMetadataMembersPerClass = 32768;
@@ -111,6 +112,8 @@ struct MemberTypeInfo {
     bool readable = false;
     bool is_value_type = false;
     bool is_enum = false;
+    bool is_by_ref = false;
+    bool is_generic_parameter = false;
     bool is_opaque = false;
 };
 struct FieldInfo {
@@ -133,7 +136,7 @@ inline constexpr bool FieldFlagsWritable(std::uint32_t flags) {
 
 inline bool FieldCanWrite(const FieldInfo& field) {
     return FieldFlagsWritable(field.flags) &&
-        !field.type_is_opaque && !field.is_delegate;
+        !field.type_is_opaque;
 }
 struct MethodParamInfo {
     const void* type = nullptr;
@@ -141,6 +144,8 @@ struct MethodParamInfo {
     std::string type_name;
     bool is_value_type = false;
     bool is_enum = false;
+    bool is_by_ref = false;
+    bool is_generic_parameter = false;
     bool is_opaque = false;
 };
 struct MethodInfo {
@@ -153,8 +158,10 @@ struct MethodInfo {
     std::uint32_t flags = 0;
     std::uint32_t iflags = 0;
     bool is_static = false;
+    bool is_abstract = false;
     bool return_is_value_type = false;
     bool return_is_enum = false;
+    bool return_type_is_generic_parameter = false;
     bool return_type_is_opaque = false;
 };
 struct PropertyInfo {
@@ -166,6 +173,8 @@ struct PropertyInfo {
     const void* get_method = nullptr;
     const void* set_method = nullptr;
     std::uint32_t flags = 0;
+    bool get_method_is_abstract = false;
+    bool set_method_is_abstract = false;
     bool can_read = false;
     bool can_write = false;
     bool is_static = false;
@@ -285,9 +294,16 @@ inline MemberTypeInfo describe_member_type(const void* type) {
         out.is_enum = true;
         break;
     case 0x10: // BYREF
+        // Reference by-ref parameters use a managed object pointer; value types need their ABI.
+        out.is_by_ref = true;
+        break;
     case 0x13: // VAR
-    case 0x1B: // FNPTR
     case 0x1E: // MVAR
+        // The concrete type comes from the generic runtime context.
+        out.is_generic_parameter = true;
+        out.is_opaque = true;
+        break;
+    case 0x1B: // FNPTR
     case 0x1F: // CMOD_REQD
     case 0x20: // CMOD_OPT
     case 0x21: // INTERNAL
@@ -540,11 +556,13 @@ inline MethodInfo method_info(const URK::managed::Method* method, TypeInfo decla
     info.name = metadata_display_name(name);
     info.flags = URK::managed::method_get_flags(method, &info.iflags);
     info.is_static = (info.flags & kStaticMemberFlag) != 0;
+    info.is_abstract = (info.flags & kAbstractMethodFlag) != 0;
     info.return_type_handle = URK::managed::method_get_return_type(method);
     const MemberTypeInfo return_type_info = describe_member_type(info.return_type_handle);
     info.return_type = return_type_info.name;
     info.return_is_value_type = return_type_info.is_value_type;
     info.return_is_enum = return_type_info.is_enum;
+    info.return_type_is_generic_parameter = return_type_info.is_generic_parameter;
     info.return_type_is_opaque = return_type_info.is_opaque;
     const std::uint32_t count = URK::managed::method_get_param_count(method);
     if (count > kMaxMethodParameters) {
@@ -564,6 +582,7 @@ inline MethodInfo method_info(const URK::managed::Method* method, TypeInfo decla
             return {};
         info.parameters.push_back(MethodParamInfo{paramType, metadata_display_name(paramName), parameter_type_info.name,
                                                   parameter_type_info.is_value_type, parameter_type_info.is_enum,
+                                                  parameter_type_info.is_by_ref, parameter_type_info.is_generic_parameter,
                                                   parameter_type_info.is_opaque});
     }
     return info;
@@ -626,6 +645,16 @@ inline PropertyInfo property_info(const URK::managed::Property* property, TypeIn
         info.get_method = nullptr; // Indexers cannot be invoked without arguments by the explorer.
     if (info.set_method && URK::managed::method_get_param_count(static_cast<const URK::managed::Method*>(info.set_method)) != 1)
         info.set_method = nullptr;
+    if (info.get_method) {
+        std::uint32_t iflags = 0;
+        info.get_method_is_abstract = (URK::managed::method_get_flags(
+            static_cast<const URK::managed::Method*>(info.get_method), &iflags) & kAbstractMethodFlag) != 0;
+    }
+    if (info.set_method) {
+        std::uint32_t iflags = 0;
+        info.set_method_is_abstract = (URK::managed::method_get_flags(
+            static_cast<const URK::managed::Method*>(info.set_method), &iflags) & kAbstractMethodFlag) != 0;
+    }
     info.can_read = info.get_method != nullptr;
     info.can_write = info.set_method != nullptr;
     if (const void* accessor = info.get_method ? info.get_method : info.set_method) {
@@ -1207,6 +1236,17 @@ inline bool method_argument_pointer(const MethodParamInfo& parameter, const Valu
     }
     const TypeInfo type = DescribeType(parameter.type);
     if (!type.handle && parameter.type_name.empty()) { detail::set_error("Unity Inspect::InvokeMethod failed: parameter type metadata is unavailable"); return false; }
+	if (parameter.is_by_ref) {
+		if (type.is_value_type) {
+			detail::set_error(std::string("Unity Inspect::InvokeMethod cannot marshal by-reference value type without its ABI: ") +
+				parameter.type_name);
+			return false;
+		}
+		if (!reference_write_value(parameter.type_name, value, storage, "InvokeMethod"))
+			return false;
+		pointer = &storage.reference;
+		return true;
+	}
     const std::string normalized = detail::normalized_type_name(parameter.type_name);
     if (type.is_enum) {
         const std::string underlying = enum_underlying_type_name(parameter.type);
@@ -1251,7 +1291,7 @@ inline ValueInfo invoke_result_value(std::string typeName, const void* type, voi
 inline ValueInfo InvokeMethod(Object object, const MethodInfo& method, const std::vector<ValueInfo>& arguments = {}) {
     detail::clear_error();
     if (!method.handle) return unavailable_value(method.return_type, "Unity Inspect::InvokeMethod failed: method handle is null");
-    if (method.return_type_is_opaque) {
+    if (method.return_type_is_opaque && !method.return_type_is_generic_parameter) {
         return unavailable_value(method.return_type,
                                  std::string("Unity Inspect::InvokeMethod cannot safely inspect runtime-specific return type: ") +
                                      method.return_type);
@@ -1263,9 +1303,102 @@ inline ValueInfo InvokeMethod(Object object, const MethodInfo& method, const std
     for (std::size_t i = 0; i < arguments.size(); ++i)
         if (!method_argument_pointer(method.parameters[i], arguments[i], storage[i], argv[i]))
             return unavailable_value(method.return_type, detail::fallback_error() ? detail::fallback_error() : "method argument conversion failed");
+    const void* invoke_handle = method.handle;
+    if (method.is_abstract && object.handle()) {
+        const auto* runtime_class = static_cast<const URK::managed::Class*>(
+            URK::managed::object_get_class(static_cast<URK::managed::Object*>(object.handle())));
+        std::vector<const char*> parameter_types;
+        parameter_types.reserve(method.parameters.size());
+        for (const MethodParamInfo& parameter : method.parameters)
+            parameter_types.push_back(parameter.type_name.c_str());
+        invoke_handle = URK::managed::resolve_method_exact(
+            runtime_class, method.name.c_str(), parameter_types.empty() ? nullptr : parameter_types.data(),
+            static_cast<int>(parameter_types.size()));
+        if (!invoke_handle)
+            return unavailable_value(method.return_type,
+                std::string("Unity Inspect::InvokeMethod could not resolve concrete override: ") + method.name);
+    }
     void* result = nullptr;
     void* ex = nullptr;
-    if (!detail::Backend::runtime_invoke(method.handle, method.is_static ? nullptr : object.handle(), argv.empty() ? nullptr : argv.data(), &result, &ex) || ex) { detail::set_error(std::string("Unity Inspect::InvokeMethod failed: runtime_invoke threw or failed: ") + method.name); detail::append_backend_error(); return unavailable_value(method.return_type, detail::fallback_error() ? detail::fallback_error() : "method invocation failed"); }
+    if (!detail::Backend::runtime_invoke(invoke_handle, method.is_static ? nullptr : object.handle(), argv.empty() ? nullptr : argv.data(), &result, &ex) || ex) { detail::set_error(std::string("Unity Inspect::InvokeMethod failed: runtime_invoke threw or failed: ") + method.name); detail::append_backend_error(); return unavailable_value(method.return_type, detail::fallback_error() ? detail::fallback_error() : "method invocation failed"); }
+    if (method.return_type_is_generic_parameter)
+        return object_reference_value(method.return_type, result);
+    return invoke_result_value(method.return_type, method.return_type_handle, result, method.name);
+}
+
+inline ValueInfo ConstructObject(const MethodInfo& constructor, const std::vector<ValueInfo>& arguments,
+                                 ObjectHandle& rooted) {
+    detail::clear_error();
+    if (!constructor.handle || constructor.name != ".ctor")
+        return unavailable_value("System.Object", "Unity Inspect::ConstructObject failed: constructor metadata is unavailable");
+    if (constructor.is_static || constructor.is_abstract || !constructor.declaring_type.handle)
+        return unavailable_value("System.Object", "Unity Inspect::ConstructObject failed: type is not constructible");
+    if (arguments.size() != constructor.parameters.size())
+        return unavailable_value("System.Object", "Unity Inspect::ConstructObject failed: argument count mismatch");
+    void* raw = detail::Backend::object_new(constructor.declaring_type.handle);
+    if (!raw) { detail::set_error("Unity Inspect::ConstructObject failed: object allocation failed"); detail::append_backend_error(); return unavailable_value("System.Object", detail::fallback_error() ? detail::fallback_error() : "object allocation failed"); }
+    rooted = PinObject(Object{raw});
+    const Object object = ResolveObjectHandle(rooted);
+    if (!rooted.handle || !object) return unavailable_value("System.Object", detail::fallback_error() ? detail::fallback_error() : "could not root allocated object");
+    std::vector<WriteStorage> storage(arguments.size());
+    std::vector<void*> argv(arguments.size(), nullptr);
+    for (std::size_t i = 0; i < arguments.size(); ++i)
+        if (!method_argument_pointer(constructor.parameters[i], arguments[i], storage[i], argv[i]))
+            return unavailable_value("System.Object", detail::fallback_error() ? detail::fallback_error() : "constructor argument conversion failed");
+    void* exception = nullptr;
+    if (!detail::Backend::runtime_invoke(constructor.handle, object.handle(), argv.empty() ? nullptr : argv.data(), nullptr, &exception) || exception) {
+        detail::set_error("Unity Inspect::ConstructObject failed: constructor threw or could not be invoked"); detail::append_backend_error();
+        return unavailable_value("System.Object", detail::fallback_error() ? detail::fallback_error() : "constructor invocation failed");
+    }
+    return object_reference_value(constructor.declaring_type.full_name, object.handle());
+}
+
+// Close and invoke a generic method through MethodInfo.
+inline ValueInfo InvokeGenericMethod(Object object, const MethodInfo& method,
+                                     const std::vector<TypeObject>& generic_types,
+                                     const std::vector<ValueInfo>& arguments = {}) {
+    detail::clear_error();
+    if (!method.handle) return unavailable_value(method.return_type, "Unity Inspect::InvokeGenericMethod failed: method handle is null");
+    if (!method.is_static && !object.handle()) return unavailable_value(method.return_type, "Unity Inspect::InvokeGenericMethod failed: target object is null");
+    if (generic_types.empty()) return unavailable_value(method.return_type, "Unity Inspect::InvokeGenericMethod failed: a concrete generic type is required");
+    if (arguments.size() != method.parameters.size()) return unavailable_value(method.return_type, "Unity Inspect::InvokeGenericMethod failed: argument count mismatch");
+    std::vector<void*> type_objects;
+    type_objects.reserve(generic_types.size());
+    for (const TypeObject& type : generic_types) {
+        if (!type.handle()) return unavailable_value(method.return_type, "Unity Inspect::InvokeGenericMethod failed: generic type could not be resolved");
+        type_objects.push_back(type.handle());
+    }
+    const void* owner = method.declaring_type.handle;
+    if (!owner && object.handle()) owner = detail::Backend::object_get_class(object.handle());
+    void* method_object = detail::Backend::method_get_object(method.handle, owner);
+    if (!method_object) { detail::set_error("Unity Inspect::InvokeGenericMethod failed: backend cannot expose MethodInfo"); detail::append_backend_error(); return unavailable_value(method.return_type, detail::fallback_error() ? detail::fallback_error() : "MethodInfo is unavailable"); }
+    void* system_type = TypeRef{"mscorlib", "System", "Type"}.resolve_type_object();
+    void* type_array = detail::make_reflection_array(system_type, type_objects);
+    if (!type_array) return unavailable_value(method.return_type, detail::fallback_error() ? detail::fallback_error() : "generic type array creation failed");
+    Object generic_definition{method_object};
+    void* closed_method = generic_definition.CallExact<void*>("MakeGenericMethod", {"System.Type[]"}, type_array);
+    if (!closed_method) return unavailable_value(method.return_type, detail::fallback_error() ? detail::fallback_error() : "MakeGenericMethod returned null");
+    std::vector<void*> boxed_arguments;
+    boxed_arguments.reserve(arguments.size());
+    for (const ValueInfo& argument : arguments) {
+        if (argument.kind == ValueKind::Null) { boxed_arguments.push_back(nullptr); continue; }
+        if ((argument.kind == ValueKind::ObjectReference || argument.kind == ValueKind::ArrayReference ||
+             argument.kind == ValueKind::String || argument.kind == ValueKind::ValueType) && argument.object) {
+            boxed_arguments.push_back(argument.object);
+            continue;
+        }
+        return unavailable_value(method.return_type,
+            "Unity Inspect::InvokeGenericMethod can pass only managed reference or boxed value arguments through reflection");
+    }
+    void* system_object = TypeRef{"mscorlib", "System", "Object"}.resolve_type_object();
+    void* argument_array = detail::make_reflection_array(system_object, boxed_arguments);
+    if (!argument_array) return unavailable_value(method.return_type, detail::fallback_error() ? detail::fallback_error() : "argument array creation failed");
+    Object closed{closed_method};
+    void* result = closed.CallExact<void*>("Invoke", {"System.Object", "System.Object[]"}, object, argument_array);
+    if (const char* error = URK::Unity::last_error(); error && error[0])
+        return unavailable_value(method.return_type, error);
+    if (method.return_type_is_generic_parameter)
+        return object_reference_value(method.return_type, result);
     return invoke_result_value(method.return_type, method.return_type_handle, result, method.name);
 }
 inline bool write_field_raw(Object object, const FieldInfo& field, void* value) {
@@ -1295,11 +1428,41 @@ inline bool read_field_scalar_pointer(Object object, const FieldInfo& field, std
 }
 inline ValueInfo ReadField(Object object, const FieldInfo& field) {
     detail::clear_error();
-    if (field.is_delegate)
-        return unavailable_value(field.type_name, "delegate/event fields are metadata-only");
     if (field.type_is_opaque)
         return unavailable_value(field.type_name, "field type requires runtime-specific marshalling");
     const std::string normalized = detail::normalized_type_name(field.type_name);
+	// Use the boxed accessor for generated and generic fields.
+	void* boxed = nullptr;
+#if defined(_WIN32)
+	__try {
+		boxed = detail::Backend::field_get_value_object(field.handle, object.handle());
+	} __except (metadata_exception_filter(_exception_code())) {
+		detail::set_error(std::string("Unity Inspect::ReadField failed: field accessor raised a native access fault: ") + field.name);
+		return unavailable_value(field.type_name, detail::fallback_error());
+	}
+#else
+	boxed = detail::Backend::field_get_value_object(field.handle, object.handle());
+#endif
+	if (!field.is_value_type) {
+		if (normalized == "system.string") return string_value(field.type_name, boxed);
+		return object_reference_value(field.type_name, boxed);
+	}
+	if (boxed) {
+		void* raw = detail::Backend::object_unbox(boxed);
+		if (!raw) {
+			detail::set_error(std::string("Unity Inspect::ReadField failed: object_unbox failed: ") + field.name);
+			return unavailable_value(field.type_name, detail::fallback_error());
+		}
+		if (field.is_enum) {
+			const std::string underlying = enum_underlying_type_name(field.type);
+			return underlying.empty() ? unavailable_value(field.type_name, "enum underlying type unavailable: " + field.name)
+				: enum_from_pointer(field.type_name, underlying, raw);
+		}
+		ValueInfo scalar = scalar_from_pointer(field.type_name, raw);
+		if (scalar.kind != ValueKind::ValueType)
+			return scalar;
+		return object_reference_value(field.type_name, boxed);
+	}
     if (normalized == "system.string") { void* ref = nullptr; return read_field_raw(object, field, &ref) ? string_value(field.type_name, ref) : unavailable_value(field.type_name, detail::fallback_error() ? detail::fallback_error() : "field read failed"); }
     if (!field.is_value_type) { void* ref = nullptr; return read_field_raw(object, field, &ref) ? object_reference_value(field.type_name, ref) : unavailable_value(field.type_name, detail::fallback_error() ? detail::fallback_error() : "field read failed"); }
     if (field.is_enum) {
@@ -1328,10 +1491,6 @@ inline ValueInfo ReadField(Object object, const FieldInfo& field) {
             ? structured_from_pointer(field.type_name, value.data())
             : unavailable_value(field.type_name, detail::fallback_error() ? detail::fallback_error() : "field read failed");
     }
-    // Box non-scalar structs so the explorer can follow them into the Object
-    // Inspector (Vector3, Color, custom structs, etc.) without raw layouts.
-    void* boxed = detail::Backend::field_get_value_object(field.handle, object.handle());
-    if (boxed) return object_reference_value(field.type_name, boxed);
     return value_type_placeholder(field.type_name);
 }
 inline ValueInfo ReadProperty(Object object, const PropertyInfo& property) {
@@ -1339,9 +1498,35 @@ inline ValueInfo ReadProperty(Object object, const PropertyInfo& property) {
     if (property.type_is_opaque)
         return unavailable_value(property.type_name, "property type requires runtime-specific marshalling");
     if (!property.can_read || !property.get_method) return unavailable_value(property.type_name, std::string("property is not readable: ") + property.name);
+    const void* getter = property.get_method;
+    if (property.get_method_is_abstract) {
+        if (property.is_static)
+            return unavailable_value(property.type_name, "abstract static property getter has no concrete runtime target: " + property.name);
+        if (!object.handle())
+            return unavailable_value(property.type_name, "property target is null: " + property.name);
+
+        const char* getterName = URK::managed::method_get_name(
+            static_cast<const URK::managed::Method*>(property.get_method));
+        const void* runtimeClass = detail::Backend::object_get_class(object.handle());
+        getter = getterName && runtimeClass ? detail::Backend::find_method(runtimeClass, getterName, 0) : nullptr;
+        std::uint32_t getterIFlags = 0;
+        const std::uint32_t getterFlags = getter
+            ? URK::managed::method_get_flags(static_cast<const URK::managed::Method*>(getter), &getterIFlags)
+            : 0;
+        if (!getter || (getterFlags & kAbstractMethodFlag) != 0) {
+            detail::set_error(std::string("Unity Inspect::ReadProperty failed: concrete override unavailable for abstract getter: ") + property.name);
+            return unavailable_value(property.type_name, detail::fallback_error());
+        }
+        const void* returnType = URK::managed::method_get_return_type(static_cast<const URK::managed::Method*>(getter));
+        if (!returnType || (returnType != property.type &&
+            detail::normalized_type_name(type_name(returnType)) != detail::normalized_type_name(property.type_name))) {
+            detail::set_error(std::string("Unity Inspect::ReadProperty failed: concrete override return type mismatch: ") + property.name);
+            return unavailable_value(property.type_name, detail::fallback_error());
+        }
+    }
     void* result = nullptr;
     void* ex = nullptr;
-    if (!detail::Backend::runtime_invoke(property.get_method, property.is_static ? nullptr : object.handle(), nullptr, &result, &ex) || ex) { detail::set_error(std::string("Unity Inspect::ReadProperty failed: getter threw or could not be invoked: ") + property.name); detail::append_backend_error(); return unavailable_value(property.type_name, detail::fallback_error() ? detail::fallback_error() : "property read failed"); }
+    if (!detail::Backend::runtime_invoke(getter, property.is_static ? nullptr : object.handle(), nullptr, &result, &ex) || ex) { detail::set_error(std::string("Unity Inspect::ReadProperty failed: getter threw or could not be invoked: ") + property.name); detail::append_backend_error(); return unavailable_value(property.type_name, detail::fallback_error() ? detail::fallback_error() : "property read failed"); }
     const std::string normalized = detail::normalized_type_name(property.type_name);
     if (normalized == "system.string") return string_value(property.type_name, result);
     if (!property.is_value_type) return object_reference_value(property.type_name, result);
@@ -1409,6 +1594,31 @@ inline bool SetProperty(Object object, const PropertyInfo& property, const Value
         return false;
     }
     if (!property.can_write || !property.set_method) { detail::set_error(std::string("Unity Inspect::SetProperty failed: property is not writable: ") + property.name); return false; }
+    const void* setter = property.set_method;
+    if (property.set_method_is_abstract) {
+        if (property.is_static || !object.handle()) {
+            detail::set_error(std::string("Unity Inspect::SetProperty failed: concrete override unavailable for abstract setter: ") + property.name);
+            return false;
+        }
+        const char* setterName = URK::managed::method_get_name(
+            static_cast<const URK::managed::Method*>(property.set_method));
+        const void* runtimeClass = detail::Backend::object_get_class(object.handle());
+        setter = setterName && runtimeClass ? detail::Backend::find_method(runtimeClass, setterName, 1) : nullptr;
+        std::uint32_t setterIFlags = 0;
+        const std::uint32_t setterFlags = setter
+            ? URK::managed::method_get_flags(static_cast<const URK::managed::Method*>(setter), &setterIFlags)
+            : 0;
+        if (!setter || (setterFlags & kAbstractMethodFlag) != 0) {
+            detail::set_error(std::string("Unity Inspect::SetProperty failed: concrete override unavailable for abstract setter: ") + property.name);
+            return false;
+        }
+        const void* parameterType = URK::managed::method_get_param(static_cast<const URK::managed::Method*>(setter), 0);
+        if (!parameterType || (parameterType != property.type &&
+            detail::normalized_type_name(type_name(parameterType)) != detail::normalized_type_name(property.type_name))) {
+            detail::set_error(std::string("Unity Inspect::SetProperty failed: concrete override parameter type mismatch: ") + property.name);
+            return false;
+        }
+    }
     WriteStorage storage{};
     void* arg = nullptr;
     const std::string normalized = detail::normalized_type_name(property.type_name);
@@ -1434,7 +1644,7 @@ inline bool SetProperty(Object object, const PropertyInfo& property, const Value
         rooted = PinObject(Object{storage.reference});
         if (!rooted.handle) return false;
     }
-    const bool invoked = detail::Backend::runtime_invoke(property.set_method, property.is_static ? nullptr : object.handle(), args, nullptr, &ex) && !ex;
+    const bool invoked = detail::Backend::runtime_invoke(setter, property.is_static ? nullptr : object.handle(), args, nullptr, &ex) && !ex;
     FreeObjectHandle(rooted);
     if (!invoked) { detail::set_error(std::string("Unity Inspect::SetProperty failed: setter threw or could not be invoked: ") + property.name); detail::append_backend_error(); return false; }
     return true;
