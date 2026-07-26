@@ -34,7 +34,35 @@ inline std::string GameObject::tag() const { return detail::managed_string_to_ut
 namespace detail {
 // runtime_invoke expects value-type params as pointers to local storage, but
 // managed reference/object/string params as the managed pointer itself.
-template<class T> struct Arg { T storage; void* ptr; bool valid; Arg(T v):storage(v),ptr(&storage),valid(true){} };
+template<class T>
+struct Arg {
+    T storage;
+    void* ptr;
+    bool valid;
+
+    explicit Arg(T value)
+        : storage(std::move(value)), ptr(&storage), valid(true) {}
+
+    Arg(const Arg& other)
+        : storage(other.storage), ptr(&storage), valid(other.valid) {}
+
+    Arg(Arg&& other) noexcept(std::is_nothrow_move_constructible_v<T>)
+        : storage(std::move(other.storage)), ptr(&storage), valid(other.valid) {}
+
+    Arg& operator=(const Arg& other) {
+        storage = other.storage;
+        ptr = &storage;
+        valid = other.valid;
+        return *this;
+    }
+
+    Arg& operator=(Arg&& other) noexcept(std::is_nothrow_move_assignable_v<T>) {
+        storage = std::move(other.storage);
+        ptr = &storage;
+        valid = other.valid;
+        return *this;
+    }
+};
 template<class T> requires is_wrapper_v<T> struct Arg<T> { void* storage; void* ptr; bool valid; Arg(T v):storage(v.handle()),ptr(storage),valid(true){} };
 template<> struct Arg<void*> { void* storage; void* ptr; bool valid; Arg(void* v):storage(v),ptr(storage),valid(true){} };
 template<> struct Arg<const char*> { void* storage; void* ptr; bool valid; Arg(const char* v):storage(Backend::new_string(v ? std::string_view(v) : std::string_view{})),ptr(storage),valid(storage != nullptr){} };
