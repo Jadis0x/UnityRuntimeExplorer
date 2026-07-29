@@ -1234,10 +1234,16 @@ inline bool method_argument_pointer(const MethodParamInfo& parameter, const Valu
                           parameter.type_name);
         return false;
     }
-    const TypeInfo type = DescribeType(parameter.type);
-    if (!type.handle && parameter.type_name.empty()) { detail::set_error("Unity Inspect::InvokeMethod failed: parameter type metadata is unavailable"); return false; }
+	// MethodParamInfo is built from the signature's element type.  Keep using
+	// that answer here: resolving a class again is both unnecessary and, on
+	// Mono, can turn a primitive signature type (for example System.Boolean)
+	// into a reference classification while the class is being initialized.
+	if (!parameter.type && parameter.type_name.empty()) {
+		detail::set_error("Unity Inspect::InvokeMethod failed: parameter type metadata is unavailable");
+		return false;
+	}
 	if (parameter.is_by_ref) {
-		if (type.is_value_type) {
+		if (parameter.is_value_type) {
 			detail::set_error(std::string("Unity Inspect::InvokeMethod cannot marshal by-reference value type without its ABI: ") +
 				parameter.type_name);
 			return false;
@@ -1248,12 +1254,12 @@ inline bool method_argument_pointer(const MethodParamInfo& parameter, const Valu
 		return true;
 	}
     const std::string normalized = detail::normalized_type_name(parameter.type_name);
-    if (type.is_enum) {
+    if (parameter.is_enum) {
         const std::string underlying = enum_underlying_type_name(parameter.type);
         if (underlying.empty()) { detail::set_error(std::string("Unity Inspect::InvokeMethod failed: enum parameter underlying type unavailable: ") + parameter.name); return false; }
         return scalar_write_pointer(underlying, value, storage, pointer, "InvokeMethod");
     }
-    if (normalized == "system.string" || !type.is_value_type)
+    if (normalized == "system.string" || !parameter.is_value_type)
         return reference_write_value(parameter.type_name, value, storage, "InvokeMethod") ? (pointer = storage.reference, true) : false;
     return value.kind == ValueKind::ValueType
         ? boxed_value_write_pointer(parameter.type, value, pointer, "InvokeMethod")
@@ -1267,16 +1273,17 @@ inline ValueInfo void_value() {
     out.readable = true;
     return out;
 }
-inline ValueInfo invoke_result_value(std::string typeName, const void* type, void* result, std::string_view methodName) {
+inline ValueInfo invoke_result_value(std::string typeName, const void* type,
+                                     bool is_value_type, bool is_enum,
+                                     void* result, std::string_view methodName) {
     const std::string normalized = detail::normalized_type_name(typeName);
     if (normalized == "system.void" || typeName.empty()) return void_value();
     if (normalized == "system.string") return string_value(std::move(typeName), result);
-    const TypeInfo resultType = DescribeType(type);
-    if (!resultType.is_value_type) return object_reference_value(std::move(typeName), result);
+    if (!is_value_type) return object_reference_value(std::move(typeName), result);
     if (!result) return unavailable_value(std::move(typeName), std::string("Unity Inspect::InvokeMethod failed: value-type result is null: ") + std::string(methodName));
     void* raw = detail::Backend::object_unbox(result);
     if (!raw) { detail::set_error(std::string("Unity Inspect::InvokeMethod failed: object_unbox failed for result: ") + std::string(methodName)); detail::append_backend_error(); return unavailable_value(std::move(typeName), detail::fallback_error() ? detail::fallback_error() : "method result unbox failed"); }
-    if (resultType.is_enum) {
+    if (is_enum) {
         const std::string underlying = enum_underlying_type_name(type);
         if (underlying.empty()) return unavailable_value(std::move(typeName), std::string("enum result underlying type unavailable: ") + std::string(methodName));
         return enum_from_pointer(std::move(typeName), underlying, raw);
@@ -1323,7 +1330,9 @@ inline ValueInfo InvokeMethod(Object object, const MethodInfo& method, const std
     if (!detail::Backend::runtime_invoke(invoke_handle, method.is_static ? nullptr : object.handle(), argv.empty() ? nullptr : argv.data(), &result, &ex) || ex) { detail::set_error(std::string("Unity Inspect::InvokeMethod failed: runtime_invoke threw or failed: ") + method.name); detail::append_backend_error(); return unavailable_value(method.return_type, detail::fallback_error() ? detail::fallback_error() : "method invocation failed"); }
     if (method.return_type_is_generic_parameter)
         return object_reference_value(method.return_type, result);
-    return invoke_result_value(method.return_type, method.return_type_handle, result, method.name);
+    return invoke_result_value(method.return_type, method.return_type_handle,
+                               method.return_is_value_type, method.return_is_enum,
+                               result, method.name);
 }
 
 inline ValueInfo ConstructObject(const MethodInfo& constructor, const std::vector<ValueInfo>& arguments,
@@ -1399,7 +1408,9 @@ inline ValueInfo InvokeGenericMethod(Object object, const MethodInfo& method,
         return unavailable_value(method.return_type, error);
     if (method.return_type_is_generic_parameter)
         return object_reference_value(method.return_type, result);
-    return invoke_result_value(method.return_type, method.return_type_handle, result, method.name);
+    return invoke_result_value(method.return_type, method.return_type_handle,
+                               method.return_is_value_type, method.return_is_enum,
+                               result, method.name);
 }
 inline bool write_field_raw(Object object, const FieldInfo& field, void* value) {
     if (!field.handle) { detail::set_error("Unity Inspect::SetField failed: field handle is null"); return false; }

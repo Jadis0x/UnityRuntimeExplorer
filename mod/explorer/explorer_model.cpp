@@ -577,7 +577,7 @@ namespace Explorer {
 		}
 
 		// Destroyed Unity wrappers can keep a valid address and instance ID.
-		// op_Implicit is the reliable lifetime check on supported IL2CPP builds.
+		// UnityEngine.Object.op_Implicit is the backend-neutral Unity lifetime check.
 		bool safe_object_alive(Object object) {
 			if (!object || !readable_address(reinterpret_cast<std::uintptr_t>(object.handle())))
 				return false;
@@ -671,6 +671,14 @@ namespace Explorer {
 		void remember_managed_method(const Inspect::MethodInfo& method) {
 			if (!method.handle || method.name.empty())
 				return;
+#if defined(URK_BACKEND_MONO)
+			// mono_compile_method is not a metadata query: Unity Mono can reject
+			// abstract, internal-call, or otherwise non-JITtable methods with a
+			// native exception. Caller naming is optional, so never compile every
+			// inspected method just to populate this best-effort index. The trace
+			// path still compiles only the explicit method selected by the user.
+			return;
+#else
 #if defined(_WIN32)
 			__try {
 #endif
@@ -683,13 +691,14 @@ namespace Explorer {
 				auto& methods = managed_caller_index().methods;
 				const auto [found, inserted] = methods.emplace(reinterpret_cast<std::uintptr_t>(pointer), name);
 				if (!inserted && found->second != name)
-					found->second = "<shared IL2CPP generic code>";
+					found->second = "<shared managed generic code>";
 #if defined(_WIN32)
 			}
 			__except (capture_native_fault(_exception_info())) {
 				// Caller names are optional. Do not fall back to a domain-wide scan here.
 			}
 #endif
+		#endif
 		}
 
 		std::string managed_caller_location(std::uintptr_t address) {
@@ -1561,6 +1570,26 @@ namespace Explorer {
 				command.text.empty() ? "<unknown>" : command.text.c_str());
 			active_scene_handle_hint_ = command.int_value;
 			active_scene_name_hint_ = command.text;
+			// The runtime scene callback is the authoritative activation signal.
+			// Do not require a second reflection call through Unity's boxed Scene
+			// value type: older Mono players can reject that query while the scene
+			// has already been activated successfully.
+			if (pending_scene_load_.active) {
+				const bool build_index_matches = pending_scene_load_.build_index >= 0 &&
+					command.member_index == pending_scene_load_.build_index;
+				const bool name_matches = !pending_scene_load_.key.empty() &&
+					(command.text == pending_scene_load_.key ||
+					 command.text == scene_display_name(pending_scene_load_.key, -1));
+				if (build_index_matches || name_matches) {
+					const bool unchanged = command.member_index == pending_scene_load_.previous_build_index &&
+						command.text == pending_scene_load_.previous_name;
+					set_status(unchanged
+						? "Scene load request targeted the already active scene: " + command.text
+						: "Scene activated: " + command.text + " (build index " +
+							std::to_string(command.member_index) + ")");
+					pending_scene_load_ = {};
+				}
+			}
 			// Release strong explorer roots before scene teardown.
 			clear_selection();
 			clear_object_inspector();
@@ -2210,9 +2239,9 @@ namespace Explorer {
 
 		metadata->methods.reserve(reflection.methods.size());
 		for (const Inspect::MethodInfo& method : reflection.methods) {
-			// Feed caller resolution only from metadata that was successfully
-			// loaded for the current inspected component. Never enumerate the
-			// whole domain merely to decorate a trace row.
+			// IL2CPP supplies stable native method pointers for this optional
+			// caller index. Mono deliberately skips this passive step because JIT
+			// compilation is not safe for every metadata method.
 			remember_managed_method(method);
 			ComponentInfo::Method member{};
 			member.name = method.name;
@@ -2279,6 +2308,14 @@ namespace Explorer {
 		constexpr std::size_t kMaxComponentClasses = 20000;
 
 		const std::size_t assembly_count = std::min<std::size_t>(URK::managed::domain_get_assembly_count(), 4096);
+		if (assembly_count == 0) {
+			const char* error = URK::managed::last_error();
+			set_status(error && error[0]
+				? std::string("Component browser could not enumerate ") +
+					URK::compiled_runtime_name + " assemblies: " + error
+				: "Component browser found no loaded managed assemblies");
+			return;
+		}
 		for (std::size_t assembly_index = 0; assembly_index < assembly_count; ++assembly_index) {
 			const URK::managed::Assembly* assembly = URK::managed::domain_get_assembly(assembly_index);
 			const URK::managed::Image* image = assembly ? URK::managed::assembly_get_image(assembly) : nullptr;
@@ -2361,6 +2398,13 @@ namespace Explorer {
 		constexpr std::uint32_t kTypeAttributeSealed = 0x100u;
 		constexpr std::size_t kMaxBrowserClasses = 50000;
 		const std::size_t assembly_count = std::min<std::size_t>(URK::managed::domain_get_assembly_count(), 4096);
+		if (assembly_count == 0) {
+			const char* error = URK::managed::last_error();
+			set_status(error && error[0]
+				? std::string("Class browser could not enumerate managed assemblies: ") + error
+				: "Class browser found no loaded managed assemblies");
+			return;
+		}
 		for (std::size_t assembly_index = 0; assembly_index < assembly_count; ++assembly_index) {
 			const URK::managed::Assembly* assembly = URK::managed::domain_get_assembly(assembly_index);
 			const URK::managed::Image* image = assembly ? URK::managed::assembly_get_image(assembly) : nullptr;
@@ -5307,12 +5351,14 @@ namespace Explorer {
 #if defined(_WIN32)
 				}
 				__except (capture_native_fault(_exception_info())) {
-					record.return_display = "IL2CPP value_box raised a native access fault";
+					record.return_display = std::string(URK::compiled_runtime_name) +
+						" value_box raised a native access fault";
 					continue;
 				}
 #endif
 				if (!boxed) {
-					record.return_display = "IL2CPP value_box failed for returned " + trace.return_type;
+					record.return_display = std::string(URK::compiled_runtime_name) +
+						" value_box failed for returned " + trace.return_type;
 					continue;
 				}
 				Inspect::ObjectHandle root = Inspect::PinObject(Object{boxed});

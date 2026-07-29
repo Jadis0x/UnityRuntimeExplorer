@@ -44,7 +44,8 @@ inline bool has_field(const URK_Il2CppApi *a, std::size_t end) {
 inline bool init(const URK::ModContext *ctx) {
   URK::set_context(ctx);
   ApiSlot() = nullptr;
-  if (!ctx || ctx->version < URK_SDK_VERSION || ctx->size < sizeof(URK_ModContext) ||
+  if (!ctx || ctx->version < URK_SDK_MIN_COMPAT_VERSION ||
+      ctx->size < sizeof(URK_ModContext) ||
       !URK::has_runtime_capability(URK::runtime_cap_il2cpp_api) ||
       ctx->runtimeBackend != URK::runtime_backend_il2cpp || !ctx->il2cpp ||
       ctx->il2cpp->version < URK_IL2CPP_API_VERSION || ctx->il2cpp->size < sizeof(URK_Il2CppApi))

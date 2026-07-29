@@ -101,7 +101,7 @@ inline bool context_has_field(std::size_t fieldEnd) {
 
 inline std::uint64_t runtime_capabilities() {
   const auto *ctx = context();
-  if (!ctx || ctx->version < URK_SDK_VERSION ||
+  if (!ctx || ctx->version < URK_SDK_MIN_COMPAT_VERSION ||
       !context_has_field(offsetof(ModContext, runtimeCapabilities) +
                          sizeof(ctx->runtimeCapabilities)))
     return runtime_cap_none;

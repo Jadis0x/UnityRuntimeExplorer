@@ -27,6 +27,7 @@ if(NOT CMAKE_SIZEOF_VOID_P EQUAL 8)
 endif()
 
 set(BUILD_SHARED_LIBS OFF CACHE BOOL "Build third-party dependencies as shared libraries" FORCE)
+option(URK_BUILD_TESTS "Build UnityRuntimeExplorer backend contract tests" OFF)
 
 function(urk_disable_vs_vcpkg_integration target_name)
     if(MSVC)
@@ -126,6 +127,10 @@ set(URK_IL2CPP_BACKEND_SOURCES
 )
 
 set(URK_MONO_BACKEND_SOURCES
+    sdk/mono/README.md
+    sdk/mono/mono_helpers.h
+    sdk/mono/mono_native_api.h
+    sdk/mono/mono_native_api.cpp
     sdk/mono/mono_runtime.h
     sdk/mono/mono_runtime.cpp
 )
@@ -183,4 +188,25 @@ if(URK_DEPLOY_DIR)
             COMMAND ${CMAKE_COMMAND} -E copy_if_different $<TARGET_FILE:${target_name}> "${URK_DEPLOY_DIR}"
         )
     endforeach()
+endif()
+
+if(URK_BUILD_TESTS)
+    enable_testing()
+    add_executable(urk_mono_runtime_tests
+        tests/mono_runtime_tests.cpp
+        sdk/mono/mono_native_api.cpp
+        sdk/mono/mono_runtime.cpp
+    )
+    target_include_directories(urk_mono_runtime_tests PRIVATE .)
+    target_compile_features(urk_mono_runtime_tests PRIVATE cxx_std_20)
+    target_compile_definitions(urk_mono_runtime_tests PRIVATE
+        WIN32_LEAN_AND_MEAN
+        NOMINMAX
+        URK_BACKEND_MONO
+    )
+    if(MSVC)
+        target_compile_options(urk_mono_runtime_tests PRIVATE /W4 /permissive- /EHsc /utf-8)
+    endif()
+    urk_disable_vs_vcpkg_integration(urk_mono_runtime_tests)
+    add_test(NAME mono_runtime_v7_contract COMMAND urk_mono_runtime_tests)
 endif()

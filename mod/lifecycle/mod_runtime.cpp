@@ -81,6 +81,7 @@ void on_scene_loaded(const URK_SceneInfo* scene) {
   Explorer::Command command{};
   command.kind = Explorer::CommandKind::SceneHint;
   command.int_value = scene->handle;
+  command.member_index = scene->buildIndex;
   command.text = scene->name;
   Explorer::RuntimeModel::instance().enqueue(std::move(command));
 }
@@ -91,6 +92,7 @@ void on_scene_changed(const URK_SceneInfo* previousScene, const URK_SceneInfo* c
   Explorer::Command command{};
   command.kind = Explorer::CommandKind::SceneHint;
   command.int_value = currentScene->handle;
+  command.member_index = currentScene->buildIndex;
   command.text = currentScene->name;
   Explorer::RuntimeModel::instance().enqueue(std::move(command));
 }

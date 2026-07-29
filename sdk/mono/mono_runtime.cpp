@@ -1,9 +1,13 @@
 #include "mono_runtime.h"
+#include "mono_native_api.h"
 
 #include <algorithm>
 #include <cstring>
 #include <limits>
+#include <mutex>
+#include <string>
 #include <string_view>
+#include <unordered_map>
 #include <unordered_set>
 
 namespace URK::mono {
@@ -11,6 +15,11 @@ namespace {
 
 const URK_MonoApi*& api_slot() {
     static const URK_MonoApi* value = nullptr;
+    return value;
+}
+
+std::string& invocation_error_slot() {
+    thread_local std::string value;
     return value;
 }
 
@@ -28,12 +37,41 @@ bool same_type_name(const Type* type, const char* requested) {
     return type_get_name(type, name, sizeof(name)) && std::string_view{name} == requested;
 }
 
+std::mutex& class_image_mutex() {
+    static std::mutex value;
+    return value;
+}
+
+std::unordered_map<const Class*, const Image*>& class_images() {
+    static std::unordered_map<const Class*, const Image*> value;
+    return value;
+}
+
+void remember_class_image(const Class* klass, const Image* image) {
+    if (!klass || !image)
+        return;
+    std::lock_guard lock(class_image_mutex());
+    class_images()[klass] = image;
+}
+
+const Image* remembered_class_image(const Class* klass) {
+    std::lock_guard lock(class_image_mutex());
+    const auto found = class_images().find(klass);
+    return found == class_images().end() ? nullptr : found->second;
+}
+
 } // namespace
 
 bool init(const URK::ModContext* context) {
     URK::set_context(context);
     api_slot() = nullptr;
-    if (!context || context->version < URK_SDK_VERSION ||
+    invocation_error_slot().clear();
+    native::reset();
+    {
+        std::lock_guard lock(class_image_mutex());
+        class_images().clear();
+    }
+    if (!context || context->version < URK_SDK_MIN_COMPAT_VERSION ||
         context->size < sizeof(URK_ModContext) ||
         context->runtimeBackend != URK::runtime_backend_mono ||
         !URK::has_runtime_capability(URK::runtime_cap_mono_api) ||
@@ -42,12 +80,14 @@ bool init(const URK::ModContext* context) {
         return false;
 
     api_slot() = context->mono;
+    native::initialize(context);
     const auto* value = api_slot();
-    if (!URK_MONO_HAS(is_available) || value->is_available() == 0) {
+    if (value->attach_current_thread && value->attach_current_thread() == 0) {
+        native::reset();
         api_slot() = nullptr;
         return false;
     }
-    return !value->attach_current_thread || value->attach_current_thread() != 0;
+    return true;
 }
 
 const URK_MonoApi* api() {
@@ -63,19 +103,33 @@ const URK_MonoApi* api() {
 
 bool available() {
     const auto* value = api();
-    return URK_MONO_HAS(is_available) && value->is_available() != 0;
+    return value && value->version >= URK_MONO_API_VERSION &&
+           value->size >= sizeof(URK_MonoApi);
 }
 
 const char* last_error() {
     const auto* value = api();
-    return value && value->last_error ? value->last_error() : nullptr;
+    if (value && value->last_error) {
+        if (const char* error = value->last_error(); error && error[0]) {
+            if (std::strstr(error, "runtime_invoke returned a managed exception") &&
+                !invocation_error_slot().empty())
+                return invocation_error_slot().c_str();
+            return error;
+        }
+    }
+    return native::last_error();
 }
 
 const Class* find_class(const char* image, const char* namespc, const char* name) {
     const auto* value = api();
-    return available() && value->find_class
-        ? static_cast<const Class*>(value->find_class(image, namespc, name))
-        : nullptr;
+    if (!available() || !value->find_class)
+        return nullptr;
+    const auto* klass =
+        static_cast<const Class*>(value->find_class(image, namespc, name));
+    if (klass && value->find_image)
+        remember_class_image(
+            klass, static_cast<const Image*>(value->find_image(image)));
+    return klass;
 }
 
 const Method* resolve_method(const Class* klass, const char* name, int argc) {
@@ -155,16 +209,12 @@ const Domain* domain_get() {
 }
 
 std::size_t domain_get_assembly_count() {
-    const auto* value = api();
-    return available() && URK_MONO_HAS(domain_get_assembly_count)
-        ? value->domain_get_assembly_count()
-        : 0;
+    return available() ? native::refresh_assemblies() : 0;
 }
 
 const Assembly* domain_get_assembly(std::size_t index) {
-    const auto* value = api();
-    return available() && URK_MONO_HAS(domain_get_assembly)
-        ? static_cast<const Assembly*>(value->domain_get_assembly(index))
+    return available()
+        ? static_cast<const Assembly*>(native::assembly_at(index))
         : nullptr;
 }
 
@@ -182,16 +232,26 @@ const char* image_get_name(const Image* image) {
 
 std::size_t image_get_class_count(const Image* image) {
     const auto* value = api();
-    return available() && URK_MONO_HAS(image_get_class_count)
-        ? value->image_get_class_count(image)
-        : 0;
+    if (!available() || !image || !value->image_get_table_rows)
+        return 0;
+    constexpr int mono_table_typedef = 2;
+    const int rows = value->image_get_table_rows(image, mono_table_typedef);
+    return rows > 0 ? static_cast<std::size_t>(rows) : 0;
 }
 
 const Class* image_get_class(const Image* image, std::size_t index) {
     const auto* value = api();
-    return available() && URK_MONO_HAS(image_get_class_at)
-        ? static_cast<const Class*>(value->image_get_class_at(image, index))
-        : nullptr;
+    if (!available() || !image || !value->image_get_class ||
+        index >= image_get_class_count(image) ||
+        index >= 0x00ffffffu) {
+        return nullptr;
+    }
+    constexpr std::uint32_t mono_token_typedef = 0x02000000u;
+    const auto* klass = static_cast<const Class*>(
+        value->image_get_class(
+            image, mono_token_typedef | (static_cast<std::uint32_t>(index) + 1u)));
+    remember_class_image(klass, image);
+    return klass;
 }
 
 const char* class_get_name(const Class* klass) {
@@ -214,17 +274,23 @@ const Class* class_get_parent(const Class* klass) {
 }
 
 const Image* class_get_image(const Class* klass) {
-    const auto* value = api();
-    return available() && URK_MONO_HAS(class_get_image)
-        ? static_cast<const Image*>(value->class_get_image(klass))
-        : nullptr;
+    if (!available() || !klass)
+        return nullptr;
+    if (const auto* image =
+            static_cast<const Image*>(native::class_get_image(klass))) {
+        remember_class_image(klass, image);
+        return image;
+    }
+    if (const Image* image = remembered_class_image(klass)) {
+        native::clear_error();
+        return image;
+    }
+    return nullptr;
 }
 
 const char* class_get_assemblyname(const Class* klass) {
-    const auto* value = api();
-    return available() && URK_MONO_HAS(class_get_assemblyname)
-        ? value->class_get_assemblyname(klass)
-        : nullptr;
+    const Image* image = class_get_image(klass);
+    return image ? image_get_name(image) : nullptr;
 }
 
 std::uint32_t class_get_flags(const Class* klass) {
@@ -278,24 +344,25 @@ const Type* class_get_type(const Class* klass) {
 }
 
 const Class* class_get_element_class(const Class* klass) {
-    const auto* value = api();
-    return available() && URK_MONO_HAS(class_get_element_class)
-        ? static_cast<const Class*>(value->class_get_element_class(klass))
+    return available()
+        ? static_cast<const Class*>(native::class_get_element_class(klass))
         : nullptr;
 }
 
 std::int32_t class_value_size(const void* klass, std::uint32_t* alignment) {
-    const auto* value = api();
-    return available() && URK_MONO_HAS(class_value_size)
-        ? value->class_value_size(klass, alignment)
-        : -1;
+    return available() ? native::class_value_size(klass, alignment) : -1;
 }
 
 int class_is_assignable_from(const void* target, const void* candidate) {
-    const auto* value = api();
-    return available() && URK_MONO_HAS(class_is_assignable_from)
-        ? value->class_is_assignable_from(target, candidate)
-        : 0;
+    if (!available() || !target || !candidate)
+        return 0;
+    if (native::class_is_assignable_from(target, candidate) != 0)
+        return 1;
+    if (class_has_parent(candidate, target) != 0) {
+        native::clear_error();
+        return 1;
+    }
+    return 0;
 }
 
 int class_has_parent(const void* klass, const void* parent) {
@@ -311,9 +378,8 @@ int class_has_parent(const void* klass, const void* parent) {
 }
 
 const Type* class_enum_basetype(const Class* klass) {
-    const auto* value = api();
-    return available() && URK_MONO_HAS(class_enum_basetype)
-        ? static_cast<const Type*>(value->class_enum_basetype(klass))
+    return available()
+        ? static_cast<const Type*>(native::class_enum_basetype(klass))
         : nullptr;
 }
 
@@ -338,9 +404,9 @@ const Type* method_get_param(const Method* method, std::uint32_t index) {
 }
 
 const char* method_get_param_name(const Method* method, std::uint32_t index) {
-    const auto* value = api();
-    return available() && URK_MONO_HAS(method_get_param_name)
-        ? value->method_get_param_name(method, index)
+    return available()
+        ? native::method_get_param_name(
+              method, index, method_get_param_count(method))
         : nullptr;
 }
 
@@ -364,8 +430,7 @@ void* method_get_object(const Method* method, const Class*) {
 }
 
 bool method_is_generic(const Method* method) {
-    const auto* value = api();
-    return available() && value->method_is_generic && value->method_is_generic(method) != 0;
+    return available() && native::method_is_generic(method);
 }
 
 const char* field_get_name(const Field* field) {
@@ -398,25 +463,24 @@ bool field_set_value(Object* object, const Field* field, void* input) {
 }
 
 void* field_get_value_object(const void* field, void* object) {
-    const auto* value = api();
-    return available() && URK_MONO_HAS(field_get_value_object)
-        ? value->field_get_value_object(field, object)
+    return available()
+        ? native::field_get_value_object(domain_get(), field, object)
         : nullptr;
 }
 
 bool field_static_get_value(const Field* field, void* output) {
     const auto* value = api();
-    if (!available() || !value->field_static_get_value || !URK_MONO_HAS(field_get_parent))
+    if (!available() || !value->field_static_get_value)
         return false;
-    const void* parent = value->field_get_parent(field);
+    const void* parent = native::field_get_parent(field);
     return parent && value->field_static_get_value(parent, field, output) != 0;
 }
 
 bool field_static_set_value(const Field* field, void* input) {
     const auto* value = api();
-    if (!available() || !value->field_static_set_value || !URK_MONO_HAS(field_get_parent))
+    if (!available() || !value->field_static_set_value)
         return false;
-    const void* parent = value->field_get_parent(field);
+    const void* parent = native::field_get_parent(field);
     return parent && value->field_static_set_value(parent, field, input) != 0;
 }
 
@@ -499,9 +563,20 @@ void* value_box(const Class* klass, void* data) {
 
 String* string_new_len(const char* utf8, std::uint32_t length) {
     const auto* value = api();
-    return available() && URK_MONO_HAS(string_new_len)
-        ? static_cast<String*>(value->string_new_len(utf8, length))
-        : nullptr;
+    if (!available() || (!utf8 && length != 0))
+        return nullptr;
+    const char* source = utf8 ? utf8 : "";
+    if (void* string = native::string_new_len(domain_get(), source, length))
+        return static_cast<String*>(string);
+    if (!value->new_string ||
+        std::memchr(source, '\0', static_cast<std::size_t>(length)) != nullptr) {
+        return nullptr;
+    }
+    const std::string copy(source, length);
+    String* result = static_cast<String*>(value->new_string(copy.c_str()));
+    if (result)
+        native::clear_error();
+    return result;
 }
 
 bool string_to_utf8(String* string, char* output, std::size_t output_size) {
@@ -561,9 +636,23 @@ int runtime_invoke(const Method* method, Object* object, void** params,
                    void** result, void** exception) {
     const auto* value = api();
     std::uint32_t native_exception = 0;
-    return available() && value->runtime_invoke
-        ? value->runtime_invoke(method, object, params, result, exception, &native_exception)
-        : 0;
+    invocation_error_slot().clear();
+    if (!available() || !value->runtime_invoke)
+        return 0;
+
+    const int status = value->runtime_invoke(method, object, params, result,
+                                             exception, &native_exception);
+    if (native_exception != 0) {
+        invocation_error_slot() = "Mono runtime_invoke raised native exception 0x" +
+            std::to_string(native_exception);
+        return status;
+    }
+    if (exception && *exception) {
+        std::string message = native::exception_message(*exception);
+        if (!message.empty())
+            invocation_error_slot() = "Mono managed exception: " + message;
+    }
+    return status;
 }
 
 GCHandle gchandle_new(void* object, int pinned) {
@@ -594,13 +683,11 @@ void gchandle_free(GCHandle handle) {
 }
 
 std::int64_t gc_get_used_size() {
-    const auto* value = api();
-    return available() && URK_MONO_HAS(gc_get_used_size) ? value->gc_get_used_size() : 0;
+    return available() ? native::gc_get_used_size() : 0;
 }
 
 std::int64_t gc_get_heap_size() {
-    const auto* value = api();
-    return available() && URK_MONO_HAS(gc_get_heap_size) ? value->gc_get_heap_size() : 0;
+    return available() ? native::gc_get_heap_size() : 0;
 }
 
 #undef URK_MONO_HAS

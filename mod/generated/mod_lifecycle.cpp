@@ -40,8 +40,9 @@ void runtime_update() {
 
 bool validate_required_backend(const URK_ModContext* ctx) {
   if (!ctx) return false;
-  if (ctx->version < URK_SDK_VERSION) {
-    ModLog::error("mod context SDK version is too old: got=%d required>=%d", ctx->version, URK_SDK_VERSION);
+  if (ctx->version < URK_SDK_MIN_COMPAT_VERSION) {
+    ModLog::error("mod context SDK version is too old: got=%d required>=%d",
+                  ctx->version, URK_SDK_MIN_COMPAT_VERSION);
     return false;
   }
   if (ctx->size < sizeof(URK_ModContext)) {

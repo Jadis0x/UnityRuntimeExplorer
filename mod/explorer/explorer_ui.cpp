@@ -2012,8 +2012,8 @@ TraceViewState &trace_view_state(MethodTracer::TraceId id) {
 std::string friendly_trace_caller(std::string_view caller) {
     if (caller.empty() || caller.find("GameAssembly.dll+") != std::string_view::npos)
         return "Game native code (method name could not be resolved)";
-    if (caller == "<shared IL2CPP generic code>")
-        return "shared generic IL2CPP code";
+    if (caller == "<shared managed generic code>")
+        return std::string("shared generic ") + ModConfig::backend_name + " code";
     return std::string(caller);
 }
 
@@ -2064,7 +2064,7 @@ void render_method_trace(const MethodTracer::Snapshot &trace) {
         if (ImGui::SmallButton("Copy method address"))
             ImGui::SetClipboardText(trace.method_pointer_text.c_str());
         if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("Copies the IL2CPP MethodInfo metadata address.");
+            ImGui::SetTooltip("Copies the managed method metadata address.");
         ImGui::TextDisabled("Raw ABI preserves arguments plus RAX/XMM0 return lanes. Managed references are shown as raw addresses; they are not rooted by a trace.");
     }
 
@@ -3677,7 +3677,8 @@ void render_class_browser(const Snapshot &snapshot) {
         state.catalog_requested = true;
     }
 
-    ImGui::TextDisabled("Search every loaded IL2CPP type. Instance search follows Unity roots and static references.");
+    ImGui::TextDisabled("Search every loaded %s type. Instance search follows Unity roots and static references.",
+                        ModConfig::backend_name);
     if (!snapshot.class_browser_catalog) {
         ImGui::TextDisabled("Scanning class metadata...");
         return;
@@ -4415,7 +4416,8 @@ void render() {
     if (ImGui::Begin("URK Explorer Workspace", nullptr, ImGuiWindowFlags_NoCollapse)) {
         ImGui::TextColored(ImVec4(0.62f, 0.72f, 0.82f, 1.0f), "%s", ModConfig::display_name);
         ImGui::SameLine();
-        ImGui::TextDisabled("IL2CPP Runtime Explorer  |  %s  |  v%s", ModConfig::author, ModConfig::version);
+        ImGui::TextDisabled("%s Runtime Explorer  |  %s  |  v%s",
+                            ModConfig::backend_name, ModConfig::author, ModConfig::version);
         ImGui::Separator();
         if (ImGui::SmallButton("Panels"))
             ImGui::OpenPopup("##workspace-panels");
