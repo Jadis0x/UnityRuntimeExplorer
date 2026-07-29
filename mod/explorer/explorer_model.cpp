@@ -1,6 +1,8 @@
 // Copyright (c) 2026 Jadis0x. All rights reserved.
 #include "explorer_model.h"
 
+#include "method_trace_value_decoder.h"
+
 #include "support/mod_log.h"
 #include "ui/highlight.h"
 
@@ -717,12 +719,21 @@ namespace Explorer {
 			const std::uintptr_t address = static_cast<std::uintptr_t>(raw);
 			if (!address)
 				return "null";
-			const std::string fallback = std::string(declared_type.empty() ? "object" : declared_type) + " @ " +
-				pointer_text(reinterpret_cast<void*>(address));
+			const std::string fallback = std::string(declared_type.empty() ? "object" : declared_type);
 			if (!readable_address(address))
-				return fallback + " (unavailable)";
-			// Trace records are raw register values, not guaranteed managed objects.
-			return fallback;
+				return fallback + " (reference no longer readable)";
+
+			// The detour only records a raw register value. Resolve its runtime
+			// type later on the Explorer thread, under the normal SEH boundary.
+			// This keeps managed calls out of the hook while making a live
+			// reference substantially more useful than an address-only label.
+			const Inspect::TypeInfo actual = safe_type_of(Object{reinterpret_cast<void*>(address)});
+			if (!actual.handle)
+				return fallback + " (runtime type unavailable)";
+			const std::string actual_name = actual.full_name.empty() ? fallback : actual.full_name;
+			if (!declared_type.empty() && actual_name != declared_type)
+				return actual_name + " (declared " + std::string(declared_type) + ")";
+			return actual_name;
 		}
 
 		std::string describe_traced_string(std::uint64_t raw) {
@@ -1354,6 +1365,49 @@ namespace Explorer {
 			object.transform().set_localScale(command.vector_value);
 			capture_last_error("Set scale");
 			break;
+		case CommandKind::PasteLocalTransform: {
+			const Transform transform = object.transform();
+			transform.set_localPosition(command.vector_value);
+			if (const char* error = last_error(); error && error[0]) {
+				capture_last_error("Paste transform position");
+				break;
+			}
+			transform.SetProperty("localEulerAngles", command.vector_value_secondary);
+			if (const char* error = last_error(); error && error[0]) {
+				capture_last_error("Paste transform rotation");
+				break;
+			}
+			transform.set_localScale(command.vector_value_tertiary);
+			capture_last_error("Paste transform scale");
+			if (!(last_error() && last_error()[0]))
+				set_status("Pasted local transform onto " + object.name());
+			full_inspector_refresh = true;
+			break;
+		}
+		case CommandKind::CopyLocalTransform: {
+			const Transform transform = object.transform();
+			working_.transform_clipboard.valid = false;
+			working_.transform_clipboard.source_instance_id = object.GetInstanceID();
+			working_.transform_clipboard.source_name = object.name();
+			working_.transform_clipboard.local_position = transform.localPosition();
+			if (const char* error = last_error(); error && error[0]) {
+				capture_last_error("Copy transform position");
+				break;
+			}
+			working_.transform_clipboard.local_rotation = transform.GetProperty<Vector3>("localEulerAngles");
+			if (const char* error = last_error(); error && error[0]) {
+				capture_last_error("Copy transform rotation");
+				break;
+			}
+			working_.transform_clipboard.local_scale = transform.localScale();
+			if (const char* error = last_error(); error && error[0]) {
+				capture_last_error("Copy transform scale");
+				break;
+			}
+			working_.transform_clipboard.valid = true;
+			set_status("Copied local transform: " + working_.transform_clipboard.source_name);
+			break;
+		}
 		case CommandKind::AddComponent: {
 			const Object component = object.AddComponent(command.image, command.namespc, command.class_name);
 			if (component)
@@ -3512,7 +3566,10 @@ namespace Explorer {
 				do {
 					reference_token = 0x1000000000000000ull | (next_reference_token_++ & 0x0fffffffffffffffull);
 				} while (reference_handles_.contains(reference_token));
-				Inspect::ObjectHandle rooted = tracked_reference_handle(*value);
+				// An Execute result must remain inspectable after the UI snapshot is
+				// published. A weak handle can disappear before the user reaches the
+				// Inspect button, so method results own a strong handle until replaced.
+				Inspect::ObjectHandle rooted = Inspect::PinObject(Object{value->object});
 				const Object returned = Inspect::ResolveObjectHandle(rooted);
 				if (rooted.handle && returned) {
 					reference_handles_[reference_token] = rooted;
@@ -5238,6 +5295,8 @@ namespace Explorer {
 		case CommandKind::ClearManagedReferences: return "Clear managed references";
 		case CommandKind::CreateClassInstance: return "Create class instance";
 		case CommandKind::RefreshByteArrayInspection: return "Refresh byte array inspection";
+		case CommandKind::PasteLocalTransform: return "Paste local transform";
+		case CommandKind::CopyLocalTransform: return "Copy local transform";
 		case CommandKind::SceneHint: return "Scene transition";
 		case CommandKind::ClearFlightRecorder: return "Clear flight recorder";
 		default: return "Explorer command";
@@ -5304,29 +5363,29 @@ namespace Explorer {
 				return left.id < right.id;
 			});
 		for (MethodTracer::Snapshot& trace : working_.method_traces) {
-			for (MethodTracer::Record& record : trace.records) {
+			// Decode captured bytes only on the Explorer thread.  The detour itself
+			// records ABI lanes and never calls managed runtime APIs.
+			MethodTraceValueDecoder::resolve_displays(trace);
+			for (MethodTracer::Record& record : trace.records)
 				record.caller_display = managed_caller_location(record.caller_address);
-				if (record.return_captured && trace.return_type == "System.String")
-					record.return_display = describe_traced_string(record.return_rax);
-				if (trace.target_is_reference)
-					record.target_display = describe_traced_reference(record.target_address, trace.declaring_type);
-				record.argument_displays.resize(record.arguments.size());
-				for (std::size_t index = 0; index < record.arguments.size(); ++index) {
-					if (index < trace.parameter_is_reference.size() && trace.parameter_is_reference[index]) {
-						const std::string_view type = index < trace.parameter_types.size()
-							? std::string_view(trace.parameter_types[index])
-							: std::string_view{};
-						record.argument_displays[index] = describe_traced_reference(record.arguments[index], type);
-					}
-				}
-			}
 		}
 		std::unordered_set<TraceReturnKey, TraceReturnKeyHash> live_trace_returns;
 		for (MethodTracer::Snapshot& trace : working_.method_traces) {
-			if (!trace.return_value_class || trace.return_value_size == 0)
-				continue;
-			for (MethodTracer::Record& record : trace.records) {
-				if (!record.return_captured || record.return_value_bytes.size() != trace.return_value_size)
+			// A trace can retain thousands of records across sessions. Keep the
+			// newest returned managed objects strongly rooted so they can be opened
+			// reliably, while older rows remain available as raw diagnostics.
+			constexpr std::size_t kMaxRootedTraceReturns = 128;
+			const std::size_t first_rooted_reference = trace.records.size() > kMaxRootedTraceReturns
+				? trace.records.size() - kMaxRootedTraceReturns : 0;
+			for (std::size_t record_index = 0; record_index < trace.records.size(); ++record_index) {
+				MethodTracer::Record& record = trace.records[record_index];
+				const bool reference_return = trace.return_is_reference && record.return_captured &&
+					record.return_rax != 0;
+				const bool boxed_value_return = trace.return_value_class && trace.return_value_size != 0 &&
+					record.return_captured && record.return_value_bytes.size() == trace.return_value_size;
+				if (!reference_return && !boxed_value_return)
+					continue;
+				if (reference_return && record_index < first_rooted_reference)
 					continue;
 				const TraceReturnKey key{trace.id, record.sequence};
 				live_trace_returns.insert(key);
@@ -5336,9 +5395,43 @@ namespace Explorer {
 					const auto handle = reference_handles_.find(existing->second);
 					if (handle != reference_handles_.end()) {
 						const Object value = Inspect::ResolveObjectHandle(handle->second);
-						record.return_display = value ? describe_traced_reference(
-							static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(value.handle())), trace.return_type)
-							: "boxed trace result was released";
+						if (!value) {
+							record.return_display = "retained trace result was released";
+						} else if (trace.return_type != "System.String" && trace.return_type != "String" &&
+							trace.return_type != "string") {
+							record.return_display = describe_traced_reference(
+								static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(value.handle())), trace.return_type);
+							record.return_readable = true;
+						}
+					}
+					continue;
+				}
+				if (reference_return) {
+					const Object candidate{reinterpret_cast<void*>(static_cast<std::uintptr_t>(record.return_rax))};
+					const Inspect::TypeInfo type = safe_type_of(candidate);
+					if (!type.handle) {
+						record.return_display = "returned reference could not be identified";
+						continue;
+					}
+					Inspect::ObjectHandle root = Inspect::PinObject(candidate);
+					const Object value = Inspect::ResolveObjectHandle(root);
+					if (!root.handle || !value) {
+						Inspect::FreeObjectHandle(root);
+						record.return_display = "returned reference could not be retained";
+						continue;
+					}
+					std::uint64_t token = 0;
+					do {
+						token = 0xc000000000000000ull | (next_reference_token_++ & 0x0fffffffffffffffull);
+					} while (reference_handles_.contains(token));
+					reference_handles_[token] = root;
+					traced_return_references_.emplace(key, token);
+					record.return_reference_token = token;
+					if (trace.return_type != "System.String" && trace.return_type != "String" &&
+						trace.return_type != "string") {
+						record.return_display = describe_traced_reference(
+							static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(value.handle())), trace.return_type);
+						record.return_readable = true;
 					}
 					continue;
 				}

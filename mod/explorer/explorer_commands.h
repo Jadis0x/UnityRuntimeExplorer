@@ -62,6 +62,8 @@ enum class CommandKind {
     ClearManagedReferences = 53,
     CreateClassInstance = 54,
     RefreshByteArrayInspection = 55,
+    PasteLocalTransform = 56,
+    CopyLocalTransform = 57,
 };
 
 struct Command {
@@ -85,6 +87,8 @@ struct Command {
     bool unlock_value = false;
     float float_value = 0.0f;
     URK::Unity::Vector3 vector_value{};
+    URK::Unity::Vector3 vector_value_secondary{};
+    URK::Unity::Vector3 vector_value_tertiary{};
     std::string text;
     std::string image;
     std::string namespc;

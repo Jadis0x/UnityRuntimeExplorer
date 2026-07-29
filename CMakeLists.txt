@@ -62,7 +62,10 @@ set(URK_COMMON_SOURCES
         mod/config/user_settings.cpp
         mod/support/mod_log.cpp
         mod/hooks/mod_hooks.cpp
+        mod/hooks/dx11_viewport_swap_chain.cpp
         mod/hooks/render_imgui_hook.cpp
+        mod/hooks/win32_input_coordinates.cpp
+        mod/hooks/win32_message_pump.cpp
         mod/hooks/unity_log_hook.cpp
         mod/lifecycle/mod_network.cpp
         mod/lifecycle/mod_runtime.cpp
@@ -72,6 +75,8 @@ set(URK_COMMON_SOURCES
         mod/explorer/explorer_ui.cpp
         mod/explorer/byte_data_decoder.cpp
         mod/explorer/managed_reference_store.cpp
+        mod/explorer/method_trace_value_decoder.cpp
+        mod/explorer/method_trace_format.cpp
         mod/explorer/method_tracer.cpp
         mod/explorer/camera/camera_focus_controller.cpp
         mod/ui/highlight.cpp
@@ -103,7 +108,10 @@ set(URK_COMMON_HEADERS
         mod/ui/menu.h
         mod/ui/highlight.h
         mod/hooks/render_imgui_hook.h
+        mod/hooks/dx11_viewport_swap_chain.h
+        mod/hooks/win32_input_coordinates.h
         mod/hooks/unity_log_hook.h
+        mod/hooks/win32_message_pump.h
         mod/generated/mod_lifecycle.h
         mod/explorer/explorer_types.h
         mod/explorer/explorer_commands.h
@@ -111,6 +119,8 @@ set(URK_COMMON_HEADERS
         mod/explorer/explorer_ui.h
         mod/explorer/byte_data_decoder.h
         mod/explorer/managed_reference_store.h
+        mod/explorer/method_trace_value_decoder.h
+        mod/explorer/method_trace_format.h
         mod/explorer/method_tracer.h
         mod/explorer/camera/camera_focus_controller.h
         mod/hooks/mod_hooks.h
@@ -127,7 +137,6 @@ set(URK_IL2CPP_BACKEND_SOURCES
 )
 
 set(URK_MONO_BACKEND_SOURCES
-    sdk/mono/README.md
     sdk/mono/mono_helpers.h
     sdk/mono/mono_native_api.h
     sdk/mono/mono_native_api.cpp
@@ -209,4 +218,55 @@ if(URK_BUILD_TESTS)
     endif()
     urk_disable_vs_vcpkg_integration(urk_mono_runtime_tests)
     add_test(NAME mono_runtime_v7_contract COMMAND urk_mono_runtime_tests)
+
+    add_executable(urk_method_trace_format_tests
+        tests/method_trace_format_tests.cpp
+        mod/explorer/method_trace_format.cpp
+    )
+    target_include_directories(urk_method_trace_format_tests PRIVATE .)
+    target_compile_features(urk_method_trace_format_tests PRIVATE cxx_std_20)
+    target_compile_definitions(urk_method_trace_format_tests PRIVATE
+        WIN32_LEAN_AND_MEAN
+        NOMINMAX
+        URK_BACKEND_IL2CPP
+    )
+    if(MSVC)
+        target_compile_options(urk_method_trace_format_tests PRIVATE /W4 /permissive- /EHsc /utf-8)
+    endif()
+    urk_disable_vs_vcpkg_integration(urk_method_trace_format_tests)
+    add_test(NAME method_trace_format_contract COMMAND urk_method_trace_format_tests)
+
+    add_executable(urk_dx11_viewport_swap_chain_tests
+        tests/dx11_viewport_swap_chain_tests.cpp
+        mod/hooks/dx11_viewport_swap_chain.cpp
+    )
+    target_include_directories(urk_dx11_viewport_swap_chain_tests PRIVATE .)
+    target_compile_features(urk_dx11_viewport_swap_chain_tests PRIVATE cxx_std_20)
+    target_compile_definitions(urk_dx11_viewport_swap_chain_tests PRIVATE
+        WIN32_LEAN_AND_MEAN
+        NOMINMAX
+    )
+    if(MSVC)
+        target_compile_options(urk_dx11_viewport_swap_chain_tests PRIVATE /W4 /permissive- /EHsc /utf-8)
+    endif()
+    urk_disable_vs_vcpkg_integration(urk_dx11_viewport_swap_chain_tests)
+    add_test(NAME dx11_viewport_swap_chain_contract COMMAND urk_dx11_viewport_swap_chain_tests)
+
+    add_executable(urk_win32_message_pump_tests
+        tests/win32_message_pump_tests.cpp
+        mod/hooks/win32_input_coordinates.cpp
+        mod/hooks/win32_message_pump.cpp
+    )
+    target_include_directories(urk_win32_message_pump_tests PRIVATE .)
+    target_compile_features(urk_win32_message_pump_tests PRIVATE cxx_std_20)
+    target_compile_definitions(urk_win32_message_pump_tests PRIVATE
+        WIN32_LEAN_AND_MEAN
+        NOMINMAX
+    )
+    if(MSVC)
+        target_compile_options(urk_win32_message_pump_tests PRIVATE /W4 /permissive- /EHsc /utf-8)
+    endif()
+    urk_disable_vs_vcpkg_integration(urk_win32_message_pump_tests)
+    add_test(NAME win32_message_pump_contract COMMAND urk_win32_message_pump_tests)
+
 endif()

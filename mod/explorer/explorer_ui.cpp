@@ -4,6 +4,7 @@
 #include "config/mod_config.h"
 #include "config/user_settings.h"
 #include "explorer_model.h"
+#include "method_trace_format.h"
 
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -19,6 +20,7 @@
 #include <bit>
 #include <cctype>
 #include <cmath>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -201,13 +203,32 @@ void enqueue_hierarchy_command(CommandKind kind, const HierarchyNode &node, std:
 
 }
 
-void render_context_menu(const HierarchyNode &node, std::uint64_t revision) {
+void enqueue_hierarchy_transform_paste(const HierarchyNode& node, std::uint64_t revision,
+                                       const Snapshot::TransformClipboard& clipboard) {
+    Command command{};
+    command.kind = CommandKind::PasteLocalTransform;
+    command.instance_id = node.instance_id;
+    command.hierarchy_revision = revision;
+    command.vector_value = clipboard.local_position;
+    command.vector_value_secondary = clipboard.local_rotation;
+    command.vector_value_tertiary = clipboard.local_scale;
+    RuntimeModel::instance().enqueue(std::move(command));
+}
+
+void render_context_menu(const HierarchyNode &node, std::uint64_t revision,
+                         const Snapshot::TransformClipboard& clipboard) {
     if (!ImGui::BeginPopupContextItem("##game-object-context"))
         return;
     ImGui::TextDisabled("%s", node.name.c_str());
     ImGui::Separator();
     if (ImGui::MenuItem("Copy Ptr"))
         ImGui::SetClipboardText(node.pointer_text.c_str());
+    if (ImGui::MenuItem("Copy transform"))
+        enqueue_hierarchy_command(CommandKind::CopyLocalTransform, node, revision);
+    if (ImGui::MenuItem("Paste transform", nullptr, false, clipboard.valid))
+        enqueue_hierarchy_transform_paste(node, revision, clipboard);
+    if (clipboard.valid)
+        ImGui::TextDisabled("Local transform from %s", clipboard.source_name.c_str());
     if (ImGui::MenuItem("Duplicate"))
         enqueue_hierarchy_command(CommandKind::DuplicateObject, node, revision);
     if (ImGui::MenuItem("Delete"))
@@ -216,7 +237,8 @@ void render_context_menu(const HierarchyNode &node, std::uint64_t revision) {
 }
 
 void render_node(const HierarchyNode &node, int selected_instance_id, const NodeMatchSet *matches,
-                  bool include_inactive, std::uint64_t revision) {
+                  bool include_inactive, std::uint64_t revision,
+                  const Snapshot::TransformClipboard& clipboard) {
     if (!include_inactive && !node.active)
         return;
     if (matches && !matches->contains(node.instance_id))
@@ -243,17 +265,18 @@ void render_node(const HierarchyNode &node, int selected_instance_id, const Node
 	}
 	else if (ImGui::IsItemClicked(ImGuiMouseButton_Left))
 		enqueue_hierarchy_command(CommandKind::Select, node, revision);
-    render_context_menu(node, revision);
+    render_context_menu(node, revision, clipboard);
 
     if (open && !node.children.empty()) {
         for (const HierarchyNode &child : node.children)
-            render_node(child, selected_instance_id, matches, include_inactive, revision);
+            render_node(child, selected_instance_id, matches, include_inactive, revision, clipboard);
         ImGui::TreePop();
     }
     ImGui::PopID();
 }
 
-void render_hierarchy(const HierarchyInfo &hierarchy, int selected_instance_id) {
+void render_hierarchy(const HierarchyInfo &hierarchy, int selected_instance_id,
+                      const Snapshot::TransformClipboard& clipboard) {
     static int filter_mode_index = 0;
     constexpr const char *filter_modes[] = {"Name, tag or instance ID", "Name", "Tag", "Instance ID"};
     const float mode_width = std::min(190.0f, ImGui::GetContentRegionAvail().x * 0.42f);
@@ -347,7 +370,7 @@ void render_hierarchy(const HierarchyInfo &hierarchy, int selected_instance_id) 
         ImGui::PopStyleColor();
         if (open) {
             for (const HierarchyNode &root : scene.roots)
-                render_node(root, selected_instance_id, matches, include_inactive, hierarchy.revision);
+                render_node(root, selected_instance_id, matches, include_inactive, hierarchy.revision, clipboard);
             if (scene.roots.empty())
                 ImGui::TextDisabled("  No root GameObjects");
             ImGui::TreePop();
@@ -823,6 +846,23 @@ void send_vector_command(CommandKind kind, const InspectorInfo &info, const floa
     RuntimeModel::instance().enqueue(std::move(command));
 }
 
+void send_transform_copy(const InspectorInfo& info) {
+    Command command{};
+    command.kind = CommandKind::CopyLocalTransform;
+    command.instance_id = info.instance_id;
+    RuntimeModel::instance().enqueue(std::move(command));
+}
+
+void send_transform_paste(const InspectorInfo& info, const Snapshot::TransformClipboard& clipboard) {
+    Command command{};
+    command.kind = CommandKind::PasteLocalTransform;
+    command.instance_id = info.instance_id;
+    command.vector_value = clipboard.local_position;
+    command.vector_value_secondary = clipboard.local_rotation;
+    command.vector_value_tertiary = clipboard.local_scale;
+    RuntimeModel::instance().enqueue(std::move(command));
+}
+
 void render_identity(const InspectorInfo &info) {
     InspectorBuffers &buffers = inspector_buffers();
     if (buffers.instance_id != info.instance_id) {
@@ -876,9 +916,25 @@ void render_identity(const InspectorInfo &info) {
     render_type_details("GameObject Type", info.assembly_name, info.namespace_name, info.class_name, info.type_name);
 }
 
-void render_transform(const InspectorInfo &info) {
+void render_transform(const InspectorInfo &info, const Snapshot::TransformClipboard& clipboard) {
     if (!ImGui::CollapsingHeader("Transform", ImGuiTreeNodeFlags_DefaultOpen))
         return;
+    if (ImGui::SmallButton("Copy transform")) {
+        send_transform_copy(info);
+    }
+    ImGui::SameLine();
+    ImGui::BeginDisabled(!clipboard.valid);
+    if (ImGui::SmallButton("Paste transform"))
+        send_transform_paste(info, clipboard);
+    ImGui::EndDisabled();
+    if (clipboard.valid) {
+        ImGui::SameLine();
+        ImGui::TextDisabled("from %s", clipboard.source_name.c_str());
+        if (clipboard.source_instance_id == info.instance_id)
+            ImGui::TextDisabled("Clipboard source is this object.");
+    } else {
+        ImGui::TextDisabled("Copy a GameObject transform, then paste it here or from the Hierarchy right-click menu.");
+    }
     if (!ImGui::BeginTable("##transform", 2, ImGuiTableFlags_SizingStretchProp))
         return;
     ImGui::TableSetupColumn("label", ImGuiTableColumnFlags_WidthFixed, 72.0f);
@@ -1129,6 +1185,9 @@ void render_reference_button(const ComponentInfo::LiveValues::Reference *referen
         command.reference_token = reference->token;
         RuntimeModel::instance().enqueue(std::move(command));
     }
+    ImGui::SameLine();
+    if (ImGui::SmallButton("Copy Ptr"))
+        ImGui::SetClipboardText(reference->pointer_text.c_str());
     if (ImGui::IsItemHovered())
         ImGui::SetTooltip("Keep this live object available as a typed method, field, or property argument.");
     if (ImGui::BeginPopupContextItem("##reference-actions")) {
@@ -1736,160 +1795,10 @@ void enqueue_field_watch_close(std::uint64_t id) {
     RuntimeModel::instance().enqueue(std::move(command));
 }
 
-std::string traced_value(std::string_view type, std::uint64_t value) {
-    char buffer[96]{};
-    if (type == "System.Boolean" || type == "Boolean" || type == "bool")
-        return value ? "true" : "false";
-    if (type == "System.Single" || type == "Single" || type == "float") {
-        const float number = std::bit_cast<float>(static_cast<std::uint32_t>(value));
-        std::snprintf(buffer, sizeof(buffer), "%g", static_cast<double>(number));
-        return buffer;
-    }
-    if (type == "System.Double" || type == "Double" || type == "double") {
-        const double number = std::bit_cast<double>(value);
-        std::snprintf(buffer, sizeof(buffer), "%g", number);
-        return buffer;
-    }
-    if (type == "System.Int32" || type == "Int32" || type == "int") {
-        std::snprintf(buffer, sizeof(buffer), "%d", static_cast<std::int32_t>(value));
-        return buffer;
-    }
-    if (type == "System.UInt32" || type == "UInt32" || type == "uint") {
-        std::snprintf(buffer, sizeof(buffer), "%u", static_cast<std::uint32_t>(value));
-        return buffer;
-    }
-    if (type == "System.Int64" || type == "Int64" || type == "long") {
-        std::snprintf(buffer, sizeof(buffer), "%lld", static_cast<long long>(value));
-        return buffer;
-    }
-    if (type == "System.UInt64" || type == "UInt64" || type == "ulong") {
-        std::snprintf(buffer, sizeof(buffer), "%llu", static_cast<unsigned long long>(value));
-        return buffer;
-    }
-    if (type == "System.IntPtr" || type == "IntPtr" || type == "System.UIntPtr" || type == "UIntPtr") {
-        std::snprintf(buffer, sizeof(buffer), "native pointer (0x%llX)", static_cast<unsigned long long>(value));
-        return buffer;
-    }
-    std::snprintf(buffer, sizeof(buffer), "0x%llX", static_cast<unsigned long long>(value));
-    return buffer;
-}
-
-std::string trace_address(std::uintptr_t address);
-
-std::string traced_arguments(const MethodTracer::Snapshot &trace, const MethodTracer::Record &record) {
-    std::string arguments;
-    for (std::size_t index = 0; index < record.arguments.size(); ++index) {
-        if (!arguments.empty())
-            arguments += ", ";
-        const std::string_view name = index < trace.parameter_names.size() ? std::string_view(trace.parameter_names[index])
-                                                                            : std::string_view{"arg"};
-        const std::string_view type = index < trace.parameter_types.size() ? std::string_view(trace.parameter_types[index])
-                                                                            : std::string_view{};
-        const bool value_type = index < trace.parameter_is_value_type.size() && trace.parameter_is_value_type[index];
-        const bool opaque = index < trace.parameter_is_opaque.size() && trace.parameter_is_opaque[index];
-        std::string value;
-        if (opaque) {
-            value = "runtime-specific ABI pointer " + trace_address(record.arguments[index]);
-        }
-        else if (value_type) {
-            value = "value ABI " + trace_address(record.arguments[index]);
-            if (index < record.argument_xmm_low.size() &&
-                (record.argument_xmm_low[index] != 0 ||
-                 (index < record.argument_xmm_high.size() && record.argument_xmm_high[index] != 0))) {
-                value += " [xmm=" + trace_address(record.argument_xmm_low[index]);
-                if (index < record.argument_xmm_high.size())
-                    value += ":" + trace_address(record.argument_xmm_high[index]);
-                value += "]";
-            }
-        }
-        else {
-            value = index < record.argument_displays.size() && !record.argument_displays[index].empty()
-                        ? record.argument_displays[index]
-                        : traced_value(type, record.arguments[index]);
-        }
-        arguments += std::string(name) + "=" + value;
-    }
-    return arguments;
-}
-
-std::string trace_address(std::uintptr_t address) {
-    char text[32]{};
-    std::snprintf(text, sizeof(text), "0x%llX", static_cast<unsigned long long>(address));
-    return text;
-}
-
-std::string traced_return(const MethodTracer::Snapshot &trace, const MethodTracer::Record &record) {
-    if (trace.return_type == "System.Void" || trace.return_type == "Void" || trace.return_type == "void")
-        return "void";
-    if (!record.return_captured)
-        return "<pending return>";
-    if (trace.return_is_opaque)
-        return "<runtime-specific return ABI; not decoded>";
-    if (!record.return_display.empty())
-        return record.return_display;
-    if (trace.return_uses_indirect_abi)
-        return "<value-type return uses a hidden output buffer; not decoded>";
-    const std::uint64_t raw = trace.return_is_floating ? record.return_xmm_low : record.return_rax;
-    if (trace.return_is_reference)
-        return raw == 0 ? "null" : "managed reference " + trace_address(raw);
-    return traced_value(trace.return_type, raw);
-}
-
-std::string raw_traced_return(const MethodTracer::Snapshot &trace, const MethodTracer::Record &record) {
-    if (!record.return_captured)
-        return "<pending>";
-    std::string text = "rax=" + trace_address(record.return_rax);
-    if (trace.return_is_floating)
-        text += " xmm0=" + trace_address(record.return_xmm_low) + ":" + trace_address(record.return_xmm_high);
-    return text;
-}
-
-std::string trace_elapsed_text(double seconds) {
-    char text[64]{};
-    if (seconds < 0.001)
-        std::snprintf(text, sizeof(text), "%.3f us", seconds * 1000000.0);
-    else if (seconds < 1.0)
-        std::snprintf(text, sizeof(text), "%.6f ms", seconds * 1000.0);
-    else
-        std::snprintf(text, sizeof(text), "%.9f s", seconds);
-    return text;
-}
-
 std::string trace_seconds_json(double seconds) {
     char text[64]{};
     std::snprintf(text, sizeof(text), "%.9f", seconds);
     return text;
-}
-
-std::string raw_trace_arguments(const MethodTracer::Snapshot &trace, const MethodTracer::Record &record) {
-    std::string arguments;
-    for (std::size_t index = 0; index < record.arguments.size(); ++index) {
-        if (!arguments.empty())
-            arguments += ", ";
-        const std::string_view name = index < trace.parameter_names.size() ? std::string_view(trace.parameter_names[index])
-                                                                            : std::string_view{"arg"};
-        arguments += std::string(name) + "=" + trace_address(record.arguments[index]);
-    }
-    return arguments;
-}
-
-std::string raw_trace_abi_arguments(const MethodTracer::Snapshot &trace, const MethodTracer::Record &record) {
-    std::string arguments;
-    for (std::size_t index = 0; index < record.arguments.size(); ++index) {
-        if (!arguments.empty())
-            arguments += ", ";
-        const std::string_view name = index < trace.parameter_names.size() ? std::string_view(trace.parameter_names[index])
-                                                                            : std::string_view{"arg"};
-        arguments += std::string(name) + "=" + trace_address(record.arguments[index]);
-        if (index < record.argument_xmm_low.size() &&
-            (record.argument_xmm_low[index] != 0 || (index < record.argument_xmm_high.size() && record.argument_xmm_high[index] != 0))) {
-            arguments += " [xmm=" + trace_address(record.argument_xmm_low[index]);
-            if (index < record.argument_xmm_high.size())
-                arguments += ":" + trace_address(record.argument_xmm_high[index]);
-            arguments += "]";
-        }
-    }
-    return arguments;
 }
 
 void append_csv_value(std::string &out, std::string_view value) {
@@ -1902,104 +1811,9 @@ void append_csv_value(std::string &out, std::string_view value) {
     out += '"';
 }
 
-void append_json_value(std::string &out, std::string_view value) {
-    out += '"';
-    for (char character : value) {
-        switch (character) {
-        case '\\':
-            out += "\\\\";
-            break;
-        case '"':
-            out += "\\\"";
-            break;
-        case '\n':
-            out += "\\n";
-            break;
-        case '\r':
-            out += "\\r";
-            break;
-        case '\t':
-            out += "\\t";
-            break;
-        default:
-            out += character;
-            break;
-        }
-    }
-    out += '"';
-}
-
-std::string trace_csv(const MethodTracer::Snapshot &trace) {
-    std::string out = "sequence,seconds,thread,caller,caller_address,target,target_address,arguments,result,raw_arguments,raw_abi,raw_result\n";
-    for (const MethodTracer::Record &record : trace.records) {
-        const double seconds = trace.timestamp_frequency && record.timestamp_ticks >= trace.start_timestamp_ticks
-                                   ? static_cast<double>(record.timestamp_ticks - trace.start_timestamp_ticks) /
-                                         static_cast<double>(trace.timestamp_frequency)
-                                   : 0.0;
-        out += std::to_string(record.sequence) + "," + trace_seconds_json(seconds) + "," + std::to_string(record.thread_id) + ",";
-        append_csv_value(out, record.caller_display);
-        out += ",";
-        append_csv_value(out, trace_address(record.caller_address));
-        out += ",";
-        append_csv_value(out, record.target_display);
-        out += ",";
-        append_csv_value(out, trace_address(record.target_address));
-        out += ",";
-        append_csv_value(out, traced_arguments(trace, record));
-        out += ",";
-        append_csv_value(out, traced_return(trace, record));
-        out += ",";
-        append_csv_value(out, raw_trace_arguments(trace, record));
-        out += ",";
-        append_csv_value(out, raw_trace_abi_arguments(trace, record));
-        out += ",";
-        append_csv_value(out, raw_traced_return(trace, record));
-        out += "\n";
-    }
-    return out;
-}
-
-std::string trace_json(const MethodTracer::Snapshot &trace) {
-    std::string out = "{\n  \"method\": ";
-    append_json_value(out, trace.declaring_type + "." + trace.method_name);
-    out += ",\n  \"totalCalls\": " + std::to_string(trace.total_calls);
-    out += ",\n  \"overwrittenRecords\": " + std::to_string(trace.overwritten_records);
-    out += ",\n  \"captureFaults\": " + std::to_string(trace.native_faults) + ",\n  \"records\": [\n";
-    for (std::size_t index = 0; index < trace.records.size(); ++index) {
-        const MethodTracer::Record &record = trace.records[index];
-        const double seconds = trace.timestamp_frequency && record.timestamp_ticks >= trace.start_timestamp_ticks
-                                   ? static_cast<double>(record.timestamp_ticks - trace.start_timestamp_ticks) /
-                                         static_cast<double>(trace.timestamp_frequency)
-                                   : 0.0;
-        out += "    {\"sequence\": " + std::to_string(record.sequence) + ", \"seconds\": " + trace_seconds_json(seconds) +
-               ", \"thread\": " + std::to_string(record.thread_id) + ", \"caller\": ";
-        append_json_value(out, record.caller_display);
-        out += ", \"callerAddress\": ";
-        append_json_value(out, trace_address(record.caller_address));
-        out += ", \"target\": ";
-        append_json_value(out, record.target_display);
-        out += ", \"targetAddress\": ";
-        append_json_value(out, trace_address(record.target_address));
-        out += ", \"arguments\": ";
-        append_json_value(out, traced_arguments(trace, record));
-        out += ", \"result\": ";
-        append_json_value(out, traced_return(trace, record));
-        out += ", \"rawArguments\": ";
-        append_json_value(out, raw_trace_arguments(trace, record));
-        out += ", \"rawAbi\": ";
-        append_json_value(out, raw_trace_abi_arguments(trace, record));
-        out += ", \"rawResult\": ";
-        append_json_value(out, raw_traced_return(trace, record));
-        out += "}";
-        out += index + 1 == trace.records.size() ? "\n" : ",\n";
-    }
-    return out + "  ]\n}";
-}
-
 struct TraceViewState {
     std::array<char, 256> filter{};
     bool newest_first = true;
-    bool show_summary = false;
     bool show_raw_abi = false;
     bool show_addresses = false;
 };
@@ -2010,11 +1824,48 @@ TraceViewState &trace_view_state(MethodTracer::TraceId id) {
 }
 
 std::string friendly_trace_caller(std::string_view caller) {
-    if (caller.empty() || caller.find("GameAssembly.dll+") != std::string_view::npos)
-        return "Game native code (method name could not be resolved)";
+    if (caller.empty())
+        return "Native caller address was not captured";
+    if (caller.find("GameAssembly.dll+") != std::string_view::npos)
+        return "Native GameAssembly call site: " + std::string(caller) +
+               " (runtime did not expose an owning managed method)";
     if (caller == "<shared managed generic code>")
         return std::string("shared generic ") + ModConfig::backend_name + " code";
     return std::string(caller);
+}
+
+// The hue is derived from the stable value/type text, rather than sampled every
+// frame.  It reads as varied data without flickering while a trace is live.
+ImVec4 trace_value_color(std::string_view key) {
+    std::uint32_t hash = 2166136261u;
+    for (const unsigned char character : key) {
+        hash ^= character;
+        hash *= 16777619u;
+    }
+    const float hue = static_cast<float>(hash % 360u) / 360.0f;
+    ImVec4 color{};
+    ImGui::ColorConvertHSVtoRGB(hue, 0.46f, 0.98f, color.x, color.y, color.z);
+    color.w = 1.0f;
+    return color;
+}
+
+void trace_value_text(std::string_view key, std::string_view text, bool readable) {
+    if (!readable) {
+        ImGui::TextWrapped("%.*s", static_cast<int>(text.size()), text.data());
+        return;
+    }
+    ImGui::PushStyleColor(ImGuiCol_Text, trace_value_color(key));
+    ImGui::TextWrapped("%.*s", static_cast<int>(text.size()), text.data());
+    ImGui::PopStyleColor();
+}
+
+void trace_card_row(std::string_view label, std::string_view color_key,
+                    std::string_view value, bool readable) {
+    ImGui::TableNextRow();
+    ImGui::TableSetColumnIndex(0);
+    ImGui::TextDisabled("%.*s", static_cast<int>(label.size()), label.data());
+    ImGui::TableSetColumnIndex(1);
+    trace_value_text(color_key, value, readable);
 }
 
 void render_method_trace(const MethodTracer::Snapshot &trace) {
@@ -2038,15 +1889,14 @@ void render_method_trace(const MethodTracer::Snapshot &trace) {
         enqueue_method_trace_clear(trace.id);
     ImGui::SameLine();
     if (ImGui::SmallButton("Copy CSV"))
-        ImGui::SetClipboardText(trace_csv(trace).c_str());
+        ImGui::SetClipboardText(MethodTraceFormat::csv(trace).c_str());
     ImGui::SameLine();
     if (ImGui::SmallButton("Copy JSON"))
-        ImGui::SetClipboardText(trace_json(trace).c_str());
+        ImGui::SetClipboardText(MethodTraceFormat::json(trace).c_str());
     if (ImGui::IsItemHovered())
-        ImGui::SetTooltip("Copies the retained trace records to the clipboard.");
-    ImGui::SetNextItemWidth(240.0f);
+        ImGui::SetTooltip("Copies schemaVersion 2 JSON with structured arguments and results.");
+    ImGui::SetNextItemWidth(std::min(360.0f, ImGui::GetContentRegionAvail().x));
     ImGui::InputTextWithHint("##trace-filter", "Filter caller, target or arguments...", state.filter.data(), state.filter.size());
-    ImGui::SameLine();
     if (ImGui::SmallButton("Clear filter"))
         state.filter.fill('\0');
     ImGui::SameLine();
@@ -2059,13 +1909,15 @@ void render_method_trace(const MethodTracer::Snapshot &trace) {
 
     if (ImGui::CollapsingHeader("Technical details")) {
         ImGui::TextDisabled("Method metadata address: %s", trace.method_pointer_text.empty() ? "<unavailable>"
-                                                                                              : trace.method_pointer_text.c_str());
+                                                                                               : trace.method_pointer_text.c_str());
         ImGui::SameLine();
         if (ImGui::SmallButton("Copy method address"))
             ImGui::SetClipboardText(trace.method_pointer_text.c_str());
         if (ImGui::IsItemHovered())
             ImGui::SetTooltip("Copies the managed method metadata address.");
-        ImGui::TextDisabled("Raw ABI preserves arguments plus RAX/XMM0 return lanes. Managed references are shown as raw addresses; they are not rooted by a trace.");
+        ImGui::TextWrapped("Raw ABI preserves arguments plus RAX/XMM0 return lanes. Friendly values use runtime "
+                           "type metadata and decode arbitrary value types through their fields on the Explorer thread. "
+                           "Recent returned references are rooted for Object Inspector access.");
     }
 
     std::unordered_map<std::string, std::size_t> caller_counts;
@@ -2094,110 +1946,139 @@ void render_method_trace(const MethodTracer::Snapshot &trace) {
         ImGui::TextDisabled("Waiting for a call...");
         return;
     }
-    if (ImGui::BeginTable("##method-trace", 7,
-        ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingStretchProp |
-                              ImGuiTableFlags_ScrollX | ImGuiTableFlags_ScrollY | ImGuiTableFlags_Hideable,
-                          ImVec2(0, std::max(180.0f, ImGui::GetContentRegionAvail().y)))) {
-        ImGui::TableSetupColumn("#", ImGuiTableColumnFlags_WidthFixed, 42.0f);
-        ImGui::TableSetupColumn("When", ImGuiTableColumnFlags_WidthFixed, 74.0f);
-        ImGui::TableSetupColumn("Thread", ImGuiTableColumnFlags_WidthFixed, 62.0f);
-        ImGui::TableSetupColumn("Called from / object", ImGuiTableColumnFlags_WidthStretch, 1.1f);
-        ImGui::TableSetupColumn("Arguments sent", ImGuiTableColumnFlags_WidthStretch, 1.6f);
-        ImGui::TableSetupColumn("Result", ImGuiTableColumnFlags_WidthStretch, 1.1f);
-        ImGui::TableSetupColumn("Addresses", ImGuiTableColumnFlags_WidthFixed, 106.0f);
-        if (!state.show_addresses)
-            ImGui::TableSetColumnEnabled(6, false);
-        ImGui::TableHeadersRow();
+    ImGui::TextDisabled("CALLS");
+    ImGui::BeginChild("##method-trace-calls", ImVec2(0.0f, std::max(180.0f, ImGui::GetContentRegionAvail().y)),
+                      true);
+    {
         for (std::size_t displayed = 0; displayed < trace.records.size(); ++displayed) {
             const std::size_t record_index = state.newest_first ? trace.records.size() - 1 - displayed : displayed;
             const MethodTracer::Record &record = trace.records[record_index];
-            const std::string arguments = traced_arguments(trace, record);
-            const std::string result = traced_return(trace, record);
+            const std::string argument_summary = MethodTraceFormat::argument_summary(trace, record);
+            const std::string result = MethodTraceFormat::result(trace, record);
             if (!filter.empty() && !contains_case_insensitive(record.caller_display, filter) &&
-                !contains_case_insensitive(record.target_display, filter) && !contains_case_insensitive(arguments, filter) &&
+                !contains_case_insensitive(record.target_display, filter) &&
+                !contains_case_insensitive(argument_summary, filter) &&
                 !contains_case_insensitive(result, filter))
                 continue;
-            const double elapsed = trace.timestamp_frequency && record.timestamp_ticks >= trace.start_timestamp_ticks
-                                       ? static_cast<double>(record.timestamp_ticks - trace.start_timestamp_ticks) /
-                                             static_cast<double>(trace.timestamp_frequency)
-                                       : 0.0;
+            const double elapsed = MethodTraceFormat::elapsed_seconds(trace, record);
+            const std::string elapsed_text = MethodTraceFormat::elapsed_text(elapsed);
             ImGui::PushID(static_cast<int>(record.sequence));
-            ImGui::TableNextRow();
-            ImGui::TableSetColumnIndex(0);
-            ImGui::Text("%llu", static_cast<unsigned long long>(record.sequence));
-            ImGui::TableSetColumnIndex(1);
-            const std::string elapsed_text = trace_elapsed_text(elapsed);
-            ImGui::TextUnformatted(elapsed_text.c_str());
-            ImGui::TableSetColumnIndex(2);
-            ImGui::Text("%u", record.thread_id);
-            ImGui::TableSetColumnIndex(3);
-            ImGui::TextUnformatted(record.caller_display.empty() ? "<unknown caller>" : record.caller_display.c_str());
-            if (!trace.is_static) {
-                ImGui::SameLine();
-                ImGui::TextDisabled("this=%s", record.target_display.empty() ? "<unavailable>" : record.target_display.c_str());
+            const bool open = ImGui::TreeNodeEx(
+                "##call", ImGuiTreeNodeFlags_SpanAvailWidth,
+                "#%llu   +%s   thread %u", static_cast<unsigned long long>(record.sequence),
+                elapsed_text.c_str(), record.thread_id);
+
+            const bool readable_arguments = std::any_of(
+                record.argument_readable.begin(), record.argument_readable.end(),
+                [](bool readable) { return readable; });
+            const std::string caller = friendly_trace_caller(record.caller_display);
+            if (ImGui::BeginTable("##trace-call-summary", 2,
+                                  ImGuiTableFlags_SizingStretchProp | ImGuiTableFlags_RowBg |
+                                  ImGuiTableFlags_BordersInnerV)) {
+                ImGui::TableSetupColumn("label", ImGuiTableColumnFlags_WidthFixed, 76.0f);
+                ImGui::TableSetupColumn("value", ImGuiTableColumnFlags_WidthStretch);
+                trace_card_row("Caller", caller, caller, false);
+                trace_card_row("Arguments", argument_summary,
+                               argument_summary.empty() ? std::string_view("none") : std::string_view(argument_summary),
+                               readable_arguments);
+                trace_card_row("Returns", trace.return_type + result, result, record.return_readable);
+                ImGui::EndTable();
             }
-            ImGui::TableSetColumnIndex(4);
-            ImGui::TextUnformatted(arguments.empty() ? "-" : arguments.c_str());
-            if (state.show_raw_abi) {
-                const std::string raw_abi = raw_trace_abi_arguments(trace, record);
-                ImGui::TextDisabled("%s", raw_abi.empty() ? "<no ABI arguments>" : raw_abi.c_str());
-            }
-            if (ImGui::BeginPopupContextItem("##trace-arguments-actions")) {
-                const std::string raw_arguments = raw_trace_abi_arguments(trace, record);
-                ImGui::TextDisabled("Raw ABI argument values");
-                ImGui::TextWrapped("%s", raw_arguments.empty() ? "<none>" : raw_arguments.c_str());
-                if (ImGui::MenuItem("Copy raw argument values"))
-                    ImGui::SetClipboardText(raw_arguments.c_str());
-                if (record.return_captured && ImGui::MenuItem("Copy raw return value"))
-                    ImGui::SetClipboardText(raw_traced_return(trace, record).c_str());
-                if (record.return_captured && trace.return_is_reference && record.return_rax != 0) {
-                    if (ImGui::MenuItem("Inspect returned reference"))
-                        enqueue_raw_reference_inspection(record.return_rax);
-                }
-                if (record.return_reference_token != 0) {
-                    if (ImGui::MenuItem("Inspect decoded value"))
-                        enqueue_reference_inspection(record.return_reference_token);
-                }
-                for (std::size_t argument_index = 0; argument_index < record.arguments.size(); ++argument_index) {
-                    if (argument_index >= trace.parameter_is_reference.size() || !trace.parameter_is_reference[argument_index] ||
-                        record.arguments[argument_index] == 0)
-                        continue;
-                    const std::string name = argument_index < trace.parameter_names.size()
-                                                 ? trace.parameter_names[argument_index]
-                                                 : "argument " + std::to_string(argument_index);
-                    const std::string label = "Inspect " + name;
-                    if (ImGui::MenuItem(label.c_str()))
-                        enqueue_raw_reference_inspection(record.arguments[argument_index]);
-                }
-                ImGui::EndPopup();
-            }
-            ImGui::TableSetColumnIndex(5);
-            ImGui::TextUnformatted(result.c_str());
-            if (state.show_raw_abi)
-                ImGui::TextDisabled("%s", raw_traced_return(trace, record).c_str());
-            if (state.show_addresses) {
-                ImGui::TableSetColumnIndex(6);
-                const std::string caller_address = trace_address(record.caller_address);
-                if (ImGui::SmallButton("Copy caller"))
-                    ImGui::SetClipboardText(caller_address.c_str());
-                if (ImGui::IsItemHovered())
-                    ImGui::SetTooltip("%s", caller_address.c_str());
+
+            if (open) {
+                ImGui::Spacing();
+                ImGui::SeparatorText("Call site");
+                ImGui::TextWrapped("%s", caller.c_str());
+
                 if (!trace.is_static) {
-                    ImGui::SameLine();
-                    const std::string target_address = trace_address(record.target_address);
-                    if (ImGui::SmallButton("Copy this"))
-                        ImGui::SetClipboardText(target_address.c_str());
-                    if (ImGui::IsItemHovered())
-                        ImGui::SetTooltip("%s", target_address.c_str());
-                    ImGui::SameLine();
-                    if (ImGui::SmallButton("Inspect this"))
+                    ImGui::SeparatorText("Target object");
+                    trace_value_text(trace.declaring_type + record.target_display,
+                                     record.target_display.empty() ? "<unavailable>" : record.target_display,
+                                     !record.target_display.empty());
+                    if (record.target_address != 0 && ImGui::SmallButton("Inspect target"))
                         enqueue_raw_reference_inspection(record.target_address);
                 }
+
+                ImGui::SeparatorText("Arguments");
+                const std::vector<MethodTraceFormat::ArgumentView> argument_views =
+                    MethodTraceFormat::arguments(trace, record);
+                if (argument_views.empty()) {
+                    ImGui::TextUnformatted("none");
+                } else {
+                    for (const MethodTraceFormat::ArgumentView& argument : argument_views) {
+                        ImGui::PushID(static_cast<int>(argument.index));
+                        ImGui::BulletText("%s", argument.name.c_str());
+                        ImGui::SameLine();
+                        ImGui::TextDisabled("(%s)", argument.type.c_str());
+                        ImGui::Indent();
+                        trace_value_text(argument.type + argument.value, argument.value, argument.readable);
+                        if (argument.inspectable_reference && ImGui::SmallButton("Inspect reference")) {
+                            std::uint64_t address = record.arguments[argument.index];
+                            const bool by_ref = argument.index < trace.parameter_is_by_ref.size() &&
+                                trace.parameter_is_by_ref[argument.index];
+                            if (by_ref && argument.index < record.argument_byref_value_bytes.size()) {
+                                const std::vector<std::uint8_t>& bytes =
+                                    record.argument_byref_value_bytes[argument.index];
+                                if (!bytes.empty())
+                                    std::memcpy(&address, bytes.data(),
+                                                std::min(bytes.size(), sizeof(address)));
+                            }
+                            enqueue_raw_reference_inspection(address);
+                        }
+                        if (state.show_raw_abi)
+                            ImGui::TextDisabled("Raw ABI: %s", argument.raw_abi.c_str());
+                        ImGui::Unindent();
+                        ImGui::PopID();
+                    }
+                }
+                const std::string raw_arguments =
+                    MethodTraceFormat::raw_arguments(trace, record, true);
+                if (!raw_arguments.empty() && ImGui::SmallButton("Copy raw arguments"))
+                    ImGui::SetClipboardText(raw_arguments.c_str());
+
+                ImGui::SeparatorText("Return value");
+                ImGui::TextDisabled("Type: %s", trace.return_type.empty() ? "<unknown>" : trace.return_type.c_str());
+                trace_value_text(trace.return_type + result, result, record.return_readable);
+                if (record.return_reference_token != 0) {
+                    if (ImGui::SmallButton("Open in Object Inspector"))
+                        enqueue_reference_inspection(record.return_reference_token);
+                } else if (record.return_captured && trace.return_is_reference && record.return_rax != 0 &&
+                           ImGui::SmallButton("Try inspect returned reference")) {
+                    enqueue_raw_reference_inspection(record.return_rax);
+                }
+                if (record.return_captured && trace.return_is_reference && record.return_rax != 0) {
+                    ImGui::SameLine();
+                    const std::string pointer = MethodTraceFormat::address(record.return_rax);
+                    if (ImGui::SmallButton("Copy returned ptr"))
+                        ImGui::SetClipboardText(pointer.c_str());
+                }
+                if (state.show_raw_abi)
+                    ImGui::TextDisabled("Raw ABI: %s", MethodTraceFormat::raw_result(trace, record).c_str());
+                if (record.return_captured && ImGui::SmallButton("Copy raw return"))
+                    ImGui::SetClipboardText(MethodTraceFormat::raw_result(trace, record).c_str());
+
+                if (state.show_addresses) {
+                    ImGui::SeparatorText("Addresses");
+                    const std::string caller_address = MethodTraceFormat::address(record.caller_address);
+                    ImGui::Text("Caller: %s", caller_address.c_str());
+                    ImGui::SameLine();
+                    if (ImGui::SmallButton("Copy caller"))
+                        ImGui::SetClipboardText(caller_address.c_str());
+                    if (!trace.is_static) {
+                        const std::string target_address = MethodTraceFormat::address(record.target_address);
+                        ImGui::Text("Target: %s", target_address.c_str());
+                        ImGui::SameLine();
+                        if (ImGui::SmallButton("Copy target"))
+                            ImGui::SetClipboardText(target_address.c_str());
+                    }
+                }
+                ImGui::TreePop();
             }
+            ImGui::Separator();
             ImGui::PopID();
         }
-        ImGui::EndTable();
     }
+    ImGui::EndChild();
 }
 
 void enqueue_method_trace_stop(MethodTracer::TraceId id) {
@@ -2410,16 +2291,12 @@ void render_method_result(const Snapshot &snapshot, int component_id, std::size_
     if (found == snapshot.method_results.end())
         return;
 	const Snapshot::MethodResult &result = found->second;
-	ImGui::SameLine();
 	ImGui::TextColored(result.succeeded ? ImVec4(0.60f, 0.68f, 0.60f, 1.0f)
 		: ImVec4(0.78f, 0.42f, 0.38f, 1.0f), result.succeeded ? "Success" : "Failed");
 	ImGui::SameLine();
 	ImGui::TextDisabled("%.2f ms", result.elapsed_milliseconds);
-	ImGui::SameLine();
-	ImGui::TextColored(result.succeeded ? ImVec4(0.62f, 0.72f, 0.82f, 1.0f)
-		: ImVec4(0.78f, 0.42f, 0.38f, 1.0f), "%s", result.display.c_str());
+	ImGui::TextWrapped("%s", result.display.c_str());
     if (!result.reference.is_null && result.reference.token != 0) {
-        ImGui::SameLine();
         render_reference_button(&result.reference);
     }
 }
@@ -3163,7 +3040,7 @@ void render_current_inspector(const Snapshot &snapshot) {
     if (ImGui::BeginTabBar("##inspector-tabs", ImGuiTabBarFlags_FittingPolicyScroll)) {
         if (ImGui::BeginTabItem("GameObject")) {
             render_identity(info);
-            render_transform(info);
+    render_transform(info, snapshot.transform_clipboard);
             render_component_list(info);
             render_add_component_popup(info, snapshot);
             ImGui::EndTabItem();
@@ -4143,41 +4020,41 @@ int push_explorer_theme(float opacity) {
         return ImVec4(r, g, b, std::clamp(alpha * surface_opacity, 0.28f, 1.0f));
     };
 
-    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.88f, 0.88f, 0.88f, 1.0f));
-    ImGui::PushStyleColor(ImGuiCol_WindowBg, surface(0.095f, 0.095f, 0.095f, 0.96f));
-    ImGui::PushStyleColor(ImGuiCol_ChildBg, surface(0.115f, 0.115f, 0.115f, 0.92f));
-    ImGui::PushStyleColor(ImGuiCol_PopupBg, surface(0.14f, 0.14f, 0.14f, 0.98f));
-    ImGui::PushStyleColor(ImGuiCol_Border, color(0.38f, 0.38f, 0.38f, 0.62f));
+    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.91f, 0.95f, 0.99f, 1.0f));
+    ImGui::PushStyleColor(ImGuiCol_WindowBg, surface(0.045f, 0.070f, 0.110f, 0.96f));
+    ImGui::PushStyleColor(ImGuiCol_ChildBg, surface(0.065f, 0.100f, 0.145f, 0.92f));
+    ImGui::PushStyleColor(ImGuiCol_PopupBg, surface(0.075f, 0.100f, 0.155f, 0.98f));
+    ImGui::PushStyleColor(ImGuiCol_Border, color(0.27f, 0.47f, 0.61f, 0.72f));
     ImGui::PushStyleColor(ImGuiCol_BorderShadow, color(0.0f, 0.0f, 0.0f, 0.42f));
-    ImGui::PushStyleColor(ImGuiCol_TitleBg, surface(0.085f, 0.085f, 0.085f, 0.96f));
-    ImGui::PushStyleColor(ImGuiCol_TitleBgActive, surface(0.19f, 0.19f, 0.19f, 1.0f));
-    ImGui::PushStyleColor(ImGuiCol_FrameBg, color(0.145f, 0.145f, 0.145f, 0.90f));
-    ImGui::PushStyleColor(ImGuiCol_FrameBgHovered, color(0.205f, 0.205f, 0.205f, 0.96f));
-    ImGui::PushStyleColor(ImGuiCol_FrameBgActive, color(0.255f, 0.255f, 0.255f, 1.0f));
-    ImGui::PushStyleColor(ImGuiCol_Header, color(0.19f, 0.19f, 0.19f, 0.86f));
-    ImGui::PushStyleColor(ImGuiCol_HeaderHovered, color(0.25f, 0.25f, 0.25f, 0.96f));
-    ImGui::PushStyleColor(ImGuiCol_HeaderActive, color(0.30f, 0.30f, 0.30f, 1.0f));
-    ImGui::PushStyleColor(ImGuiCol_Button, color(0.16f, 0.16f, 0.16f, 0.92f));
-    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, color(0.23f, 0.23f, 0.23f, 0.98f));
-    ImGui::PushStyleColor(ImGuiCol_ButtonActive, color(0.29f, 0.29f, 0.29f, 1.0f));
-    ImGui::PushStyleColor(ImGuiCol_Separator, color(0.34f, 0.34f, 0.34f, 0.68f));
-    ImGui::PushStyleColor(ImGuiCol_SeparatorHovered, color(0.40f, 0.40f, 0.40f, 0.90f));
-    ImGui::PushStyleColor(ImGuiCol_SeparatorActive, color(0.46f, 0.46f, 0.46f, 1.0f));
-    ImGui::PushStyleColor(ImGuiCol_TableRowBg, color(0.115f, 0.115f, 0.115f, 0.78f));
-    ImGui::PushStyleColor(ImGuiCol_TableRowBgAlt, color(0.145f, 0.145f, 0.145f, 0.82f));
-    ImGui::PushStyleColor(ImGuiCol_TableHeaderBg, color(0.20f, 0.20f, 0.20f, 0.92f));
-    ImGui::PushStyleColor(ImGuiCol_TextDisabled, ImVec4(0.56f, 0.56f, 0.56f, 1.0f));
-    ImGui::PushStyleColor(ImGuiCol_CheckMark, ImVec4(0.38f, 0.58f, 0.76f, 1.0f));
-    ImGui::PushStyleColor(ImGuiCol_TextSelectedBg, color(0.27f, 0.45f, 0.62f, 0.86f));
-    ImGui::PushStyleColor(ImGuiCol_ScrollbarBg, color(0.09f, 0.09f, 0.09f, 0.86f));
-    ImGui::PushStyleColor(ImGuiCol_ScrollbarGrab, color(0.30f, 0.30f, 0.30f, 0.96f));
-    ImGui::PushStyleColor(ImGuiCol_ScrollbarGrabHovered, color(0.39f, 0.39f, 0.39f, 1.0f));
-    ImGui::PushStyleColor(ImGuiCol_ScrollbarGrabActive, color(0.46f, 0.46f, 0.46f, 1.0f));
-    ImGui::PushStyleColor(ImGuiCol_Tab, color(0.13f, 0.13f, 0.13f, 0.98f));
-    ImGui::PushStyleColor(ImGuiCol_TabHovered, color(0.25f, 0.25f, 0.25f, 1.0f));
-    ImGui::PushStyleColor(ImGuiCol_TabSelected, color(0.30f, 0.43f, 0.56f, 1.0f));
-    ImGui::PushStyleColor(ImGuiCol_TabDimmed, color(0.10f, 0.10f, 0.10f, 0.94f));
-    ImGui::PushStyleColor(ImGuiCol_TabDimmedSelected, color(0.22f, 0.30f, 0.38f, 0.98f));
+    ImGui::PushStyleColor(ImGuiCol_TitleBg, surface(0.040f, 0.100f, 0.155f, 0.96f));
+    ImGui::PushStyleColor(ImGuiCol_TitleBgActive, surface(0.105f, 0.245f, 0.355f, 1.0f));
+    ImGui::PushStyleColor(ImGuiCol_FrameBg, color(0.085f, 0.145f, 0.205f, 0.90f));
+    ImGui::PushStyleColor(ImGuiCol_FrameBgHovered, color(0.125f, 0.220f, 0.295f, 0.96f));
+    ImGui::PushStyleColor(ImGuiCol_FrameBgActive, color(0.165f, 0.285f, 0.365f, 1.0f));
+    ImGui::PushStyleColor(ImGuiCol_Header, color(0.090f, 0.180f, 0.245f, 0.86f));
+    ImGui::PushStyleColor(ImGuiCol_HeaderHovered, color(0.115f, 0.255f, 0.335f, 0.96f));
+    ImGui::PushStyleColor(ImGuiCol_HeaderActive, color(0.155f, 0.320f, 0.405f, 1.0f));
+    ImGui::PushStyleColor(ImGuiCol_Button, color(0.095f, 0.175f, 0.245f, 0.92f));
+    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, color(0.135f, 0.255f, 0.345f, 0.98f));
+    ImGui::PushStyleColor(ImGuiCol_ButtonActive, color(0.185f, 0.325f, 0.425f, 1.0f));
+    ImGui::PushStyleColor(ImGuiCol_Separator, color(0.210f, 0.415f, 0.520f, 0.68f));
+    ImGui::PushStyleColor(ImGuiCol_SeparatorHovered, color(0.300f, 0.610f, 0.710f, 0.90f));
+    ImGui::PushStyleColor(ImGuiCol_SeparatorActive, color(0.370f, 0.710f, 0.790f, 1.0f));
+    ImGui::PushStyleColor(ImGuiCol_TableRowBg, color(0.060f, 0.115f, 0.165f, 0.78f));
+    ImGui::PushStyleColor(ImGuiCol_TableRowBgAlt, color(0.075f, 0.145f, 0.205f, 0.82f));
+    ImGui::PushStyleColor(ImGuiCol_TableHeaderBg, color(0.095f, 0.205f, 0.275f, 0.92f));
+    ImGui::PushStyleColor(ImGuiCol_TextDisabled, ImVec4(0.58f, 0.69f, 0.76f, 1.0f));
+    ImGui::PushStyleColor(ImGuiCol_CheckMark, ImVec4(0.32f, 0.88f, 0.72f, 1.0f));
+    ImGui::PushStyleColor(ImGuiCol_TextSelectedBg, color(0.235f, 0.520f, 0.680f, 0.86f));
+    ImGui::PushStyleColor(ImGuiCol_ScrollbarBg, color(0.035f, 0.070f, 0.100f, 0.86f));
+    ImGui::PushStyleColor(ImGuiCol_ScrollbarGrab, color(0.175f, 0.350f, 0.455f, 0.96f));
+    ImGui::PushStyleColor(ImGuiCol_ScrollbarGrabHovered, color(0.255f, 0.510f, 0.610f, 1.0f));
+    ImGui::PushStyleColor(ImGuiCol_ScrollbarGrabActive, color(0.335f, 0.620f, 0.700f, 1.0f));
+    ImGui::PushStyleColor(ImGuiCol_Tab, color(0.055f, 0.125f, 0.185f, 0.98f));
+    ImGui::PushStyleColor(ImGuiCol_TabHovered, color(0.150f, 0.340f, 0.445f, 1.0f));
+    ImGui::PushStyleColor(ImGuiCol_TabSelected, color(0.180f, 0.420f, 0.540f, 1.0f));
+    ImGui::PushStyleColor(ImGuiCol_TabDimmed, color(0.040f, 0.085f, 0.130f, 0.94f));
+    ImGui::PushStyleColor(ImGuiCol_TabDimmedSelected, color(0.105f, 0.245f, 0.315f, 0.98f));
     ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 1.0f);
     ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 4.0f);
     ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, 2.0f);
@@ -4192,34 +4069,31 @@ int push_explorer_theme(float opacity) {
     return 35;
 }
 
-int push_panel_accent(const ImVec4&, float opacity) {
+int push_panel_accent(const ImVec4& accent, float opacity) {
     const float surface_opacity = std::clamp(opacity, 0.35f, 1.0f);
-    const auto color = [](float r, float g, float b, float alpha) {
-        return ImVec4(r, g, b, alpha);
+    const auto tint = [&accent, surface_opacity](float base, float accent_weight, float alpha) {
+        return ImVec4(base + accent.x * accent_weight, base + accent.y * accent_weight,
+                      base + accent.z * accent_weight, std::clamp(alpha * surface_opacity, 0.25f, 1.0f));
     };
-    const ImVec4 window_bg(0.095f, 0.095f, 0.095f, 0.96f * surface_opacity);
-    const ImVec4 child_bg(0.115f, 0.115f, 0.115f, 0.90f * surface_opacity);
-    const ImVec4 title_bg(0.085f, 0.085f, 0.085f, 0.98f * surface_opacity);
-    const ImVec4 selection_blue(0.30f, 0.43f, 0.56f, 1.0f);
-    ImGui::PushStyleColor(ImGuiCol_WindowBg, window_bg);
-    ImGui::PushStyleColor(ImGuiCol_ChildBg, child_bg);
-    ImGui::PushStyleColor(ImGuiCol_Border, color(0.35f, 0.35f, 0.35f, 0.72f));
-    ImGui::PushStyleColor(ImGuiCol_Separator, color(0.34f, 0.34f, 0.34f, 0.60f));
-    ImGui::PushStyleColor(ImGuiCol_TitleBg, title_bg);
-    ImGui::PushStyleColor(ImGuiCol_TitleBgActive, selection_blue);
-    ImGui::PushStyleColor(ImGuiCol_TabSelected, ImVec4(0.25f, 0.36f, 0.47f, 1.0f));
-    ImGui::PushStyleColor(ImGuiCol_TabHovered, ImVec4(0.33f, 0.46f, 0.59f, 1.0f));
+    ImGui::PushStyleColor(ImGuiCol_WindowBg, tint(0.052f, 0.105f, 0.94f));
+    ImGui::PushStyleColor(ImGuiCol_ChildBg, tint(0.070f, 0.090f, 0.88f));
+    ImGui::PushStyleColor(ImGuiCol_Border, tint(0.170f, 0.240f, 0.78f));
+    ImGui::PushStyleColor(ImGuiCol_Separator, tint(0.145f, 0.190f, 0.66f));
+    ImGui::PushStyleColor(ImGuiCol_TitleBg, tint(0.040f, 0.145f, 0.97f));
+    ImGui::PushStyleColor(ImGuiCol_TitleBgActive, ImVec4(accent.x, accent.y, accent.z, 0.90f));
+    ImGui::PushStyleColor(ImGuiCol_TabSelected, tint(0.115f, 0.390f, 0.98f));
+    ImGui::PushStyleColor(ImGuiCol_TabHovered, tint(0.160f, 0.470f, 1.00f));
     return 8;
 }
 
-void draw_panel_accent_bar(const ImVec4&) {
+void draw_panel_accent_bar(const ImVec4& accent) {
     ImDrawList* draw_list = ImGui::GetWindowDrawList();
     if (!draw_list)
         return;
     const ImVec2 position = ImGui::GetWindowPos();
     const ImVec2 size = ImGui::GetWindowSize();
     draw_list->AddRectFilled(position, ImVec2(position.x + 3.0f, position.y + size.y),
-                              ImGui::GetColorU32(ImVec4(0.30f, 0.43f, 0.56f, 0.90f)));
+                              ImGui::GetColorU32(ImVec4(accent.x, accent.y, accent.z, 0.82f)));
 }
 
 void render_toggle_key_setting() {
@@ -4284,6 +4158,64 @@ void render_diagnostics(const Snapshot &snapshot) {
         RuntimeModel::instance().enqueue(Command{.kind = CommandKind::ClearFlightRecorder});
 }
 
+const ImGuiPlatformMonitor* find_secondary_monitor(const ImGuiViewport* main_viewport) {
+    if (!main_viewport)
+        return nullptr;
+
+    const ImVec2 main_center(
+        main_viewport->WorkPos.x + main_viewport->WorkSize.x * 0.5f,
+        main_viewport->WorkPos.y + main_viewport->WorkSize.y * 0.5f);
+    const ImGuiPlatformIO& platform_io = ImGui::GetPlatformIO();
+    for (const ImGuiPlatformMonitor& monitor : platform_io.Monitors) {
+        const ImRect work_area(
+            monitor.WorkPos,
+            ImVec2(
+                monitor.WorkPos.x + monitor.WorkSize.x,
+                monitor.WorkPos.y + monitor.WorkSize.y));
+        if (!work_area.Contains(main_center))
+            return &monitor;
+    }
+    return nullptr;
+}
+
+void render_secondary_workspace(const ImGuiViewport* main_viewport) {
+    const ImGuiIO& io = ImGui::GetIO();
+    if ((io.ConfigFlags & (ImGuiConfigFlags_DockingEnable |
+                           ImGuiConfigFlags_ViewportsEnable)) !=
+        (ImGuiConfigFlags_DockingEnable | ImGuiConfigFlags_ViewportsEnable))
+        return;
+
+    const ImGuiPlatformMonitor* monitor = find_secondary_monitor(main_viewport);
+    if (!monitor || monitor->WorkSize.x <= 1.0f || monitor->WorkSize.y <= 1.0f)
+        return;
+
+    // A panel-created viewport follows that panel while it is dragged, so it
+    // cannot act as a stable docking target. This separate host owns the
+    // secondary monitor's work area and stays in place while panels move.
+    ImGuiWindowClass workspace_class{};
+    workspace_class.ViewportFlagsOverrideSet =
+        ImGuiViewportFlags_NoFocusOnAppearing | ImGuiViewportFlags_NoTaskBarIcon;
+    ImGui::SetNextWindowClass(&workspace_class);
+    ImGui::SetNextWindowPos(monitor->WorkPos, ImGuiCond_Always);
+    ImGui::SetNextWindowSize(monitor->WorkSize, ImGuiCond_Always);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 0.0f);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0f);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.0f, 0.0f));
+    const ImGuiWindowFlags flags =
+        ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoCollapse |
+        ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
+        ImGuiWindowFlags_NoDocking | ImGuiWindowFlags_NoBringToFrontOnFocus |
+        ImGuiWindowFlags_NoNavFocus | ImGuiWindowFlags_NoBackground |
+        ImGuiWindowFlags_NoSavedSettings;
+    ImGui::Begin("URK Explorer Secondary Workspace##urk-secondary-workspace", nullptr, flags);
+    ImGui::PopStyleVar(3);
+    ImGui::DockSpace(
+        ImGui::GetID("URKExplorerSecondaryDockSpace"),
+        ImVec2(0.0f, 0.0f),
+        ImGuiDockNodeFlags_PassthruCentralNode);
+    ImGui::End();
+}
+
 } // namespace
 
 void render() {
@@ -4314,23 +4246,6 @@ void render() {
     static std::uint64_t previous_object_token = 0;
     static std::size_t previous_trace_count = 0;
     static std::size_t previous_field_watch_count = 0;
-    struct DockPanelState {
-        bool hierarchy;
-        bool inspector;
-        bool object_inspector;
-        bool class_browser;
-        bool method_traces;
-        bool field_watches;
-        bool diagnostics;
-
-        bool operator==(const DockPanelState &other) const {
-            return hierarchy == other.hierarchy && inspector == other.inspector &&
-                   object_inspector == other.object_inspector && class_browser == other.class_browser &&
-                   method_traces == other.method_traces && field_watches == other.field_watches &&
-                   diagnostics == other.diagnostics;
-        }
-    };
-    static DockPanelState previous_dock_panel_state{};
     static bool dock_layout_initialized = false;
     const bool selection_changed = snapshot->selected_instance_id != previous_selection_id;
     if (selection_changed) {
@@ -4364,18 +4279,9 @@ void render() {
 
     const int pushed_colors = push_explorer_theme(opacity);
     const ImGuiID dockspace_id = ImGui::GetID("URKExplorerDockSpace");
-    const DockPanelState dock_panel_state{
-        show_hierarchy,
-        show_inspector,
-        show_object_inspector,
-        show_class_browser,
-        show_method_traces,
-        show_field_watches,
-        show_diagnostics,
-    };
-    // Rebuild the layout after panels are opened or closed.
-    const bool dock_layout_changed = !dock_layout_initialized || !(dock_panel_state == previous_dock_panel_state);
-    if (dock_layout_changed || !ImGui::DockBuilderGetNode(dockspace_id)) {
+    // Only establish the default layout once. Rebuilding it after a panel is
+    // opened or closed would forcibly pull panels back from a second monitor.
+    if (!dock_layout_initialized || !ImGui::DockBuilderGetNode(dockspace_id)) {
         if (ImGui::DockBuilderGetNode(dockspace_id))
             ImGui::DockBuilderRemoveNode(dockspace_id);
         ImGui::DockBuilderAddNode(dockspace_id, ImGuiDockNodeFlags_DockSpace);
@@ -4405,10 +4311,10 @@ void render() {
         if (show_diagnostics)
             ImGui::DockBuilderDockWindow("###urk-diagnostics", diagnostics_dock);
         ImGui::DockBuilderFinish(dockspace_id);
-        previous_dock_panel_state = dock_panel_state;
         dock_layout_initialized = true;
     }
     ImGui::DockSpaceOverViewport(dockspace_id, viewport, ImGuiDockNodeFlags_PassthruCentralNode);
+    render_secondary_workspace(viewport);
 
     ImGui::SetNextWindowPos(ImVec2(work_pos.x + 12.0f, work_pos.y + 12.0f), ImGuiCond_FirstUseEver);
     ImGui::SetNextWindowSize(ImVec2(std::min(900.0f, work_size.x - 24.0f), 96.0f), ImGuiCond_FirstUseEver);
@@ -4453,6 +4359,11 @@ void render() {
             ImGui::SetNextItemWidth(180.0f);
             ImGui::SliderFloat("Panel background", &opacity, 0.35f, 1.0f, "%.2f");
             ImGui::TextDisabled("Text, controls and borders remain opaque for readability.");
+            const bool multi_monitor =
+                (ImGui::GetIO().ConfigFlags & ImGuiConfigFlags_ViewportsEnable) != 0;
+            ImGui::TextDisabled("Multi-monitor windows: %s", multi_monitor ? "enabled" : "unavailable on this renderer");
+            if (multi_monitor)
+                ImGui::TextWrapped("Drag an undocked panel or tab outside the game window to place it on your other monitor.");
             ImGui::SeparatorText("Controls");
             render_toggle_key_setting();
             ImGui::SeparatorText("Selection Highlight");
@@ -4536,13 +4447,14 @@ void render() {
         ImGui::SetNextWindowPos(ImVec2(work_pos.x + 12.0f, work_pos.y + 120.0f), ImGuiCond_FirstUseEver);
         ImGui::SetNextWindowSize(ImVec2(std::max(300.0f, work_size.x * 0.26f), std::max(420.0f, work_size.y * 0.72f)),
                                  ImGuiCond_FirstUseEver);
-        const int panel_colors = push_panel_accent(ImVec4(0.30f, 0.43f, 0.56f, 1.0f), opacity);
+        const ImVec4 accent(0.24f, 0.56f, 0.52f, 1.0f);
+        const int panel_colors = push_panel_accent(accent, opacity);
         if (ImGui::Begin("Hierarchy##urk-hierarchy", &show_hierarchy, ImGuiWindowFlags_NoCollapse)) {
-            draw_panel_accent_bar(ImVec4(0.30f, 0.43f, 0.56f, 1.0f));
+            draw_panel_accent_bar(accent);
             ImGui::TextColored(ImVec4(0.68f, 0.68f, 0.68f, 1.0f), "%zu objects", hierarchy->objects);
             ImGui::SameLine();
             ImGui::TextDisabled("in %zu roots", hierarchy->roots);
-            render_hierarchy(*hierarchy, snapshot->selected_instance_id);
+            render_hierarchy(*hierarchy, snapshot->selected_instance_id, snapshot->transform_clipboard);
         }
         ImGui::End();
         ImGui::PopStyleColor(panel_colors);
@@ -4560,9 +4472,10 @@ void render() {
         const std::string title = snapshot->inspector.valid
                                       ? "Inspector - " + snapshot->inspector.name + "###urk-inspector"
                                       : "Inspector###urk-inspector";
-        const int panel_colors = push_panel_accent(ImVec4(0.30f, 0.43f, 0.56f, 1.0f), opacity);
+        const ImVec4 accent(0.32f, 0.50f, 0.74f, 1.0f);
+        const int panel_colors = push_panel_accent(accent, opacity);
         if (ImGui::Begin(title.c_str(), &show_inspector, ImGuiWindowFlags_NoCollapse)) {
-            draw_panel_accent_bar(ImVec4(0.30f, 0.43f, 0.56f, 1.0f));
+            draw_panel_accent_bar(accent);
             render_inspector(*snapshot);
             inspector_window_size = ImGui::GetWindowSize();
         }
@@ -4577,9 +4490,10 @@ void render() {
         const std::string title = snapshot->object_inspector.valid
                                       ? "Object Inspector - " + snapshot->object_inspector.type_name + "###urk-object"
                                       : "Object Inspector###urk-object";
-        const int panel_colors = push_panel_accent(ImVec4(0.30f, 0.43f, 0.56f, 1.0f), opacity);
+        const ImVec4 accent(0.48f, 0.62f, 0.42f, 1.0f);
+        const int panel_colors = push_panel_accent(accent, opacity);
         if (ImGui::Begin(title.c_str(), &show_object_inspector, ImGuiWindowFlags_NoCollapse)) {
-            draw_panel_accent_bar(ImVec4(0.30f, 0.43f, 0.56f, 1.0f));
+            draw_panel_accent_bar(accent);
             render_object_inspector(*snapshot);
         }
         ImGui::End();
@@ -4590,9 +4504,10 @@ void render() {
         ImGui::SetNextWindowPos(ImVec2(work_pos.x + work_size.x * 0.20f, work_pos.y + 150.0f), ImGuiCond_FirstUseEver);
         ImGui::SetNextWindowSize(ImVec2(std::max(520.0f, work_size.x * 0.42f), std::max(520.0f, work_size.y * 0.74f)),
                                  ImGuiCond_FirstUseEver);
-        const int panel_colors = push_panel_accent(ImVec4(0.30f, 0.43f, 0.56f, 1.0f), opacity);
+        const ImVec4 accent(0.56f, 0.45f, 0.73f, 1.0f);
+        const int panel_colors = push_panel_accent(accent, opacity);
         if (ImGui::Begin("Class Browser###urk-class-browser", &show_class_browser, ImGuiWindowFlags_NoCollapse)) {
-            draw_panel_accent_bar(ImVec4(0.30f, 0.43f, 0.56f, 1.0f));
+            draw_panel_accent_bar(accent);
             render_class_browser(*snapshot);
         }
         ImGui::End();
@@ -4604,9 +4519,10 @@ void render() {
         ImGui::SetNextWindowSize(ImVec2(std::max(680.0f, work_size.x * 0.58f), std::max(420.0f, work_size.y * 0.62f)),
                                  ImGuiCond_FirstUseEver);
         const std::string title = "Method Traces (" + std::to_string(snapshot->method_traces.size()) + ")###urk-method-traces";
-        const int panel_colors = push_panel_accent(ImVec4(0.30f, 0.43f, 0.56f, 1.0f), opacity);
+        const ImVec4 accent(0.72f, 0.51f, 0.30f, 1.0f);
+        const int panel_colors = push_panel_accent(accent, opacity);
         if (ImGui::Begin(title.c_str(), &show_method_traces, ImGuiWindowFlags_NoCollapse)) {
-            draw_panel_accent_bar(ImVec4(0.30f, 0.43f, 0.56f, 1.0f));
+            draw_panel_accent_bar(accent);
             render_method_traces(*snapshot);
         }
         ImGui::End();
@@ -4619,9 +4535,10 @@ void render() {
                                  ImGuiCond_FirstUseEver);
         const std::string title =
             "Field Watches (" + std::to_string(snapshot->field_watches.size()) + ")###urk-field-watches";
-        const int panel_colors = push_panel_accent(ImVec4(0.30f, 0.43f, 0.56f, 1.0f), opacity);
+        const ImVec4 accent(0.63f, 0.42f, 0.54f, 1.0f);
+        const int panel_colors = push_panel_accent(accent, opacity);
         if (ImGui::Begin(title.c_str(), &show_field_watches, ImGuiWindowFlags_NoCollapse)) {
-            draw_panel_accent_bar(ImVec4(0.30f, 0.43f, 0.56f, 1.0f));
+            draw_panel_accent_bar(accent);
             render_field_watches(*snapshot);
         }
         ImGui::End();
@@ -4633,9 +4550,10 @@ void render() {
         ImGui::SetNextWindowSize(ImVec2(std::min(760.0f, work_size.x - 60.0f), 230.0f), ImGuiCond_FirstUseEver);
         const std::string title =
             "Activity Log (" + std::to_string(snapshot->diagnostics.size()) + ")###urk-diagnostics";
-        const int panel_colors = push_panel_accent(ImVec4(0.30f, 0.43f, 0.56f, 1.0f), opacity);
+        const ImVec4 accent(0.68f, 0.40f, 0.34f, 1.0f);
+        const int panel_colors = push_panel_accent(accent, opacity);
         if (ImGui::Begin(title.c_str(), &show_diagnostics)) {
-            draw_panel_accent_bar(ImVec4(0.30f, 0.43f, 0.56f, 1.0f));
+            draw_panel_accent_bar(accent);
             ImGui::TextDisabled("Latest activity");
             ImGui::TextWrapped("%s", snapshot->status.empty() ? "Ready" : snapshot->status.c_str());
             ImGui::Separator();

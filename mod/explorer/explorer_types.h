@@ -260,6 +260,14 @@ struct InspectorInfo {
 };
 
 struct Snapshot {
+    struct TransformClipboard {
+        bool valid = false;
+        int source_instance_id = 0;
+        std::string source_name;
+        URK::Unity::Vector3 local_position{};
+        URK::Unity::Vector3 local_rotation{};
+        URK::Unity::Vector3 local_scale{1.0f, 1.0f, 1.0f};
+    };
     struct FlightEvent {
         std::uint64_t sequence = 0;
         double seconds_since_start = 0.0;
@@ -325,6 +333,7 @@ struct Snapshot {
     bool class_browser_scan_truncated = false;
     InspectorInfo inspector;
     ObjectInspectorInfo object_inspector;
+    TransformClipboard transform_clipboard;
     bool live_data = false;
     bool highlight_enabled = true;
     // This must be configurable because a practical focus distance differs

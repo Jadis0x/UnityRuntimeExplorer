@@ -34,10 +34,19 @@ struct Record {
     // Retain XMM lanes for floating-point and value-type arguments.
     std::vector<std::uint64_t> argument_xmm_low;
     std::vector<std::uint64_t> argument_xmm_high;
+    // For ref/out parameters this contains the value copied after the callee
+    // returned. `arguments` intentionally remains the original ABI address.
+    std::vector<std::vector<std::uint8_t>> argument_byref_value_bytes;
+    // Value-type arguments are copied at entry, before the callee can mutate
+    // caller-owned temporaries. This keeps their display independent from the
+    // live stack/register state when the Explorer renders the trace later.
+    std::vector<std::vector<std::uint8_t>> argument_value_bytes;
     // Filled on the Explorer thread; the detour does not resolve managed objects.
     std::string caller_display;
     std::string target_display;
     std::vector<std::string> argument_displays;
+    std::vector<bool> argument_readable;
+    bool return_readable = false;
 };
 
 struct Snapshot {
@@ -50,13 +59,22 @@ struct Snapshot {
     std::string return_type;
     std::vector<std::string> parameter_names;
     std::vector<std::string> parameter_types;
+    std::vector<const void*> parameter_type_handles;
+    std::vector<const void*> parameter_value_classes;
+    std::vector<std::size_t> parameter_value_sizes;
     std::vector<bool> parameter_is_reference;
     std::vector<bool> parameter_is_value_type;
+    std::vector<bool> parameter_is_enum;
+    std::vector<bool> parameter_is_by_ref;
+    std::vector<std::string> parameter_enum_underlying_types;
     std::vector<bool> parameter_is_opaque;
     std::vector<bool> parameter_is_floating;
     bool target_is_reference = false;
     bool return_is_reference = false;
     bool return_is_value_type = false;
+    bool return_is_enum = false;
+    std::string return_enum_underlying_type;
+    const void* return_type_handle = nullptr;
     bool return_is_opaque = false;
     const void* return_value_class = nullptr;
     std::size_t return_value_size = 0;

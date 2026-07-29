@@ -19,6 +19,8 @@
 #include <memory>
 #include <mutex>
 #include <new>
+#include <string_view>
+#include <unordered_map>
 
 namespace Explorer::MethodTracer {
 namespace {
@@ -59,13 +61,29 @@ struct HookSession {
     std::vector<ArgumentKind> argument_kinds;
     std::vector<bool> argument_is_reference;
     std::vector<bool> argument_is_value_type;
+    std::vector<bool> argument_is_enum;
+    std::vector<bool> argument_is_by_ref;
+    std::vector<std::string> argument_enum_underlying_types;
     std::vector<bool> argument_is_opaque;
+    std::vector<const void*> argument_type_handles;
+    std::vector<const void*> argument_value_classes;
+    std::vector<std::size_t> argument_value_sizes;
+    std::vector<std::size_t> argument_value_word_offsets;
+    std::size_t argument_value_word_count = 0;
+    std::unique_ptr<std::atomic<std::uint64_t>[]> argument_value_words;
+    std::vector<std::size_t> argument_byref_value_sizes;
+    std::vector<std::size_t> argument_byref_word_offsets;
+    std::size_t argument_byref_word_count = 0;
+    std::unique_ptr<std::atomic<std::uint64_t>[]> argument_byref_value_words;
     std::unique_ptr<std::atomic<std::uint64_t>[]> return_value_words;
     std::size_t argument_count = 0;
     bool is_static = false;
     bool target_is_reference = false;
     bool return_is_reference = false;
     bool return_is_value_type = false;
+    bool return_is_enum = false;
+    std::string return_enum_underlying_type;
+    const void* return_type_handle = nullptr;
     bool return_is_opaque = false;
     const void* return_value_class = nullptr;
     std::size_t return_value_size = 0;
@@ -106,15 +124,113 @@ bool is_floating(std::string_view type) {
 int trace_exception_filter(unsigned long code);
 #endif
 
-bool resolve_value_return_layout(const URK::Unity::Inspect::MethodInfo& method, HookSession& session) {
-    if (!method.return_is_value_type || method.return_is_enum || method.return_type_is_opaque ||
-        !method.return_type_handle)
+struct RuntimeTypeTraits {
+    bool resolved = false;
+    bool is_value_type = false;
+    bool is_enum = false;
+    const URK::managed::Class* klass = nullptr;
+};
+
+const URK::managed::Class* resolve_class_by_name(std::string_view name) {
+    static std::unordered_map<std::string, const URK::managed::Class*> cache;
+    std::string normalized(name);
+    while (!normalized.empty() && (normalized.back() == '&' || normalized.back() == '*'))
+        normalized.pop_back();
+    if (normalized.empty() || normalized.find('[') != std::string::npos)
+        return nullptr;
+    if (const auto found = cache.find(normalized); found != cache.end())
+        return found->second;
+
+    constexpr std::size_t kMaxClassesToSearch = 250000;
+    std::size_t visited = 0;
+    for (std::size_t assembly_index = 0;
+         assembly_index < URK::managed::domain_get_assembly_count() && visited < kMaxClassesToSearch;
+         ++assembly_index) {
+        const auto* assembly = URK::managed::domain_get_assembly(assembly_index);
+        const auto* image = assembly ? URK::managed::assembly_get_image(assembly) : nullptr;
+        if (!image)
+            continue;
+        const std::size_t class_count = URK::managed::image_get_class_count(image);
+        for (std::size_t class_index = 0; class_index < class_count && visited++ < kMaxClassesToSearch;
+             ++class_index) {
+            const auto* klass = URK::managed::image_get_class(image, class_index);
+            if (!klass)
+                continue;
+            const char* namespc = URK::managed::class_get_namespace(klass);
+            const char* class_name = URK::managed::class_get_name(klass);
+            if (!class_name)
+                continue;
+            const std::string full_name = !namespc || namespc[0] == '\0'
+                ? std::string(class_name) : std::string(namespc) + "." + class_name;
+            if (full_name == normalized) {
+                cache.emplace(std::move(normalized), klass);
+                return klass;
+            }
+        }
+    }
+    cache.emplace(std::move(normalized), nullptr);
+    return nullptr;
+}
+
+RuntimeTypeTraits resolve_runtime_type_traits(const void* type_handle, std::string_view display_name) {
+    RuntimeTypeTraits traits{};
+#if defined(_WIN32)
+    __try {
+#endif
+        const auto* klass = type_handle ? URK::managed::type_get_class_or_element_class(
+            static_cast<const URK::managed::Type*>(type_handle)) : nullptr;
+        std::string normalized(display_name);
+        while (!normalized.empty() && (normalized.back() == '&' || normalized.back() == '*'))
+            normalized.pop_back();
+        if (klass) {
+            const char* namespc = URK::managed::class_get_namespace(klass);
+            const char* class_name = URK::managed::class_get_name(klass);
+            const std::string class_display = !class_name ? std::string{}
+                : !namespc || namespc[0] == '\0' ? std::string(class_name)
+                : std::string(namespc) + "." + class_name;
+            // Bridge type records can point at a proxy class rather than the
+            // declared signature type. Do not use that proxy to choose an ABI.
+            if (!normalized.empty() && class_display != normalized)
+                klass = nullptr;
+        }
+        if (!klass)
+            klass = resolve_class_by_name(display_name);
+        if (!klass)
+            return traits;
+        traits.resolved = true;
+        traits.klass = klass;
+        traits.is_value_type = URK::managed::class_is_valuetype(klass);
+        traits.is_enum = URK::managed::class_is_enum(klass);
+        // Some generated/bridge signatures advertise a CLASS element kind even
+        // though their runtime class is an explicit-layout struct.  The class
+        // size API is the ABI authority here: a positive value size identifies
+        // a by-value payload even when the metadata kind is conservative.
+        std::uint32_t alignment = 0;
+        const std::int32_t value_size = URK::managed::class_value_size(klass, &alignment);
+        if (value_size > 0)
+            traits.is_value_type = true;
+        if (!traits.is_enum && URK::managed::class_enum_basetype(klass) != nullptr)
+            traits.is_enum = true;
+#if defined(_WIN32)
+    }
+    __except (trace_exception_filter(GetExceptionCode())) {
+        return {};
+    }
+#endif
+    return traits;
+}
+
+bool resolve_value_return_layout(HookSession& session) {
+    if (!session.return_is_value_type || session.return_is_enum || session.return_is_opaque ||
+        !session.return_type_handle)
         return false;
 #if defined(_WIN32)
     __try {
 #endif
-        const auto* klass = URK::managed::type_get_class_or_element_class(
-            static_cast<const URK::managed::Type*>(method.return_type_handle));
+        const auto* klass = session.return_value_class
+            ? static_cast<const URK::managed::Class*>(session.return_value_class)
+            : URK::managed::type_get_class_or_element_class(
+                  static_cast<const URK::managed::Type*>(session.return_type_handle));
         std::uint32_t alignment = 0;
         const std::int32_t size = klass ? URK::managed::class_value_size(klass, &alignment) : 0;
         if (size <= 0)
@@ -128,6 +244,50 @@ bool resolve_value_return_layout(const URK::Unity::Inspect::MethodInfo& method, 
     }
     __except (trace_exception_filter(GetExceptionCode())) {
         return false;
+    }
+#endif
+}
+
+std::size_t resolve_byref_value_size(const URK::Unity::Inspect::MethodParamInfo& parameter,
+                                     bool is_by_ref, bool is_value_type,
+                                     const URK::managed::Class* known_class) {
+    if (!is_by_ref)
+        return 0;
+    if (!is_value_type)
+        return sizeof(void*);
+#if defined(_WIN32)
+    __try {
+#endif
+        const auto* klass = known_class ? known_class : URK::managed::type_get_class_or_element_class(
+            static_cast<const URK::managed::Type*>(parameter.type));
+        std::uint32_t alignment = 0;
+        const std::int32_t size = klass ? URK::managed::class_value_size(klass, &alignment) : 0;
+        return size > 0 ? static_cast<std::size_t>(size) : 0;
+#if defined(_WIN32)
+    }
+    __except (trace_exception_filter(GetExceptionCode())) {
+        return 0;
+    }
+#endif
+}
+
+std::size_t resolve_value_size(const URK::Unity::Inspect::MethodParamInfo& parameter,
+                               bool is_by_ref, bool is_value_type, bool is_enum,
+                               const URK::managed::Class* known_class) {
+    if (!is_value_type || is_enum || is_by_ref || !parameter.type)
+        return 0;
+#if defined(_WIN32)
+    __try {
+#endif
+        const auto* klass = known_class ? known_class : URK::managed::type_get_class_or_element_class(
+            static_cast<const URK::managed::Type*>(parameter.type));
+        std::uint32_t alignment = 0;
+        const std::int32_t size = klass ? URK::managed::class_value_size(klass, &alignment) : 0;
+        return size > 0 ? static_cast<std::size_t>(size) : 0;
+#if defined(_WIN32)
+    }
+    __except (trace_exception_filter(GetExceptionCode())) {
+        return 0;
     }
 #endif
 }
@@ -153,6 +313,21 @@ std::uint64_t xmm_lane_value(const TraceRegisterFrame *frame, std::size_t slot, 
 
 std::size_t argument_slot(const HookSession &session, std::uint64_t sequence, std::size_t argument_index) {
     return static_cast<std::size_t>(sequence % max_records) * session.argument_count + argument_index;
+}
+
+std::size_t byref_word_count(std::size_t bytes) {
+    return (bytes + sizeof(std::uint64_t) - 1) / sizeof(std::uint64_t);
+}
+
+void copy_value_words(std::atomic<std::uint64_t>* destination, std::size_t word_count,
+                      const void* source, std::size_t byte_count) {
+    for (std::size_t word = 0; word < word_count; ++word) {
+        const std::size_t offset = word * sizeof(std::uint64_t);
+        const std::size_t bytes = std::min(sizeof(std::uint64_t), byte_count - offset);
+        std::uint64_t value = 0;
+        std::memcpy(&value, static_cast<const std::uint8_t*>(source) + offset, bytes);
+        destination[word].store(value, std::memory_order_relaxed);
+    }
 }
 
 #if defined(_WIN32)
@@ -200,6 +375,26 @@ extern "C" std::uintptr_t trace_record_from_stub(const TraceRegisterFrame *frame
         session->argument_xmm_low[storage].store(xmm_lane_value(frame, slot, 0), std::memory_order_relaxed);
         session->argument_xmm_high[storage].store(xmm_lane_value(frame, slot, 8), std::memory_order_relaxed);
     }
+    if (session->argument_value_words) {
+        for (std::size_t index = 0; index < session->argument_count; ++index) {
+            const std::size_t value_size = session->argument_value_sizes[index];
+            if (value_size == 0)
+                continue;
+            const std::size_t words = byref_word_count(value_size);
+            const std::size_t base = (sequence % max_records) * session->argument_value_word_count +
+                session->argument_value_word_offsets[index];
+            for (std::size_t word = 0; word < words; ++word)
+                session->argument_value_words[base + word].store(0, std::memory_order_relaxed);
+            const std::uint64_t raw = session->arguments[argument_slot(*session, sequence, index)]
+                .load(std::memory_order_relaxed);
+            if (value_size <= sizeof(raw)) {
+                copy_value_words(session->argument_value_words.get() + base, words, &raw, value_size);
+            } else if (raw != 0) {
+                copy_value_words(session->argument_value_words.get() + base, words,
+                                 reinterpret_cast<const void*>(static_cast<std::uintptr_t>(raw)), value_size);
+            }
+        }
+    }
     record.return_published.store(false, std::memory_order_relaxed);
     record.published_sequence.store(sequence + 1, std::memory_order_release);
     original_return = push_return_context(session, sequence, static_cast<std::uintptr_t>(frame->return_address));
@@ -229,6 +424,29 @@ extern "C" std::uintptr_t trace_record_return_from_stub(HookSession* session, st
             record.return_rax.store(rax, std::memory_order_relaxed);
             record.return_xmm_low.store(xmm_low, std::memory_order_relaxed);
             record.return_xmm_high.store(xmm_high, std::memory_order_relaxed);
+            if (session->argument_byref_value_words) {
+                for (std::size_t index = 0; index < session->argument_count; ++index) {
+                    const std::size_t value_size = session->argument_byref_value_sizes[index];
+                    if (value_size == 0)
+                        continue;
+                    const std::size_t words = byref_word_count(value_size);
+                    const std::size_t base = (context.sequence % max_records) * session->argument_byref_word_count +
+                        session->argument_byref_word_offsets[index];
+                    for (std::size_t word = 0; word < words; ++word)
+                        session->argument_byref_value_words[base + word].store(0, std::memory_order_relaxed);
+                    const std::uintptr_t address = session->arguments[argument_slot(*session, context.sequence, index)]
+                        .load(std::memory_order_relaxed);
+                    if (address == 0)
+                        continue;
+                    for (std::size_t word = 0; word < words; ++word) {
+                        const std::size_t offset = word * sizeof(std::uint64_t);
+                        const std::size_t bytes = std::min(sizeof(std::uint64_t), value_size - offset);
+                        std::uint64_t value = 0;
+                        std::memcpy(&value, reinterpret_cast<const void*>(address + offset), bytes);
+                        session->argument_byref_value_words[base + word].store(value, std::memory_order_relaxed);
+                    }
+                }
+            }
             if (session->return_uses_indirect_abi && session->return_value_words) {
                 const std::uintptr_t buffer = record.return_buffer_address.load(std::memory_order_relaxed);
                 if (buffer != 0) {
@@ -339,8 +557,14 @@ Snapshot copy_snapshot(const HookSession &session) {
     out.return_type = session.return_type;
     out.parameter_names = session.parameter_names;
     out.parameter_types = session.parameter_types;
+    out.parameter_type_handles = session.argument_type_handles;
+    out.parameter_value_classes = session.argument_value_classes;
+    out.parameter_value_sizes = session.argument_value_sizes;
     out.parameter_is_reference = session.argument_is_reference;
     out.parameter_is_value_type = session.argument_is_value_type;
+    out.parameter_is_enum = session.argument_is_enum;
+    out.parameter_is_by_ref = session.argument_is_by_ref;
+    out.parameter_enum_underlying_types = session.argument_enum_underlying_types;
     out.parameter_is_opaque = session.argument_is_opaque;
     out.parameter_is_floating.reserve(session.argument_kinds.size());
     for (const ArgumentKind kind : session.argument_kinds)
@@ -348,6 +572,9 @@ Snapshot copy_snapshot(const HookSession &session) {
     out.target_is_reference = session.target_is_reference;
     out.return_is_reference = session.return_is_reference;
     out.return_is_value_type = session.return_is_value_type;
+    out.return_is_enum = session.return_is_enum;
+    out.return_enum_underlying_type = session.return_enum_underlying_type;
+    out.return_type_handle = session.return_type_handle;
     out.return_is_opaque = session.return_is_opaque;
     out.return_value_class = session.return_value_class;
     out.return_value_size = session.return_value_size;
@@ -394,11 +621,41 @@ Snapshot copy_snapshot(const HookSession &session) {
         record.arguments.reserve(session.argument_count);
         record.argument_xmm_low.reserve(session.argument_count);
         record.argument_xmm_high.reserve(session.argument_count);
+        record.argument_byref_value_bytes.resize(session.argument_count);
+        record.argument_value_bytes.resize(session.argument_count);
         for (std::size_t index = 0; index < session.argument_count; ++index) {
             const std::size_t storage = argument_slot(session, sequence, index);
             record.arguments.push_back(session.arguments[storage].load(std::memory_order_relaxed));
             record.argument_xmm_low.push_back(session.argument_xmm_low[storage].load(std::memory_order_relaxed));
             record.argument_xmm_high.push_back(session.argument_xmm_high[storage].load(std::memory_order_relaxed));
+            const std::size_t value_size = session.argument_byref_value_sizes[index];
+            if (record.return_captured && value_size != 0 && session.argument_byref_value_words) {
+                std::vector<std::uint8_t>& bytes = record.argument_byref_value_bytes[index];
+                bytes.resize(value_size);
+                const std::size_t base = (sequence % max_records) * session.argument_byref_word_count +
+                    session.argument_byref_word_offsets[index];
+                for (std::size_t word = 0; word < byref_word_count(value_size); ++word) {
+                    const std::size_t offset = word * sizeof(std::uint64_t);
+                    const std::size_t copy_size = std::min(sizeof(std::uint64_t), value_size - offset);
+                    const std::uint64_t value = session.argument_byref_value_words[base + word]
+                        .load(std::memory_order_relaxed);
+                    std::memcpy(bytes.data() + offset, &value, copy_size);
+                }
+            }
+            const std::size_t entry_value_size = session.argument_value_sizes[index];
+            if (entry_value_size != 0 && session.argument_value_words) {
+                std::vector<std::uint8_t>& bytes = record.argument_value_bytes[index];
+                bytes.resize(entry_value_size);
+                const std::size_t base = (sequence % max_records) * session.argument_value_word_count +
+                    session.argument_value_word_offsets[index];
+                for (std::size_t word = 0; word < byref_word_count(entry_value_size); ++word) {
+                    const std::size_t offset = word * sizeof(std::uint64_t);
+                    const std::size_t copy_size = std::min(sizeof(std::uint64_t), entry_value_size - offset);
+                    const std::uint64_t value = session.argument_value_words[base + word]
+                        .load(std::memory_order_relaxed);
+                    std::memcpy(bytes.data() + offset, &value, copy_size);
+                }
+            }
         }
         if (source.published_sequence.load(std::memory_order_acquire) == sequence + 1) out.records.push_back(std::move(record));
     }
@@ -410,6 +667,11 @@ bool start(const URK::Unity::Inspect::MethodInfo &method, std::string &error) {
     std::lock_guard lock(g_state.control_mutex);
     if (!URK::hooks::available()) { error = "Hook API is unavailable in this runtime"; return false; }
     if (!method.handle) { error = "Method metadata handle is unavailable"; return false; }
+    if (g_state.frequency.QuadPart <= 0 &&
+        (!QueryPerformanceFrequency(&g_state.frequency) || g_state.frequency.QuadPart <= 0)) {
+        error = "Method tracer could not initialize the high-resolution timestamp clock";
+        return false;
+    }
     const auto *method_handle = static_cast<const URK::managed::Method *>(method.handle);
     for (const auto &existing : g_state.sessions) {
         if (existing->method != method_handle)
@@ -444,10 +706,17 @@ bool start(const URK::Unity::Inspect::MethodInfo &method, std::string &error) {
     session->is_static = method.is_static;
     session->target_is_reference = !method.is_static && !method.declaring_type.is_value_type;
     session->return_type = method.return_type;
+    session->return_type_handle = method.return_type_handle;
     session->return_is_floating = is_floating(method.return_type);
-    session->return_is_value_type = method.return_is_value_type;
+    const RuntimeTypeTraits return_traits = resolve_runtime_type_traits(method.return_type_handle, method.return_type);
+    session->return_is_value_type = return_traits.resolved ? return_traits.is_value_type : method.return_is_value_type;
+    session->return_is_enum = return_traits.resolved ? return_traits.is_enum : method.return_is_enum;
+    session->return_value_class = return_traits.klass;
+    if (method.return_is_enum)
+        session->return_enum_underlying_type =
+            URK::Unity::Inspect::enum_underlying_type_name(method.return_type_handle);
     session->return_is_opaque = method.return_type_is_opaque;
-    resolve_value_return_layout(method, *session);
+    resolve_value_return_layout(*session);
     session->return_is_reference = !method.return_is_value_type && method.return_type != "System.Void" &&
                                    method.return_type != "Void" && method.return_type != "void";
     if (session->argument_count > 0) {
@@ -484,17 +753,90 @@ bool start(const URK::Unity::Inspect::MethodInfo &method, std::string &error) {
     session->argument_kinds.reserve(method.parameters.size());
     session->argument_is_reference.reserve(method.parameters.size());
     session->argument_is_value_type.reserve(method.parameters.size());
+    session->argument_is_enum.reserve(method.parameters.size());
+    session->argument_is_by_ref.reserve(method.parameters.size());
+    session->argument_enum_underlying_types.reserve(method.parameters.size());
     session->argument_is_opaque.reserve(method.parameters.size());
+    session->argument_type_handles.reserve(method.parameters.size());
+    session->argument_value_classes.reserve(method.parameters.size());
+    session->argument_value_sizes.reserve(method.parameters.size());
+    session->argument_value_word_offsets.reserve(method.parameters.size());
     for (std::size_t index = 0; index < method.parameters.size(); ++index) {
         const auto &parameter = method.parameters[index];
+        const RuntimeTypeTraits traits = resolve_runtime_type_traits(parameter.type, parameter.type_name);
+        const bool is_value_type = traits.resolved ? traits.is_value_type : parameter.is_value_type;
+        const bool is_enum = traits.resolved ? traits.is_enum : parameter.is_enum;
+        // The bridge metadata in some IL2CPP titles reports the element type
+        // but omits the BYREF flag. The managed signature still carries '&',
+        // which is authoritative and avoids interpreting the pointer itself
+        // as a byte/int/enum value.
+        const bool is_by_ref = parameter.is_by_ref || std::string_view(parameter.type_name).ends_with('&');
         session->parameter_names.push_back(parameter.name.empty() ? "arg" + std::to_string(index + 1) : parameter.name);
         session->parameter_types.push_back(parameter.type_name);
         session->argument_kinds.push_back(is_floating(parameter.type_name) ? ArgumentKind::Floating
-                                          : parameter.is_value_type && !parameter.is_enum ? ArgumentKind::Aggregate
-                                                                                           : ArgumentKind::Integer);
-        session->argument_is_reference.push_back(!parameter.is_value_type);
-        session->argument_is_value_type.push_back(parameter.is_value_type && !parameter.is_enum);
+                                          : is_value_type && !is_enum ? ArgumentKind::Aggregate
+                                                                       : ArgumentKind::Integer);
+        session->argument_is_reference.push_back(!is_value_type);
+        session->argument_is_value_type.push_back(is_value_type && !is_enum);
+        session->argument_is_enum.push_back(is_enum);
+        session->argument_is_by_ref.push_back(is_by_ref);
+        session->argument_enum_underlying_types.push_back(
+            is_enum ? URK::Unity::Inspect::enum_underlying_type_name(parameter.type) : std::string{});
         session->argument_is_opaque.push_back(parameter.is_opaque);
+        session->argument_type_handles.push_back(parameter.type);
+        session->argument_value_classes.push_back(traits.klass);
+        session->argument_value_word_offsets.push_back(session->argument_value_word_count);
+        const std::size_t entry_value_size = resolve_value_size(
+            parameter, is_by_ref, is_value_type, is_enum, traits.klass);
+        session->argument_value_sizes.push_back(entry_value_size);
+        if (entry_value_size != 0) {
+            const std::size_t words = byref_word_count(entry_value_size);
+            if (words > std::numeric_limits<std::size_t>::max() - session->argument_value_word_count) {
+                error = "Method tracer value-type capture size overflow";
+                return false;
+            }
+            session->argument_value_word_count += words;
+        }
+        session->argument_byref_word_offsets.push_back(session->argument_byref_word_count);
+        const std::size_t value_size = resolve_byref_value_size(
+            parameter, is_by_ref, is_value_type, traits.klass);
+        session->argument_byref_value_sizes.push_back(value_size);
+        if (value_size != 0) {
+            const std::size_t words = byref_word_count(value_size);
+            if (words > std::numeric_limits<std::size_t>::max() - session->argument_byref_word_count) {
+                error = "Method tracer by-reference capture size overflow";
+                return false;
+            }
+            session->argument_byref_word_count += words;
+        }
+    }
+    if (session->argument_value_word_count != 0) {
+        if (session->argument_value_word_count > std::numeric_limits<std::size_t>::max() / max_records) {
+            error = "Method tracer value-type capture storage size overflow";
+            return false;
+        }
+        try {
+            session->argument_value_words = std::make_unique<std::atomic<std::uint64_t>[]>(
+                session->argument_value_word_count * max_records);
+        }
+        catch (const std::bad_alloc&) {
+            error = "Method tracer could not allocate value-type capture storage";
+            return false;
+        }
+    }
+    if (session->argument_byref_word_count != 0) {
+        if (session->argument_byref_word_count > std::numeric_limits<std::size_t>::max() / max_records) {
+            error = "Method tracer by-reference capture storage size overflow";
+            return false;
+        }
+        try {
+            session->argument_byref_value_words = std::make_unique<std::atomic<std::uint64_t>[]>(
+                session->argument_byref_word_count * max_records);
+        }
+        catch (const std::bad_alloc&) {
+            error = "Method tracer could not allocate by-reference capture storage";
+            return false;
+        }
     }
     reset_records(*session);
     if (!create_stub(*session, error)) return false;

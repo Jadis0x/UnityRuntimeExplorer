@@ -1,5 +1,8 @@
 // Copyright (c) 2026 Jadis0x. All rights reserved.
 #include "render_imgui_hook.h"
+#include "dx11_viewport_swap_chain.h"
+#include "win32_input_coordinates.h"
+#include "win32_message_pump.h"
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
@@ -31,6 +34,13 @@
 #include <mutex>
 #include <vector>
 #include <windowsx.h>
+
+// The DX11 backend intentionally keeps this multi-viewport customization API
+// out of its public header, but exposes it for integrations that must match an
+// existing application's swap-chain policy.
+void ImGui_ImplDX11_SetSwapChainDescs(
+	const DXGI_SWAP_CHAIN_DESC* descriptor_templates,
+	int descriptor_template_count);
 
 #ifdef _MSC_VER
 #pragma warning(push)
@@ -146,10 +156,14 @@ namespace ModRenderHook {
 	inline std::atomic_uint g_active_frames{ 0 };
 	inline std::atomic<DWORD> g_render_thread_id{ 0 };
 	inline thread_local unsigned g_present_depth = 0;
+	inline thread_local unsigned g_platform_renderer_depth = 0;
 	inline std::recursive_mutex g_imgui_mutex;
 	inline std::mutex g_install_mutex;
 	inline std::mutex g_input_mutex;
 	inline std::deque<InputEvent> g_input_events;
+	inline std::vector<HWND> g_platform_windows;
+	inline bool g_platform_window_topology_logged = false;
+	inline ULONGLONG g_platform_message_warning_tick = 0;
 	inline std::array<bool, 5> g_wndproc_mouse_down{};
 	inline std::array<KeyboardButtonState, 256> g_physical_keyboard{};
 	inline std::array<KeyboardButtonState, 256> g_game_keyboard{};
@@ -192,6 +206,21 @@ namespace ModRenderHook {
 	inline constexpr std::uint32_t kMaxGraphicsProbeAttempts = 120;
 	inline DxgiVTableTargets g_cached_dxgi_targets{};
 	inline bool g_dxgi_targets_discovered = false;
+
+	struct PlatformRendererCallbacks {
+		void (*create_window)(ImGuiViewport*) = nullptr;
+		void (*destroy_window)(ImGuiViewport*) = nullptr;
+		void (*set_window_size)(ImGuiViewport*, ImVec2) = nullptr;
+		void (*render_window)(ImGuiViewport*, void*) = nullptr;
+		void (*swap_buffers)(ImGuiViewport*, void*) = nullptr;
+		bool installed = false;
+	};
+	inline PlatformRendererCallbacks g_platform_renderer_callbacks{};
+
+	struct PlatformRendererGuard {
+		PlatformRendererGuard() { ++g_platform_renderer_depth; }
+		~PlatformRendererGuard() { --g_platform_renderer_depth; }
+	};
 
 	struct InputRelay {
 		UINT message{};
@@ -357,6 +386,126 @@ namespace ModRenderHook {
 		if (left_identity) left_identity->Release();
 		if (right_identity) right_identity->Release();
 		return same;
+	}
+
+	inline bool is_active_game_swap_chain(IDXGISwapChain* swap_chain) {
+		return swap_chain && g_active_swap_chain &&
+			(swap_chain == g_active_swap_chain || same_com_identity(swap_chain, g_active_swap_chain));
+	}
+
+	inline void platform_renderer_create_window(ImGuiViewport* viewport) {
+		PlatformRendererGuard guard{};
+		if (g_platform_renderer_callbacks.create_window)
+			g_platform_renderer_callbacks.create_window(viewport);
+	}
+
+	inline void platform_renderer_destroy_window(ImGuiViewport* viewport) {
+		PlatformRendererGuard guard{};
+		if (g_platform_renderer_callbacks.destroy_window)
+			g_platform_renderer_callbacks.destroy_window(viewport);
+	}
+
+	inline void platform_renderer_set_window_size(ImGuiViewport* viewport, ImVec2 size) {
+		PlatformRendererGuard guard{};
+		if (g_platform_renderer_callbacks.set_window_size)
+			g_platform_renderer_callbacks.set_window_size(viewport, size);
+	}
+
+	inline void platform_renderer_render_window(ImGuiViewport* viewport, void* render_arg) {
+		PlatformRendererGuard guard{};
+		if (g_platform_renderer_callbacks.render_window)
+			g_platform_renderer_callbacks.render_window(viewport, render_arg);
+	}
+
+	inline void platform_renderer_swap_buffers(ImGuiViewport* viewport, void* render_arg) {
+		PlatformRendererGuard guard{};
+		if (g_platform_renderer_callbacks.swap_buffers)
+			g_platform_renderer_callbacks.swap_buffers(viewport, render_arg);
+	}
+
+	inline bool install_platform_renderer_isolation() {
+		if ((ImGui::GetIO().ConfigFlags & ImGuiConfigFlags_ViewportsEnable) == 0)
+			return true;
+		ImGuiPlatformIO& platform = ImGui::GetPlatformIO();
+		if (!platform.Renderer_CreateWindow || !platform.Renderer_DestroyWindow ||
+			!platform.Renderer_SetWindowSize || !platform.Renderer_RenderWindow ||
+			!platform.Renderer_SwapBuffers) {
+			log("ImGui renderer did not expose a complete multi-viewport callback set.");
+			return false;
+		}
+		g_platform_renderer_callbacks = {
+			platform.Renderer_CreateWindow,
+			platform.Renderer_DestroyWindow,
+			platform.Renderer_SetWindowSize,
+			platform.Renderer_RenderWindow,
+			platform.Renderer_SwapBuffers,
+			true,
+		};
+		platform.Renderer_CreateWindow = &platform_renderer_create_window;
+		platform.Renderer_DestroyWindow = &platform_renderer_destroy_window;
+		platform.Renderer_SetWindowSize = &platform_renderer_set_window_size;
+		platform.Renderer_RenderWindow = &platform_renderer_render_window;
+		platform.Renderer_SwapBuffers = &platform_renderer_swap_buffers;
+		return true;
+	}
+
+	inline void collect_platform_windows() {
+		g_platform_windows.clear();
+		const ImGuiPlatformIO& platform = ImGui::GetPlatformIO();
+		if (platform.Viewports.Size > 1)
+			g_platform_windows.reserve(static_cast<std::size_t>(platform.Viewports.Size - 1));
+		for (int index = 1; index < platform.Viewports.Size; ++index) {
+			const ImGuiViewport* viewport = platform.Viewports[index];
+			if (!viewport)
+				continue;
+			const auto window = static_cast<HWND>(
+				viewport->PlatformHandleRaw ? viewport->PlatformHandleRaw : viewport->PlatformHandle);
+			if (window)
+				g_platform_windows.push_back(window);
+		}
+	}
+
+	inline void pump_platform_window_messages() {
+		collect_platform_windows();
+		const WindowMessagePumpResult result = pump_owned_window_messages(g_platform_windows);
+		const ULONGLONG now = GetTickCount64();
+		if ((result.foreign_thread_windows != 0 || result.backlog_remaining) &&
+			now - g_platform_message_warning_tick >= 2000) {
+			char text[192]{};
+			std::snprintf(
+				text,
+				sizeof(text),
+				"Detached viewport message pressure: foreign-thread windows=%u backlog=%s.",
+				result.foreign_thread_windows,
+				result.backlog_remaining ? "yes" : "no");
+			log(text);
+			g_platform_message_warning_tick = now;
+		}
+	}
+
+	inline void validate_platform_window_topology() {
+		if (g_platform_window_topology_logged)
+			return;
+		collect_platform_windows();
+		if (g_platform_windows.empty())
+			return;
+
+		const HWND window = g_platform_windows.front();
+		const HWND owner = GetWindow(window, GW_OWNER);
+		const DWORD window_thread = GetWindowThreadProcessId(window, nullptr);
+		const DWORD render_thread = GetCurrentThreadId();
+		char text[256]{};
+		std::snprintf(
+			text,
+			sizeof(text),
+			"Detached viewport topology: hwnd=%p owner=%p windowThread=%lu renderThread=%lu isolated=%s.",
+			static_cast<void*>(window),
+			static_cast<void*>(owner),
+			static_cast<unsigned long>(window_thread),
+			static_cast<unsigned long>(render_thread),
+			!owner && window_thread == render_thread ? "yes" : "no");
+		log(text);
+		g_platform_window_topology_logged = true;
 	}
 
 	inline bool executable(const void* ptr) {
@@ -816,13 +965,27 @@ namespace ModRenderHook {
 		queue_input_event(event);
 	}
 
-	inline void queue_mouse_position(HWND hwnd, LONG x, LONG y) {
+	inline void log_cursor_error(const char* operation);
+
+	inline void queue_mouse_screen_position(HWND hwnd, LONG x, LONG y) {
 		InputEvent event{};
 		event.kind = InputEventKind::mouse_position;
 		event.hwnd = hwnd;
 		event.x = static_cast<float>(x);
 		event.y = static_cast<float>(y);
 		queue_input_event(event);
+	}
+
+	inline bool queue_mouse_client_position(HWND hwnd, LONG x, LONG y) {
+		POINT screen{ x, y };
+		if (!client_mouse_to_desktop(hwnd, &screen)) {
+			log_cursor_error("ClientToScreen(mouse)");
+			return false;
+		}
+		g_virtual_mouse_position = screen;
+		g_virtual_mouse_position_valid = true;
+		queue_mouse_screen_position(hwnd, screen.x, screen.y);
+		return true;
 	}
 
 	inline void queue_mouse_button(HWND hwnd, int button, bool down) {
@@ -847,10 +1010,10 @@ namespace ModRenderHook {
 			return;
 
 		POINT position{};
-		if (GetCursorPos(&position) && ScreenToClient(hwnd, &position)) {
+		if (GetCursorPos(&position)) {
 			g_virtual_mouse_position = position;
 			g_virtual_mouse_position_valid = true;
-			queue_mouse_position(hwnd, position.x, position.y);
+			queue_mouse_screen_position(hwnd, position.x, position.y);
 		}
 
 		static constexpr int virtual_keys[5] = {
@@ -893,7 +1056,26 @@ namespace ModRenderHook {
 		for (const InputEvent& event : events) {
 			switch (event.kind) {
 			case InputEventKind::mouse_position:
-				io.AddMousePosEvent(event.x, event.y);
+				if (event.x <= -std::numeric_limits<float>::max() ||
+					event.y <= -std::numeric_limits<float>::max()) {
+					io.AddMousePosEvent(event.x, event.y);
+					break;
+				}
+				if ((io.ConfigFlags & ImGuiConfigFlags_ViewportsEnable) != 0) {
+					io.AddMousePosEvent(event.x, event.y);
+					break;
+				}
+				{
+					POINT client{
+						static_cast<LONG>(std::lround(event.x)),
+						static_cast<LONG>(std::lround(event.y))};
+					if (desktop_mouse_to_imgui(event.hwnd, false, &client))
+						io.AddMousePosEvent(
+							static_cast<float>(client.x),
+							static_cast<float>(client.y));
+					else
+						log_cursor_error("ScreenToClient(mouse event)");
+				}
 				break;
 			case InputEventKind::mouse_button:
 				if (event.button >= 0 && event.button < 5)
@@ -978,13 +1160,13 @@ namespace ModRenderHook {
 				g_native_cursor_owned.store(true, std::memory_order_release);
 			}
 			POINT position{};
-			if (GetCursorPos(&position) && ScreenToClient(hwnd, &position)) {
+			if (GetCursorPos(&position)) {
 				g_virtual_mouse_position = position;
 				g_virtual_mouse_position_valid = true;
-				queue_mouse_position(hwnd, position.x, position.y);
+				queue_mouse_screen_position(hwnd, position.x, position.y);
 			}
 			else {
-				log_cursor_error("GetCursorPos/ScreenToClient(menu open)");
+				log_cursor_error("GetCursorPos(menu open)");
 				g_virtual_mouse_position_valid = false;
 			}
 			g_raw_mouse_seen = false;
@@ -1124,6 +1306,7 @@ namespace ModRenderHook {
 			if (g_backend == GraphicsBackend::dx11) ImGui_ImplDX11_Shutdown();
 			if (g_backend == GraphicsBackend::dx12) ImGui_ImplDX12_Shutdown();
 			if (g_backend == GraphicsBackend::opengl) ImGui_ImplOpenGL3_Shutdown();
+			g_platform_renderer_callbacks = {};
 			ImGui_ImplWin32_Shutdown();
 			ImGui::DestroyContext();
 			g_imgui_ready = false;
@@ -1138,6 +1321,9 @@ namespace ModRenderHook {
 		g_menu_input_applied.store(-1, std::memory_order_release);
 		g_native_cursor_requested.store(-1, std::memory_order_release);
 		g_native_cursor_applied.store(-1, std::memory_order_release);
+		g_platform_windows.clear();
+		g_platform_window_topology_logged = false;
+		g_platform_message_warning_tick = 0;
 		if (g_active_swap_chain) { g_active_swap_chain->Release(); g_active_swap_chain = nullptr; }
 		release_device_objects();
 		release_dx12_objects();
@@ -1183,14 +1369,6 @@ namespace ModRenderHook {
 			return false;
 		}
 
-		RECT client{};
-		if (!GetClientRect(hwnd, &client)) {
-			log_cursor_error("GetClientRect(raw mouse)");
-			return false;
-		}
-		if (client.right <= client.left || client.bottom <= client.top)
-			return false;
-
 		const RAWMOUSE& mouse = input.data.mouse;
 		g_raw_mouse_seen = true;
 		if ((mouse.usFlags & MOUSE_MOVE_ABSOLUTE) != 0) {
@@ -1199,27 +1377,34 @@ namespace ModRenderHook {
 			const int origin_y = virtual_desktop ? GetSystemMetrics(SM_YVIRTUALSCREEN) : 0;
 			const int width = GetSystemMetrics(virtual_desktop ? SM_CXVIRTUALSCREEN : SM_CXSCREEN);
 			const int height = GetSystemMetrics(virtual_desktop ? SM_CYVIRTUALSCREEN : SM_CYSCREEN);
-			POINT screen{ origin_x + MulDiv(mouse.lLastX, width, 65535),
-						 origin_y + MulDiv(mouse.lLastY, height, 65535) };
-			if (!ScreenToClient(hwnd, &screen)) {
-				log_cursor_error("ScreenToClient(raw mouse)");
-				return false;
-			}
-			g_virtual_mouse_position = screen;
+			g_virtual_mouse_position = {
+				origin_x + MulDiv(mouse.lLastX, width, 65535),
+				origin_y + MulDiv(mouse.lLastY, height, 65535)};
 		}
 		else {
 			if (!g_virtual_mouse_position_valid) {
-				g_virtual_mouse_position.x = (client.right - client.left) / 2;
-				g_virtual_mouse_position.y = (client.bottom - client.top) / 2;
+				if (!GetCursorPos(&g_virtual_mouse_position)) {
+					log_cursor_error("GetCursorPos(raw mouse)");
+					return false;
+				}
 			}
 			g_virtual_mouse_position.x += mouse.lLastX;
 			g_virtual_mouse_position.y += mouse.lLastY;
 		}
 
-		g_virtual_mouse_position.x = (std::clamp)(g_virtual_mouse_position.x, client.left, client.right - 1);
-		g_virtual_mouse_position.y = (std::clamp)(g_virtual_mouse_position.y, client.top, client.bottom - 1);
+		const LONG virtual_left = GetSystemMetrics(SM_XVIRTUALSCREEN);
+		const LONG virtual_top = GetSystemMetrics(SM_YVIRTUALSCREEN);
+		const LONG virtual_width = GetSystemMetrics(SM_CXVIRTUALSCREEN);
+		const LONG virtual_height = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+		if (virtual_width > 0 && virtual_height > 0) {
+			g_virtual_mouse_position.x = (std::clamp)(
+				g_virtual_mouse_position.x, virtual_left, virtual_left + virtual_width - 1);
+			g_virtual_mouse_position.y = (std::clamp)(
+				g_virtual_mouse_position.y, virtual_top, virtual_top + virtual_height - 1);
+		}
 		g_virtual_mouse_position_valid = true;
-		queue_mouse_position(hwnd, g_virtual_mouse_position.x, g_virtual_mouse_position.y);
+		queue_mouse_screen_position(
+			hwnd, g_virtual_mouse_position.x, g_virtual_mouse_position.y);
 
 		const USHORT buttons = mouse.usButtonFlags;
 		if ((buttons & RI_MOUSE_LEFT_BUTTON_DOWN) != 0) queue_mouse_button(hwnd, 0, true);
@@ -1299,17 +1484,26 @@ namespace ModRenderHook {
 		}
 
 		if (message == WM_KILLFOCUS || message == WM_CANCELMODE) {
-			clear_window_mouse_buttons(hwnd, true);
-			if (message == WM_KILLFOCUS)
-				clear_tracked_input();
-			InputEvent focus{};
-			focus.kind = InputEventKind::focus;
-			focus.hwnd = hwnd;
-			focus.state = false;
-			queue_input_event(focus);
+			const HWND focus_destination = message == WM_KILLFOCUS
+				? reinterpret_cast<HWND>(wparam)
+				: GetForegroundWindow();
+			const bool internal_viewport_transfer =
+				is_imgui_platform_window(focus_destination);
+			if (!internal_viewport_transfer) {
+				clear_window_mouse_buttons(hwnd, true);
+				if (message == WM_KILLFOCUS)
+					clear_tracked_input();
+				InputEvent focus{};
+				focus.kind = InputEventKind::focus;
+				focus.hwnd = hwnd;
+				focus.state = false;
+				queue_input_event(focus);
+			}
 		}
 		else if (message == WM_CAPTURECHANGED) {
-			if (any_window_mouse_button_down())
+			const HWND capture_destination = reinterpret_cast<HWND>(lparam);
+			if (!is_imgui_platform_window(capture_destination) &&
+				any_window_mouse_button_down())
 				clear_window_mouse_buttons(hwnd, false);
 		}
 		else if (message == WM_SETFOCUS) {
@@ -1344,9 +1538,8 @@ namespace ModRenderHook {
 		}
 		else if (message == WM_MOUSEMOVE && visible) {
 			if (g_cursor_lease.load(std::memory_order_acquire) || !g_raw_mouse_seen) {
-				g_virtual_mouse_position = { GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam) };
-				g_virtual_mouse_position_valid = true;
-				queue_mouse_position(hwnd, g_virtual_mouse_position.x, g_virtual_mouse_position.y);
+				queue_mouse_client_position(
+					hwnd, GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam));
 			}
 			consumed = wants_mouse || any_window_mouse_button_down();
 		}
@@ -1458,7 +1651,11 @@ namespace ModRenderHook {
 		ImGui::CreateContext();
 		ImGuiIO& io = ImGui::GetIO();
 		io.ConfigFlags |= ImGuiConfigFlags_NoMouseCursorChange;
-		io.ConfigFlags |= ImGuiConfigFlags_DockingEnable;
+		io.ConfigFlags |= ImGuiConfigFlags_DockingEnable | ImGuiConfigFlags_ViewportsEnable;
+		// Unity presents on a render thread while the game HWND belongs to its
+		// main/message thread. Making detached viewports owned by that HWND forms
+		// a cross-thread SendMessage cycle inside DXGI during monitor changes.
+		io.ConfigViewportsNoDefaultParent = true;
 		log_render_target_diagnostics(desc.BufferDesc.Format);
 		apply_swap_chain_color_space(desc.BufferDesc.Format);
 		ModUI::initialize_style();
@@ -1477,10 +1674,40 @@ namespace ModRenderHook {
 			release_device_objects();
 			return false;
 		}
+		const auto viewport_swap_chain = make_dx11_viewport_swap_chain_config(desc);
+		if (!viewport_swap_chain) {
+			log("DX11 game swap-chain descriptor cannot be adapted safely for detached ImGui viewports.");
+			ImGui_ImplDX11_Shutdown();
+			ImGui_ImplWin32_Shutdown();
+			ImGui::DestroyContext();
+			release_device_objects();
+			return false;
+		}
+		ImGui_ImplDX11_SetSwapChainDescs(&viewport_swap_chain->descriptor, 1);
+		{
+			char text[224]{};
+			std::snprintf(
+				text,
+				sizeof(text),
+				"DX11 detached viewports configured from game swap chain: effect=%s buffers=%u format=%u.",
+				dxgi_swap_effect_name(viewport_swap_chain->descriptor.SwapEffect),
+				viewport_swap_chain->descriptor.BufferCount,
+				static_cast<unsigned>(viewport_swap_chain->descriptor.BufferDesc.Format));
+			log(text);
+		}
+		if (!install_platform_renderer_isolation()) {
+			log("DX11 multi-monitor callback isolation failed; UI disabled to avoid an unsafe render path.");
+			ImGui_ImplDX11_Shutdown();
+			ImGui_ImplWin32_Shutdown();
+			ImGui::DestroyContext();
+			release_device_objects();
+			return false;
+		}
 
 		if (!install_window_message_handler()) {
 			log("Window-message handler installation failed; UI disabled.");
 			ImGui_ImplDX11_Shutdown();
+			g_platform_renderer_callbacks = {};
 			ImGui_ImplWin32_Shutdown();
 			ImGui::DestroyContext();
 			release_device_objects();
@@ -1494,7 +1721,7 @@ namespace ModRenderHook {
 		g_imgui_ready = true;
 		sync_menu_state();
 		log_font_diagnostics("DX11 ImGui", "linear");
-		log("DX11 ImGui initialized with docking support.");
+		log("DX11 ImGui initialized with docking and multi-monitor viewport support.");
 		return true;
 	}
 
@@ -1596,7 +1823,9 @@ namespace ModRenderHook {
 		IMGUI_CHECKVERSION();
 		ImGui::CreateContext();
 		ImGuiIO& io = ImGui::GetIO();
-		io.ConfigFlags |= ImGuiConfigFlags_NoMouseCursorChange | ImGuiConfigFlags_DockingEnable;
+		io.ConfigFlags |= ImGuiConfigFlags_NoMouseCursorChange | ImGuiConfigFlags_DockingEnable |
+			ImGuiConfigFlags_ViewportsEnable;
+		io.ConfigViewportsNoDefaultParent = true;
 		ModUI::initialize_style();
 		ImGui_ImplDX12_InitInfo dx12_init_info{};
 		dx12_init_info.Device = g_dx12_device;
@@ -1613,9 +1842,16 @@ namespace ModRenderHook {
 			release_dx12_objects();
 			return false;
 		}
+		if (!install_platform_renderer_isolation()) {
+			log("DX12 multi-monitor callback isolation failed; UI disabled to avoid an unsafe render path.");
+			ImGui_ImplDX12_Shutdown(); ImGui_ImplWin32_Shutdown(); ImGui::DestroyContext();
+			release_dx12_objects(); g_hwnd = nullptr;
+			return false;
+		}
 		if (!install_window_message_handler()) {
 			log("Window-message handler installation failed; UI disabled.");
-			ImGui_ImplDX12_Shutdown(); ImGui_ImplWin32_Shutdown(); ImGui::DestroyContext();
+			ImGui_ImplDX12_Shutdown(); g_platform_renderer_callbacks = {};
+			ImGui_ImplWin32_Shutdown(); ImGui::DestroyContext();
 			release_dx12_objects(); g_hwnd = nullptr;
 			return false;
 		}
@@ -1625,7 +1861,7 @@ namespace ModRenderHook {
 		g_imgui_ready = true;
 		sync_menu_state();
 		log_font_diagnostics("DX12 ImGui", "linear");
-		log("DX12 ImGui initialized with docking support.");
+		log("DX12 ImGui initialized with docking and multi-monitor viewport support.");
 		return true;
 	}
 
@@ -1636,6 +1872,26 @@ namespace ModRenderHook {
 			reinterpret_cast<void**>(&dx11_device))) && dx11_device;
 		if (dx11_device) dx11_device->Release();
 		return is_dx11 ? init_dx11_imgui(swap_chain) : init_dx12_imgui(swap_chain);
+	}
+
+	inline void render_platform_windows() {
+		if ((ImGui::GetIO().ConfigFlags & ImGuiConfigFlags_ViewportsEnable) == 0)
+			return;
+		PlatformRendererGuard platform_guard{};
+		ImGui::UpdatePlatformWindows();
+		// A newly-created detached workspace receives its first non-client and
+		// cursor messages during UpdatePlatformWindows(). Dispatch them now rather
+		// than making the user's first drag wait for the following Present frame.
+		pump_platform_window_messages();
+		validate_platform_window_topology();
+		ImGui::RenderPlatformWindowsDefault();
+		// imgui_impl_dx11 binds the secondary viewport's render target before
+		// drawing it. Its state backup correctly restores shaders and viewport,
+		// but that backup intentionally sees the secondary RTV as current. This
+		// injected overlay must restore the game's primary RTV before returning to
+		// the original Present path.
+		if (g_backend == GraphicsBackend::dx11 && g_context && g_render_target)
+			g_context->OMSetRenderTargets(1, &g_render_target, nullptr);
 	}
 
 	inline void render_dx12_frame(IDXGISwapChain* swap_chain) {
@@ -1683,6 +1939,7 @@ namespace ModRenderHook {
 		frame.fence_value = g_dx12_next_fence_value++;
 		if (FAILED(g_dx12_command_queue->Signal(g_dx12_fence, frame.fence_value)))
 			log("DX12 fence signal failed; UI frame synchronization is unavailable.");
+		render_platform_windows();
 	}
 
 	inline void render_frame(IDXGISwapChain* swap_chain) {
@@ -1691,6 +1948,8 @@ namespace ModRenderHook {
 		std::lock_guard<std::recursive_mutex> lock(g_imgui_mutex);
 		if (g_shutting_down.load(std::memory_order_acquire)) return;
 		if (!init_imgui(swap_chain)) return;
+		if (g_backend == GraphicsBackend::dx11 || g_backend == GraphicsBackend::dx12)
+			pump_platform_window_messages();
 		if (g_backend == GraphicsBackend::dx12) {
 			apply_pending_menu_toggle();
 			sync_menu_state();
@@ -1717,9 +1976,12 @@ namespace ModRenderHook {
 
 		g_context->OMSetRenderTargets(1, &g_render_target, nullptr);
 		ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
+		render_platform_windows();
 	}
 
 	inline HRESULT __stdcall detour_present(IDXGISwapChain* swap_chain, UINT sync_interval, UINT flags) {
+		if (g_platform_renderer_depth != 0)
+			return g_present ? g_present(swap_chain, sync_interval, flags) : DXGI_ERROR_INVALID_CALL;
 		struct ScopedPresentDepth {
 			unsigned* depth = nullptr;
 			explicit ScopedPresentDepth(unsigned* value) : depth(value) {
@@ -1737,6 +1999,10 @@ namespace ModRenderHook {
 		if (depth_guard.reentrant()) {
 			return g_present ? g_present(swap_chain, sync_interval, flags) : DXGI_ERROR_INVALID_CALL;
 		}
+		// ImGui viewports own secondary DXGI swap chains. They must never become
+		// Explorer's primary render target or start a second Explorer frame.
+		if (g_imgui_ready && !is_active_game_swap_chain(swap_chain))
+			return g_present ? g_present(swap_chain, sync_interval, flags) : DXGI_ERROR_INVALID_CALL;
 
 		render_frame(swap_chain);
 		return g_present ? g_present(swap_chain, sync_interval, flags) : DXGI_ERROR_INVALID_CALL;
@@ -1744,6 +2010,8 @@ namespace ModRenderHook {
 
 	inline HRESULT __stdcall detour_present1(IDXGISwapChain1* swap_chain, UINT sync_interval, UINT flags,
 		const DXGI_PRESENT_PARAMETERS* parameters) {
+		if (g_platform_renderer_depth != 0)
+			return g_present1 ? g_present1(swap_chain, sync_interval, flags, parameters) : DXGI_ERROR_INVALID_CALL;
 		struct ScopedPresentDepth {
 			unsigned* depth = nullptr;
 			explicit ScopedPresentDepth(unsigned* value) : depth(value) {
@@ -1761,6 +2029,8 @@ namespace ModRenderHook {
 		if (depth_guard.reentrant()) {
 			return g_present1 ? g_present1(swap_chain, sync_interval, flags, parameters) : DXGI_ERROR_INVALID_CALL;
 		}
+		if (g_imgui_ready && !is_active_game_swap_chain(swap_chain))
+			return g_present1 ? g_present1(swap_chain, sync_interval, flags, parameters) : DXGI_ERROR_INVALID_CALL;
 
 		render_frame(swap_chain);
 		return g_present1 ? g_present1(swap_chain, sync_interval, flags, parameters) : DXGI_ERROR_INVALID_CALL;
@@ -1769,7 +2039,19 @@ namespace ModRenderHook {
 	inline HRESULT __stdcall detour_resize_buffers(IDXGISwapChain* swap_chain, UINT buffer_count,
 		UINT width, UINT height, DXGI_FORMAT format,
 		UINT flags) {
+		if (g_platform_renderer_depth != 0) {
+			return g_resize_buffers
+				? g_resize_buffers(swap_chain, buffer_count, width, height, format, flags)
+				: DXGI_ERROR_INVALID_CALL;
+		}
 		std::lock_guard<std::recursive_mutex> lock(g_imgui_mutex);
+		// A platform viewport may resize while it is dragged to another monitor.
+		// Its buffers are owned by imgui_impl_dx11/dx12, not by this overlay.
+		if (g_imgui_ready && !is_active_game_swap_chain(swap_chain)) {
+			return g_resize_buffers
+				? g_resize_buffers(swap_chain, buffer_count, width, height, format, flags)
+				: DXGI_ERROR_INVALID_CALL;
+		}
 		if (g_shutting_down.load(std::memory_order_acquire)) {
 			return g_resize_buffers
 				? g_resize_buffers(swap_chain, buffer_count, width, height, format, flags)
@@ -1813,6 +2095,11 @@ namespace ModRenderHook {
 
 	inline void __stdcall detour_execute_command_lists(ID3D12CommandQueue* command_queue, UINT count,
 		ID3D12CommandList* const* command_lists) {
+		if (g_platform_renderer_depth != 0) {
+			if (g_execute_command_lists)
+				g_execute_command_lists(command_queue, count, command_lists);
+			return;
+		}
 		if (command_queue && command_queue->GetDesc().Type == D3D12_COMMAND_LIST_TYPE_DIRECT && !g_dx12_command_queue) {
 			std::lock_guard<std::recursive_mutex> lock(g_imgui_mutex);
 			if (!g_dx12_command_queue) {

@@ -1,140 +1,179 @@
 # UnityRuntimeExplorer
 
-UnityRuntimeExplorer is a small runtime inspector for Unity games. It runs
-inside a game through [URKit](https://github.com/Jadis0x/URKit) and gives you a
-live view of the game's scenes, GameObjects, components, fields, properties,
-and methods.
+UnityRuntimeExplorer is a live runtime inspection and exploration tool for
+Windows Unity games.
 
-![UnityRuntimeExplorer showcase](showcase/ss1.png)
-![UnityRuntimeExplorer showcase](showcase/ss2.png)
+Its purpose is to expose the running game's scene hierarchy, GameObjects,
+components, managed fields, properties, methods, references, and runtime
+values in one place. It is intended for understanding and testing a game's
+live state without rebuilding the game or writing a separate one-off inspector
+for each project.
 
-The project is still early. The current release remains focused on **Windows
-x64 IL2CPP games**, while the source tree and build targets are separated for
-IL2CPP and Mono. The Mono target requires the matching URKit Mono v9 runtime
-API surface before it can be used in a game.
+It is built with the [URKit](https://github.com/Jadis0x/URKit) native C++ SDK,
+which generates the project and provides the Unity runtime services, hooks,
+main-thread access, and ImGui integration used by the Explorer. It supports
+both IL2CPP and Mono builds through separate DLLs.
 
-## Why this exists
+![UnityRuntimeExplorer](showcase/ss1.png)
 
-Most Unity runtime tools either focus on one game or make you work with a
-large amount of game-specific setup. The goal here is to have a small,
-reusable explorer that can be loaded by URKit and used to understand what a
-Unity game is doing while it is running.
+![UnityRuntimeExplorer](showcase/ss2.png)
 
-It is useful for exploring scenes, checking component data, testing small
-runtime changes, and debugging game-specific behavior. It is not intended to
-be a complete modding framework.
+## Project purpose
 
-## Current features
+UnityRuntimeExplorer gives a Unity game a general-purpose runtime workspace:
+
+- inspect what is currently loaded in the scene;
+- understand how objects and components are connected;
+- read and edit supported managed values while the game is running;
+- invoke methods and trace their calls, arguments, and return values;
+- inspect runtime-specific data through the metadata exposed by IL2CPP or Mono.
+
+It is meant to be a reusable base for exploring different Unity games, not a
+game-specific mod menu or a complete modding framework.
+
+## What it can do
 
 - Browse loaded scenes, hidden roots, and `DontDestroyOnLoad` objects.
-- Search for GameObjects and inspect their components.
-- Select, duplicate, delete, enable, and disable GameObjects.
-- Edit supported Transform values and other supported fields and properties.
-- Add components where the target runtime allows it.
-- Inspect methods and invoke signatures that can be handled safely.
-- Follow references to other GameObjects from the inspector.
-- Focus the game camera on a selected object and restore the previous camera
-  position.
-- Highlight selected objects in the game and show useful camera/distance
-  information.
-- Trace a selected native IL2CPP method with a limited call history.
-- Use a dockable ImGui interface with DX11, DX12, and OpenGL backends.
+- Search GameObjects by name, tag, or instance ID.
+- Inspect GameObjects, components, fields, properties, and methods.
+- Edit supported values at runtime.
+- Copy and paste local transforms from the Inspector or the Hierarchy context
+  menu.
+- Duplicate, delete, enable, disable, and add components when the target game
+  allows it.
+- Follow managed object references and open returned objects in the Object
+  Inspector.
+- Invoke methods with supported signatures.
+- Trace managed methods and inspect callers, arguments, return values, raw ABI
+  data, and captured value types.
+- Focus the camera on an object and highlight it in the game.
+- Use a dockable ImGui interface with DX11, DX12, and OpenGL render paths.
 
-The inspector deliberately refuses to guess when an IL2CPP type or method
-signature is too runtime-specific to handle safely. In those cases it shows
-the available metadata instead of attempting an unsafe read, write, or call.
+The important part is that the Explorer uses the runtime metadata available in
+the game. It does not pretend that every game has the same classes, layouts, or
+Mono/IL2CPP behavior. If a type is not safe to read or write, the UI keeps the
+metadata visible and reports the limitation instead of silently guessing.
 
-## Requirements
+## How it works
 
-- Windows 10 or later, 64-bit.
-- A Unity game built with IL2CPP.
-- [URKit v0.1.1 or later](https://github.com/Jadis0x/URKit).
-- Either the normal URKit proxy workflow or the optional `URKitInjector.dll`
-  workflow.
+UnityRuntimeExplorer is a generated URKit mod project built on top of the URKit
+SDK. The SDK supplies the common Mono/IL2CPP runtime layer, Unity wrappers,
+hooks, main-thread callbacks, and ImGui support that the Explorer uses.
 
-UnityRuntimeExplorer is a URKit loader plugin; it is not a standalone DLL and
-must not be injected directly into the game. A matching proxy is required only
-when using URKit's normal proxy/`Mods`-folder workflow. With `URKitInjector.dll`,
-URKit can load the plugin externally without a proxy or a `Mods` folder. This
-project currently supports IL2CPP games only.
+URKit also provides the loader workflows used to run the generated mod: the
+normal proxy/`Mods` setup and the optional `URKitInjector.dll` external loader.
+The Explorer DLL is the generated mod itself; it is not a separate injector.
+
+There are two plugins:
+
+```text
+URK_Il2cpp_UnityRuntimeExplorer.dll
+URK_Mono_UnityRuntimeExplorer.dll
+```
+
+Use the one that matches the game. The Explorer then talks to the appropriate
+IL2CPP or Mono runtime layer while sharing the same Inspector and UI code.
 
 ## Installation
 
-Install URKit first. Choose one of the two supported loading workflows below.
+Install [URKit](https://github.com/Jadis0x/URKit) first. The current proxy,
+`Mods`, injector, and compatibility details are documented in the URKit
+repository. Then choose the matching workflow below for the generated Explorer
+mod.
 
-Recommended `Mods`-folder workflow:
+### Mods folder / proxy workflow
 
-1. Create a `Mods` folder next to the game's executable.
-2. Place exactly one matching URKit proxy next to the game's executable. The
-   proxy filename must be one that the game's executable imports; do not rename
-   it or place all proxy variants in the folder.
-3. Copy `URK_Il2cpp_UnityRuntimeExplorer.dll` into the game's `Mods` folder.
-4. Start the game through the normal URKit-supported launch path.
-5. Press **F7** to open or close the Explorer menu.
+1. Create a `Mods` folder next to the game executable.
+2. Put the correct URKit proxy next to the executable. Keep the original proxy
+   filename; do not copy every proxy variant.
+3. Put exactly one Explorer DLL in `Mods`:
 
-Optional proxy-free injector workflow:
+   ```text
+   URK_Il2cpp_UnityRuntimeExplorer.dll   # IL2CPP game
+   URK_Mono_UnityRuntimeExplorer.dll     # Mono game
+   ```
+
+4. Start the game through the normal URKit launch path.
+5. Press **F7** to open or close the Explorer.
+
+### Injector workflow
+
+The optional `URKitInjector.dll` workflow can load the generated mod without a proxy
+or a `Mods` folder:
 
 1. Inject `URKitInjector.dll` into the supported Windows x64 game.
-2. When prompted, select the URKit configuration `.ini` and
-   `URK_Il2cpp_UnityRuntimeExplorer.dll`.
-3. Do not inject `URK_Il2cpp_UnityRuntimeExplorer.dll` directly; it must be
-   loaded by URKitInjector as a URKit plugin.
+2. Select the URKit `.ini` file when prompted.
+3. Select the Explorer DLL matching the game's runtime.
 
-If nothing appears, check `URKit_logs.log` next to the game executable first.
-For the proxy workflow, verify the proxy filename and placement. For the
-injector workflow, verify the selected `.ini` and plugin DLL. The Explorer DLL
-alone cannot initialize itself in a Unity process.
+Do not inject the Explorer DLL directly. It must be loaded by URKit.
 
-## Building from source
+If nothing appears, check `URKit_logs.log` beside the game executable first.
+The log usually makes a wrong proxy name, wrong backend, or missing runtime API
+obvious.
 
-The project is built with CMake, Ninja, and Clang on Windows. ImGui is fetched
-from GitHub during the first configure, so the first build needs network
-access.
+## Building
 
-You will need:
+The project is built on Windows with CMake, Ninja, and Clang. The first configure
+fetches ImGui from GitHub, so network access is needed once.
 
-- CMake 3.28 or newer
+Requirements:
+
+- Windows 10 or newer, x64
+- CMake 3.28+
 - LLVM/Clang
 - Ninja
 
-From the repository root, run:
+From the repository root:
 
 ```powershell
 cmake --preset clang-release
 cmake --build --preset clang-release --parallel
 ```
 
-The build produces backend-specific plugins:
+The DLLs are written to:
 
 ```text
 out/build/clang-release/URK_Il2cpp_UnityRuntimeExplorer.dll
 out/build/clang-release/URK_Mono_UnityRuntimeExplorer.dll
 ```
 
-For a clean Release build:
+Run the test suite with:
 
 ```powershell
-Remove-Item -LiteralPath .\out\build\clang-release -Recurse -Force
-cmake --preset clang-release
-cmake --build --preset clang-release --parallel
+ctest --test-dir out/build/clang-release --output-on-failure
 ```
 
-## Limitations
+## A note about compatibility
 
-This is a runtime tool, so the result depends on the game, its Unity version,
-its IL2CPP metadata, and the URKit proxy being used. Calling methods or editing
-live objects can also make a game unstable. Use it with a game and save data
-you can afford to restart.
+This is a runtime tool, so compatibility depends on the game, its Unity
+version, its generated metadata, and the URKit runtime that loads the mod.
+The same method name can have a different ABI or different managed types in
+another game. This is why the Inspector resolves metadata at runtime instead
+of relying on a hardcoded list of game types.
 
-Mono runtime support is still incomplete at the loader/integration boundary.
-The Explorer now consumes a common managed-runtime interface, so backend work
-can continue without mixing Mono logic into the IL2CPP implementation.
+Tracing and live editing can make a game unstable. Use it on a game and save
+data that you can restart.
 
-## Roadmap
+Mono support also depends on the standard embedding exports shipped by the
+game. If a game removes an export required by an advanced feature, the Explorer
+reports that capability as unavailable.
 
-- Stabilize the IL2CPP inspection and invocation layer.
-- Add support for more Unity and game-specific type signatures.
-- Add Mono support after the IL2CPP foundation is ready.
-- Improve compatibility across Unity versions.
+## Project status
+
+This project is still evolving. The core scene/object Inspector is useful now,
+but there are many Unity versions, stripped runtimes, generated bridge types,
+and unusual value layouts to deal with. Compatibility reports, trace examples,
+and small reproducible cases are more useful than generic “doesn't work”
+reports.
+
+If you open an issue, include:
+
+- game runtime: IL2CPP or Mono
+- Unity version if known
+- the relevant part of `URKit_logs.log`
+- the method/type signature involved
+- what the Explorer showed and what you expected
+
+## License
 
 Copyright (c) 2026 Jadis0x. All rights reserved.
