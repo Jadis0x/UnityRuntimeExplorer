@@ -1,3 +1,6 @@
+[![Views](https://hits.sh/github.com/Jadis0x/UnityRuntimeExplorer.svg?style=flat-square&label=views&color=blue)](https://hits.sh/github.com/Jadis0x/UnityRuntimeExplorer/)
+[![Downloads](https://img.shields.io/github/downloads/Jadis0x/UnityRuntimeExplorer/total?style=flat-square&label=downloads&color=blue)](https://github.com/Jadis0x/UnityRuntimeExplorer/releases)
+
 # UnityRuntimeExplorer
 
 UnityRuntimeExplorer is a live runtime inspection and exploration tool for
