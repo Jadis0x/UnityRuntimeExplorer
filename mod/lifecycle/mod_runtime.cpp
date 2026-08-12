@@ -2,12 +2,14 @@
 #include "mod_runtime.h"
 
 #include "explorer/explorer_model.h"
+#include "mcp/mcp_bridge.h"
 #include "support/mod_log.h"
 
 #include "sdk/runtime_api.h"
 #include "sdk/runtime_bootstrap.h"
 #include "sdk/unity/unity.h"
 
+#include <string>
 #include <utility>
 
 #if defined(_WIN32)
@@ -50,6 +52,9 @@ bool start(const URK_ModContext* ctx) {
   }
 
   Explorer::RuntimeModel::instance().start();
+  std::string mcp_error;
+  if (!Explorer::Mcp::Bridge::start(mcp_error))
+    ModLog::error("MCP bridge startup failed: %s", mcp_error.c_str());
   ModLog::info("runtime ready: backend=%s main_thread=%s scene_events=%s",
                URK::compiled_runtime_name, URK::has_main_thread() ? "yes" : "no",
                URK::has_scene_events() ? "yes" : "no");
@@ -63,6 +68,7 @@ void update() {
   // update; RuntimeModel will discard stale reflection state next frame.
   __try {
     Explorer::RuntimeModel::instance().tick();
+    Explorer::Mcp::Bridge::tick(Explorer::RuntimeModel::instance());
   } __except (capture_runtime_fault(_exception_info())) {
     Explorer::RuntimeModel::instance().notify_native_fault(
         g_runtime_fault.code, g_runtime_fault.address, g_runtime_fault.instruction);
@@ -72,6 +78,7 @@ void update() {
   }
 #else
   Explorer::RuntimeModel::instance().tick();
+  Explorer::Mcp::Bridge::tick(Explorer::RuntimeModel::instance());
 #endif
 }
 
@@ -108,6 +115,7 @@ void on_object_destroy_requested(const URK_ObjectDestroyRequest* request) {
 }
 
 void stop() {
+  Explorer::Mcp::Bridge::stop();
   Explorer::RuntimeModel::instance().stop();
   ModLog::info("runtime stopped");
 }

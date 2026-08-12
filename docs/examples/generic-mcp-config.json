@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "unity-runtime-explorer": {
+      "type": "stdio",
+      "command": "C:\\absolute\\path\\to\\URK_UnityRuntimeExplorer_McpServer.exe",
+      "args": []
+    }
+  }
+}

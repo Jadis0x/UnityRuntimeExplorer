@@ -21,6 +21,8 @@
 
 namespace Explorer {
 
+namespace Mcp { class RuntimeTools; }
+
 class RuntimeModel {
   public:
     static RuntimeModel &instance();
@@ -37,6 +39,7 @@ class RuntimeModel {
     std::shared_ptr<const Snapshot> snapshot() const;
 
   private:
+    friend class Mcp::RuntimeTools;
     using Clock = std::chrono::steady_clock;
 
     void process_commands();

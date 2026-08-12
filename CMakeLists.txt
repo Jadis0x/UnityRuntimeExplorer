@@ -61,6 +61,11 @@ FetchContent_Declare(imgui
     GIT_TAG v1.92.2b-docking
 )
 FetchContent_MakeAvailable(imgui)
+FetchContent_Declare(nlohmann_json
+    GIT_REPOSITORY https://github.com/nlohmann/json.git
+    GIT_TAG v3.11.3
+)
+FetchContent_MakeAvailable(nlohmann_json)
 add_library(imgui STATIC
     ${imgui_SOURCE_DIR}/imgui.cpp
     ${imgui_SOURCE_DIR}/imgui_draw.cpp
@@ -104,6 +109,10 @@ set(URK_COMMON_SOURCES
         mod/explorer/watch_analysis.cpp
         mod/explorer/camera/camera_focus_controller.cpp
         mod/ui/highlight.cpp
+        mod/mcp/mcp_bridge.cpp
+        mod/mcp/mcp_runtime_tools.cpp
+        mcp/core/bridge_protocol.cpp
+        mcp/core/tool_catalog.cpp
 )
 
 set(URK_COMMON_HEADERS
@@ -157,6 +166,10 @@ set(URK_COMMON_HEADERS
         mod/support/mod_log.h
         mod/config/mod_config.h
         mod/config/user_settings.h
+        mod/mcp/mcp_bridge.h
+        mod/mcp/mcp_runtime_tools.h
+        mcp/core/bridge_protocol.h
+        mcp/core/tool_catalog.h
 )
 
 set(URK_IL2CPP_BACKEND_SOURCES
@@ -193,7 +206,7 @@ function(urk_add_explorer_target target_name backend_definition)
         NOMINMAX
         ${backend_definition}
     )
-    target_link_libraries(${target_name} PRIVATE imgui d3d11 d3d12 dxgi opengl32 ntdll)
+    target_link_libraries(${target_name} PRIVATE imgui nlohmann_json::nlohmann_json d3d11 d3d12 dxgi opengl32 ntdll advapi32 bcrypt)
     urk_enable_project_warnings(${target_name})
     if(MSVC)
         target_link_options(${target_name} PRIVATE
@@ -211,6 +224,24 @@ urk_add_explorer_target(
     ${URK_IL2CPP_BACKEND_SOURCES}
 )
 
+add_executable(URK_UnityRuntimeExplorer_McpServer
+    mcp/server/main.cpp
+    mcp/server/mcp_stdio_server.cpp
+    mcp/server/mcp_stdio_server.h
+    mcp/server/pipe_client.cpp
+    mcp/server/pipe_client.h
+    mcp/core/bridge_protocol.cpp
+    mcp/core/bridge_protocol.h
+    mcp/core/tool_catalog.cpp
+    mcp/core/tool_catalog.h
+)
+target_include_directories(URK_UnityRuntimeExplorer_McpServer PRIVATE .)
+target_compile_features(URK_UnityRuntimeExplorer_McpServer PRIVATE cxx_std_20)
+target_compile_definitions(URK_UnityRuntimeExplorer_McpServer PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+target_link_libraries(URK_UnityRuntimeExplorer_McpServer PRIVATE nlohmann_json::nlohmann_json)
+urk_enable_project_warnings(URK_UnityRuntimeExplorer_McpServer)
+urk_disable_vs_vcpkg_integration(URK_UnityRuntimeExplorer_McpServer)
+
 urk_add_explorer_target(
     URK_Mono_UnityRuntimeExplorer
     URK_BACKEND_MONO
@@ -225,6 +256,11 @@ if(URK_DEPLOY_DIR)
             COMMAND ${CMAKE_COMMAND} -E copy_if_different $<TARGET_FILE:${target_name}> "${URK_DEPLOY_DIR}"
         )
     endforeach()
+    add_custom_command(TARGET URK_UnityRuntimeExplorer_McpServer POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${URK_DEPLOY_DIR}"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                $<TARGET_FILE:URK_UnityRuntimeExplorer_McpServer> "${URK_DEPLOY_DIR}"
+    )
 endif()
 
 if(URK_BUILD_TESTS)
@@ -296,5 +332,18 @@ if(URK_BUILD_TESTS)
     endif()
     urk_disable_vs_vcpkg_integration(urk_win32_message_pump_tests)
     add_test(NAME win32_message_pump_contract COMMAND urk_win32_message_pump_tests)
+
+    add_executable(urk_mcp_core_tests
+        tests/mcp_core_tests.cpp
+        mcp/core/bridge_protocol.cpp
+        mcp/core/tool_catalog.cpp
+    )
+    target_include_directories(urk_mcp_core_tests PRIVATE .)
+    target_compile_features(urk_mcp_core_tests PRIVATE cxx_std_20)
+    target_compile_definitions(urk_mcp_core_tests PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_link_libraries(urk_mcp_core_tests PRIVATE nlohmann_json::nlohmann_json)
+    urk_enable_project_warnings(urk_mcp_core_tests)
+    urk_disable_vs_vcpkg_integration(urk_mcp_core_tests)
+    add_test(NAME mcp_core_contract COMMAND urk_mcp_core_tests)
 
 endif()
