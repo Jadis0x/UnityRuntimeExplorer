@@ -23,13 +23,6 @@ std::string& invocation_error_slot() {
     return value;
 }
 
-bool has_field(const URK_MonoApi* value, std::size_t end) {
-    return value && value->version >= URK_MONO_API_VERSION && value->size >= end;
-}
-
-#define URK_MONO_HAS(member) \
-    (has_field(value, offsetof(URK_MonoApi, member) + sizeof(value->member)) && value->member)
-
 bool same_type_name(const Type* type, const char* requested) {
     if (!type || !requested)
         return false;
@@ -690,5 +683,4 @@ std::int64_t gc_get_heap_size() {
     return available() ? native::gc_get_heap_size() : 0;
 }
 
-#undef URK_MONO_HAS
 } // namespace URK::mono

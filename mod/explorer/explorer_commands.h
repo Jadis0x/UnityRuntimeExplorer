@@ -64,6 +64,10 @@ enum class CommandKind {
     RefreshByteArrayInspection = 55,
     PasteLocalTransform = 56,
     CopyLocalTransform = 57,
+    ConfigureFieldWatch = 58,
+    ExportDiagnosticBundle = 59,
+    BuildReferenceGraph = 60,
+    ClearReferenceGraph = 61,
 };
 
 struct Command {
@@ -85,6 +89,8 @@ struct Command {
     bool class_browser_target = false;
     bool lock_value = false;
     bool unlock_value = false;
+    bool member_is_property = false;
+    bool class_is_unity_object = false;
     float float_value = 0.0f;
     URK::Unity::Vector3 vector_value{};
     URK::Unity::Vector3 vector_value_secondary{};

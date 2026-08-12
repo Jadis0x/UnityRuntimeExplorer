@@ -5,6 +5,7 @@
 #include "config/user_settings.h"
 #include "explorer_model.h"
 #include "method_trace_format.h"
+#include "reference_graph_ui.h"
 
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -20,6 +21,7 @@
 #include <bit>
 #include <cctype>
 #include <cmath>
+#include <cfloat>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -125,11 +127,22 @@ void open_external_url(const char *url) {
         ShellExecuteA(nullptr, "open", url, nullptr, nullptr, SW_SHOWNORMAL);
 }
 
-bool workspace_link_button(const char *label, const char *url, const ImVec4 &color) {
+bool workspace_button(const char *label, const ImVec4 &color, const ImVec4 &text_color = ImVec4(0.90f, 0.91f, 0.92f, 1.0f)) {
     ImGui::PushStyleColor(ImGuiCol_Button, color);
-    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(color.x + 0.08f, color.y + 0.08f, color.z + 0.08f, color.w));
+    ImGui::PushStyleColor(ImGuiCol_ButtonHovered,
+                          ImVec4(std::min(1.0f, color.x + 0.08f), std::min(1.0f, color.y + 0.08f),
+                                 std::min(1.0f, color.z + 0.08f), color.w));
+    ImGui::PushStyleColor(ImGuiCol_ButtonActive,
+                          ImVec4(color.x * 0.88f, color.y * 0.88f, color.z * 0.88f, color.w));
+    ImGui::PushStyleColor(ImGuiCol_Text, text_color);
     const bool pressed = ImGui::SmallButton(label);
-    ImGui::PopStyleColor(2);
+    ImGui::PopStyleColor(4);
+    return pressed;
+}
+
+bool workspace_link_button(const char *label, const char *url, const ImVec4 &color,
+                           const ImVec4 &text_color = ImVec4(0.90f, 0.91f, 0.92f, 1.0f)) {
+    const bool pressed = workspace_button(label, color, text_color);
     if (ImGui::IsItemHovered())
         ImGui::SetTooltip("%s", url);
     if (pressed)
@@ -197,7 +210,6 @@ void enqueue_hierarchy_command(CommandKind kind, const HierarchyNode &node, std:
         command.hierarchy_revision = revision;
     }
 
-    // command.expected_object_address = node.object_address;
 
     RuntimeModel::instance().enqueue(std::move(command));
 
@@ -260,11 +272,12 @@ void render_node(const HierarchyNode &node, int selected_instance_id, const Node
     if (!node.active)
         ImGui::PopStyleColor();
 
-	if (ImGui::IsItemHovered() && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
-		enqueue_hierarchy_command(CommandKind::FocusSelected, node, revision);
-	}
-	else if (ImGui::IsItemClicked(ImGuiMouseButton_Left))
-		enqueue_hierarchy_command(CommandKind::Select, node, revision);
+    if (ImGui::IsItemHovered() && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
+        enqueue_hierarchy_command(CommandKind::FocusSelected, node, revision);
+    }
+    else if (ImGui::IsItemClicked(ImGuiMouseButton_Left)) {
+        enqueue_hierarchy_command(CommandKind::Select, node, revision);
+    }
     render_context_menu(node, revision, clipboard);
 
     if (open && !node.children.empty()) {
@@ -279,7 +292,48 @@ void render_hierarchy(const HierarchyInfo &hierarchy, int selected_instance_id,
                       const Snapshot::TransformClipboard& clipboard) {
     static int filter_mode_index = 0;
     constexpr const char *filter_modes[] = {"Name, tag or instance ID", "Name", "Tag", "Instance ID"};
-    const float mode_width = std::min(190.0f, ImGui::GetContentRegionAvail().x * 0.42f);
+    static bool include_inactive = true;
+    if (ImGui::SmallButton("+##hierarchy-actions"))
+        ImGui::OpenPopup("##hierarchy-actions-popup");
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Scene actions and Hierarchy options");
+    if (ImGui::BeginPopup("##hierarchy-actions-popup")) {
+        ImGui::Checkbox("Show inactive objects", &include_inactive);
+        ImGui::SeparatorText("Scenes in Build Settings");
+        if (hierarchy.available_scenes.empty()) {
+            ImGui::TextDisabled("No build scenes are available.");
+        } else {
+            for (const SceneLoadInfo &scene : hierarchy.available_scenes) {
+                ImGui::PushID(scene.build_index);
+                const std::string label = "Load [" + std::to_string(scene.build_index) + "] " + scene.name;
+                if (ImGui::MenuItem(label.c_str(), nullptr, false, !scene.active)) {
+                    Command command{.kind = CommandKind::LoadScene};
+                    command.int_value = scene.build_index;
+                    command.text = scene.path;
+                    RuntimeModel::instance().enqueue(std::move(command));
+                }
+                if (ImGui::IsItemHovered() && !scene.path.empty())
+                    ImGui::SetTooltip("%s%s", scene.path.c_str(), scene.loaded ? "\nLoaded" : "");
+                ImGui::PopID();
+            }
+        }
+        ImGui::SeparatorText("Load by path or name");
+        static std::vector<char> manual_scene_key;
+        ImGui::SetNextItemWidth(320.0f);
+        input_text_dynamic("##manual-scene-key", "Assets/.../Scene.unity or scene name", manual_scene_key);
+        ImGui::BeginDisabled(manual_scene_key.empty() || manual_scene_key.front() == '\0');
+        if (ImGui::Button("Load Scene", ImVec2(-1.0f, 0.0f))) {
+            Command command{.kind = CommandKind::LoadScene};
+            command.int_value = -1;
+            command.text = std::string(manual_scene_key.data());
+            RuntimeModel::instance().enqueue(std::move(command));
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::EndDisabled();
+        ImGui::EndPopup();
+    }
+    ImGui::SameLine();
+    const float mode_width = std::min(155.0f, ImGui::GetContentRegionAvail().x * 0.38f);
     ImGui::SetNextItemWidth(std::max(100.0f, ImGui::GetContentRegionAvail().x - mode_width -
                                              ImGui::GetStyle().ItemSpacing.x));
     ImGui::InputTextWithHint("##hierarchy-search", "Search GameObjects...", search_buffer().data(),
@@ -287,47 +341,6 @@ void render_hierarchy(const HierarchyInfo &hierarchy, int selected_instance_id,
     ImGui::SameLine();
     ImGui::SetNextItemWidth(mode_width);
     ImGui::Combo("##hierarchy-filter-mode", &filter_mode_index, filter_modes, IM_ARRAYSIZE(filter_modes));
-    static bool include_inactive = true;
-    ImGui::Checkbox("Inactive", &include_inactive);
-    if (!hierarchy.available_scenes.empty() &&
-        ImGui::CollapsingHeader("Build scenes / maps", ImGuiTreeNodeFlags_DefaultOpen)) {
-        ImGui::TextDisabled("Loaded scene hierarchy is below. Load uses Unity's build index.");
-        const float scene_list_height = std::min(156.0f,
-            ImGui::GetFrameHeightWithSpacing() * static_cast<float>(hierarchy.available_scenes.size()));
-        ImGui::BeginChild("##build-scene-list", ImVec2(0.0f, scene_list_height), true);
-        for (const SceneLoadInfo &scene : hierarchy.available_scenes) {
-            ImGui::PushID(scene.build_index);
-            ImGui::TextColored(scene.active ? ImVec4(0.60f, 0.68f, 0.60f, 1.0f) : ImVec4(0.62f, 0.72f, 0.82f, 1.0f),
-                               "[%d] %s", scene.build_index, scene.name.c_str());
-            ImGui::SameLine();
-            ImGui::TextDisabled("%s", scene.active ? "ACTIVE" : scene.loaded ? "LOADED" : "available");
-            ImGui::SameLine();
-            if (ImGui::SmallButton("Load")) {
-                Command command{.kind = CommandKind::LoadScene};
-                command.int_value = scene.build_index;
-                command.text = scene.path;
-                RuntimeModel::instance().enqueue(std::move(command));
-            }
-            if (ImGui::IsItemHovered() && !scene.path.empty())
-                ImGui::SetTooltip("%s", scene.path.c_str());
-            ImGui::PopID();
-        }
-        ImGui::EndChild();
-    }
-    if (ImGui::CollapsingHeader("Load scene by path or name")) {
-        static std::vector<char> manual_scene_key;
-        ImGui::SetNextItemWidth(-76.0f);
-        input_text_dynamic("##manual-scene-key", "Assets/.../Scene.unity or scene name", manual_scene_key);
-        ImGui::SameLine();
-        if (ImGui::SmallButton("Load##manual-scene")) {
-            Command command{.kind = CommandKind::LoadScene};
-            command.int_value = -1;
-            command.text = manual_scene_key.empty() ? std::string{} : std::string(manual_scene_key.data());
-            RuntimeModel::instance().enqueue(std::move(command));
-        }
-        ImGui::TextDisabled("Used when a stripped player exposes only LoadScene(string).");
-    }
-    ImGui::Separator();
 
     const std::string_view filter(search_buffer().data());
     const auto filter_mode = static_cast<HierarchyFilterMode>(std::clamp(filter_mode_index, 0, 3));
@@ -353,21 +366,18 @@ void render_hierarchy(const HierarchyInfo &hierarchy, int selected_instance_id,
         }
         matches = &cached_matches;
     }
-    ImGui::BeginChild("##hierarchy-results", ImVec2(0.0f, 0.0f), true);
+    const float status_height = ImGui::GetTextLineHeightWithSpacing();
+    ImGui::BeginChild("##hierarchy-results", ImVec2(0.0f, -status_height), false);
     for (const SceneNode &scene : hierarchy.scenes) {
         const int group_id = scene.dont_destroy_on_load ? -1 : scene.hide_and_dont_save ? -2 : scene.handle;
         ImGui::PushID(group_id);
         ImGuiTreeNodeFlags scene_flags = ImGuiTreeNodeFlags_DefaultOpen | ImGuiTreeNodeFlags_SpanAvailWidth;
-        const ImVec4 scene_color = scene.dont_destroy_on_load ? ImVec4(0.62f, 0.72f, 0.82f, 1.0f)
-                                   : scene.hide_and_dont_save ? ImVec4(0.72f, 0.64f, 0.50f, 1.0f)
-                                                              : ImVec4(0.68f, 0.68f, 0.68f, 1.0f);
-        const char *marker = scene.dont_destroy_on_load ? "[DDOL] "
-                             : scene.hide_and_dont_save ? "[Hidden] "
-                             : scene.active             ? "[Active] "
-                                                        : "";
-        ImGui::PushStyleColor(ImGuiCol_Text, scene_color);
-        const bool open = ImGui::TreeNodeEx("##scene", scene_flags, "%s%s", marker, scene.name.c_str());
-        ImGui::PopStyleColor();
+        const char *marker = scene.dont_destroy_on_load ? "DontDestroyOnLoad"
+                             : scene.hide_and_dont_save ? "Hidden / Dont Save"
+                                                        : scene.name.c_str();
+        const bool open = ImGui::TreeNodeEx("##scene", scene_flags, "%s", marker);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("%s%s", scene.name.c_str(), scene.active ? "\nActive scene" : "");
         if (open) {
             for (const HierarchyNode &root : scene.roots)
                 render_node(root, selected_instance_id, matches, include_inactive, hierarchy.revision, clipboard);
@@ -385,6 +395,7 @@ void render_hierarchy(const HierarchyInfo &hierarchy, int selected_instance_id,
         enqueue_simple(CommandKind::ClearSelection, 0);
     }
     ImGui::EndChild();
+    ImGui::TextDisabled("%zu GameObjects  |  %zu roots", hierarchy.objects, hierarchy.roots);
 }
 
 bool property_label(const char *label) {
@@ -808,8 +819,8 @@ void render_method_context_menu(const ComponentInfo::Method &method, const CodeC
 }
 
 void render_type_details(const char *label, std::string_view assembly, std::string_view namespc,
-                         std::string_view class_name, std::string_view full_name) {
-    if (!ImGui::CollapsingHeader(label, ImGuiTreeNodeFlags_DefaultOpen))
+                         std::string_view class_name, std::string_view full_name, bool default_open = true) {
+    if (!ImGui::CollapsingHeader(label, default_open ? ImGuiTreeNodeFlags_DefaultOpen : 0))
         return;
     if (ImGui::BeginTable("##runtime-type", 2, ImGuiTableFlags_SizingStretchProp | ImGuiTableFlags_NoPadOuterX)) {
         ImGui::TableSetupColumn("label", ImGuiTableColumnFlags_WidthFixed, 88.0f);
@@ -878,14 +889,24 @@ void render_identity(const InspectorInfo &info) {
         RuntimeModel::instance().enqueue(std::move(command));
     }
     ImGui::SameLine();
-    const float copy_width = ImGui::CalcTextSize("Copy Ptr").x + ImGui::GetStyle().FramePadding.x * 2.0f;
-    ImGui::SetNextItemWidth(std::max(80.0f, ImGui::GetContentRegionAvail().x - copy_width - 6.0f));
+    const float menu_width = ImGui::CalcTextSize("...").x + ImGui::GetStyle().FramePadding.x * 2.0f;
+    ImGui::SetNextItemWidth(std::max(80.0f, ImGui::GetContentRegionAvail().x - menu_width - 6.0f));
     ImGui::InputText("##name", buffers.name.data(), buffers.name.size());
     if (ImGui::IsItemDeactivatedAfterEdit())
         send_text_command(CommandKind::Rename, info, buffers.name.data());
     ImGui::SameLine();
-    if (ImGui::SmallButton("Copy Ptr"))
-        ImGui::SetClipboardText(info.pointer_text.c_str());
+    if (ImGui::SmallButton("...##game-object-menu"))
+        ImGui::OpenPopup("##game-object-menu-popup");
+    if (ImGui::BeginPopup("##game-object-menu-popup")) {
+        if (ImGui::MenuItem("Copy GameObject Pointer"))
+            ImGui::SetClipboardText(info.pointer_text.c_str());
+        if (ImGui::MenuItem("Copy Runtime Type")) {
+            const std::string details = type_details_text(info.assembly_name, info.namespace_name,
+                                                          info.class_name, info.type_name);
+            ImGui::SetClipboardText(details.c_str());
+        }
+        ImGui::EndPopup();
+    }
 
     if (ImGui::BeginTable("##identity", 2, ImGuiTableFlags_SizingStretchProp)) {
         ImGui::TableSetupColumn("label", ImGuiTableColumnFlags_WidthFixed, 72.0f);
@@ -913,28 +934,32 @@ void render_identity(const InspectorInfo &info) {
         }
         ImGui::EndTable();
     }
-    render_type_details("GameObject Type", info.assembly_name, info.namespace_name, info.class_name, info.type_name);
 }
 
 void render_transform(const InspectorInfo &info, const Snapshot::TransformClipboard& clipboard) {
-    if (!ImGui::CollapsingHeader("Transform", ImGuiTreeNodeFlags_DefaultOpen))
+    const bool open = ImGui::CollapsingHeader("Transform", ImGuiTreeNodeFlags_DefaultOpen);
+    if (ImGui::BeginPopupContextItem("##transform-context")) {
+        if (ImGui::MenuItem("Copy Component"))
+            send_transform_copy(info);
+        ImGui::BeginDisabled(!clipboard.valid);
+        if (ImGui::MenuItem("Paste Component Values"))
+            send_transform_paste(info, clipboard);
+        ImGui::EndDisabled();
+        ImGui::Separator();
+        if (ImGui::MenuItem("Reset")) {
+            const float position[3]{};
+            const float rotation[3]{};
+            const float scale[3]{1.0f, 1.0f, 1.0f};
+            send_vector_command(CommandKind::SetLocalPosition, info, position);
+            send_vector_command(CommandKind::SetLocalRotation, info, rotation);
+            send_vector_command(CommandKind::SetLocalScale, info, scale);
+        }
+        ImGui::EndPopup();
+    }
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Right-click for component actions");
+    if (!open)
         return;
-    if (ImGui::SmallButton("Copy transform")) {
-        send_transform_copy(info);
-    }
-    ImGui::SameLine();
-    ImGui::BeginDisabled(!clipboard.valid);
-    if (ImGui::SmallButton("Paste transform"))
-        send_transform_paste(info, clipboard);
-    ImGui::EndDisabled();
-    if (clipboard.valid) {
-        ImGui::SameLine();
-        ImGui::TextDisabled("from %s", clipboard.source_name.c_str());
-        if (clipboard.source_instance_id == info.instance_id)
-            ImGui::TextDisabled("Clipboard source is this object.");
-    } else {
-        ImGui::TextDisabled("Copy a GameObject transform, then paste it here or from the Hierarchy right-click menu.");
-    }
     if (!ImGui::BeginTable("##transform", 2, ImGuiTableFlags_SizingStretchProp))
         return;
     ImGui::TableSetupColumn("label", ImGuiTableColumnFlags_WidthFixed, 72.0f);
@@ -944,31 +969,16 @@ void render_transform(const InspectorInfo &info, const Snapshot::TransformClipbo
     property_label("Position");
     if (ImGui::DragFloat3("##position", position, 0.05f, 0.0f, 0.0f, "%.3f"))
         send_vector_command(CommandKind::SetLocalPosition, info, position);
-    ImGui::SameLine();
-    if (ImGui::SmallButton("Reset##position")) {
-        const float reset[3]{};
-        send_vector_command(CommandKind::SetLocalPosition, info, reset);
-    }
 
     float rotation[3]{info.local_rotation.x, info.local_rotation.y, info.local_rotation.z};
     property_label("Rotation");
     if (ImGui::DragFloat3("##rotation", rotation, 0.25f, 0.0f, 0.0f, "%.2f"))
         send_vector_command(CommandKind::SetLocalRotation, info, rotation);
-    ImGui::SameLine();
-    if (ImGui::SmallButton("Reset##rotation")) {
-        const float reset[3]{};
-        send_vector_command(CommandKind::SetLocalRotation, info, reset);
-    }
 
     float scale[3]{info.local_scale.x, info.local_scale.y, info.local_scale.z};
     property_label("Scale");
     if (ImGui::DragFloat3("##scale", scale, 0.02f, 0.0f, 0.0f, "%.3f"))
         send_vector_command(CommandKind::SetLocalScale, info, scale);
-    ImGui::SameLine();
-    if (ImGui::SmallButton("Reset##scale")) {
-        const float reset[3]{1.0f, 1.0f, 1.0f};
-        send_vector_command(CommandKind::SetLocalScale, info, reset);
-    }
 
     ImGui::EndTable();
 }
@@ -1026,7 +1036,6 @@ bool &component_show_inherited(int component_id) {
         return found->second;
     if (filters.size() >= 1024)
         filters.clear();
-    // Show inherited members by default.
     return filters.try_emplace(component_id, true).first->second;
 }
 
@@ -1171,31 +1180,36 @@ void enqueue_member_sample(CommandKind value_kind, int component_id, int member_
     RuntimeModel::instance().enqueue(std::move(command));
 }
 
-void render_reference_button(const ComponentInfo::LiveValues::Reference *reference) {
-    if (!reference || reference->is_null || reference->token == 0)
-        return;
-    const bool is_game_object = reference->type_name == "UnityEngine.GameObject" ||
-                                reference->type_name == "GameObject";
-    if (ImGui::SmallButton(is_game_object ? "Select" : "Inspect"))
+bool render_reference_context_menu(const ComponentInfo::LiveValues::Reference *reference, bool allow_assign = false) {
+    const bool available = reference && !reference->is_null && reference->token != 0;
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("%s\nRight-click for reference actions",
+                          available ? reference->type_name.c_str() : "null reference");
+    bool assign_requested = false;
+    if (!ImGui::BeginPopupContextItem("##reference-actions"))
+        return false;
+
+    ImGui::TextDisabled("%s", available ? reference->type_name.c_str() : "Reference");
+    ImGui::BeginDisabled(!available);
+    const bool is_game_object = available &&
+        (reference->type_name == "UnityEngine.GameObject" || reference->type_name == "GameObject");
+    if (ImGui::MenuItem(is_game_object ? "Select GameObject" : "Inspect Reference"))
         enqueue_reference_inspection(reference->token, !is_game_object);
-    ImGui::SameLine();
-    if (ImGui::SmallButton("Save ref")) {
+    if (ImGui::MenuItem("Save Reference")) {
         Command command{};
         command.kind = CommandKind::PinManagedReference;
         command.reference_token = reference->token;
         RuntimeModel::instance().enqueue(std::move(command));
     }
-    ImGui::SameLine();
-    if (ImGui::SmallButton("Copy Ptr"))
+    if (ImGui::MenuItem("Copy Pointer"))
         ImGui::SetClipboardText(reference->pointer_text.c_str());
-    if (ImGui::IsItemHovered())
-        ImGui::SetTooltip("Keep this live object available as a typed method, field, or property argument.");
-    if (ImGui::BeginPopupContextItem("##reference-actions")) {
-        ImGui::TextDisabled("%s", reference->type_name.c_str());
-        if (ImGui::MenuItem("Copy address"))
-            ImGui::SetClipboardText(reference->pointer_text.c_str());
-        ImGui::EndPopup();
+    ImGui::EndDisabled();
+    if (allow_assign) {
+        ImGui::Separator();
+        assign_requested = ImGui::MenuItem("Assign Reference...");
     }
+    ImGui::EndPopup();
+    return assign_requested;
 }
 
 bool pending_timed_out(const MemberBuffer &buffer, bool live_data) {
@@ -1347,15 +1361,14 @@ void render_live_value(CommandKind kind, int component_id, int member_index,
             ImGui::TextColored(ImVec4(0.78f, 0.42f, 0.38f, 1.0f), "%s",
                                value->display.empty() ? "Unavailable" : value->display.c_str());
         }
-        render_reference_button(reference);
+        render_reference_context_menu(reference);
         return;
     }
     buffer.sample_requested = false;
     if (!writable) {
         ImGui::TextDisabled("%s", value->display.empty() ? "<unsupported>" : value->display.c_str());
         if (reference && !reference->is_null && reference->token != 0) {
-            ImGui::SameLine();
-            render_reference_button(reference);
+            render_reference_context_menu(reference);
         }
         return;
     }
@@ -1366,12 +1379,7 @@ void render_live_value(CommandKind kind, int component_id, int member_index,
                                   ? "null"
                                   : (!value->display.empty() ? value->display.c_str() : value->type_name.c_str());
         ImGui::TextColored(ImVec4(0.62f, 0.72f, 0.82f, 1.0f), "%s", display);
-        if (reference && !reference->is_null && reference->token != 0) {
-            ImGui::SameLine();
-            render_reference_button(reference);
-        }
-        ImGui::SameLine();
-        if (ImGui::SmallButton("Assign...")) {
+        if (render_reference_context_menu(reference, true)) {
             if (reference && !reference->pointer_text.empty())
                 copy_text(buffer.text, reference->pointer_text);
             else
@@ -1425,7 +1433,7 @@ void render_live_value(CommandKind kind, int component_id, int member_index,
     }
     if (!editable_value(*value)) {
         ImGui::TextDisabled("%s", value->display.empty() ? "<unsupported>" : value->display.c_str());
-        render_reference_button(reference);
+        render_reference_context_menu(reference);
         return;
     }
     if (value->kind == ValueKind::Boolean) {
@@ -1444,7 +1452,7 @@ void render_live_value(CommandKind kind, int component_id, int member_index,
         }
         render_member_lock(kind, component_id, member_index, nullptr, buffer.bool_value, object_inspector_target,
                            buffer_key, locked, lockable, object_inspector_token);
-        render_reference_button(reference);
+        render_reference_context_menu(reference);
         return;
     }
     if (value->kind == ValueKind::Structured) {
@@ -1475,7 +1483,7 @@ void render_live_value(CommandKind kind, int component_id, int member_index,
     }
     render_member_lock(kind, component_id, member_index, buffer.text.data(), false, object_inspector_target, buffer_key,
                        locked, lockable, object_inspector_token);
-    render_reference_button(reference);
+    render_reference_context_menu(reference);
 }
 
 bool invokable_method(const ComponentInfo::Method &method) {
@@ -1497,7 +1505,7 @@ bool &method_boolean_argument(std::uint64_t key) {
 }
 
 std::uint64_t scoped_ui_key(std::uint64_t scope, std::uint64_t domain, std::size_t first, std::size_t second = 0) {
-    // Keep editor state separate for each Object Inspector tab.
+    // Scope editor state to each Object Inspector tab.
     std::uint64_t key = scope ^ domain;
     key ^= static_cast<std::uint64_t>(first) + 0x9e3779b97f4a7c15ull + (key << 6) + (key >> 2);
     key ^= static_cast<std::uint64_t>(second) + 0x9e3779b97f4a7c15ull + (key << 6) + (key >> 2);
@@ -1759,18 +1767,19 @@ const MethodTracer::Snapshot *trace_for_method(const std::vector<MethodTracer::S
 
 const Snapshot::FieldWatch *field_watch_for(const Snapshot &snapshot, int component_instance_id,
                                              std::size_t field_index,
-                                             std::uint64_t object_inspector_token = 0) {
+                                             std::uint64_t object_inspector_token = 0,
+                                             bool property = false) {
     const auto found = std::find_if(snapshot.field_watches.begin(), snapshot.field_watches.end(),
                                     [=](const Snapshot::FieldWatch &watch) {
                                         return watch.component_instance_id == component_instance_id &&
                                                watch.object_inspector_token == object_inspector_token &&
-                                               watch.field_index == field_index;
+                                               watch.field_index == field_index && watch.property == property;
                                     });
     return found == snapshot.field_watches.end() ? nullptr : &*found;
 }
 
 void enqueue_field_watch(int component_id, int field_index, bool enabled,
-                         std::uint64_t object_inspector_token = 0) {
+                         std::uint64_t object_inspector_token = 0, bool property = false) {
     Command command{};
     command.kind = CommandKind::SetFieldWatch;
     command.instance_id = component_id;
@@ -1778,6 +1787,7 @@ void enqueue_field_watch(int component_id, int field_index, bool enabled,
     command.bool_value = enabled;
     command.object_inspector_target = object_inspector_token != 0;
     command.object_inspector_token = object_inspector_token;
+    command.member_is_property = property;
     RuntimeModel::instance().enqueue(std::move(command));
 }
 
@@ -1799,6 +1809,15 @@ std::string trace_seconds_json(double seconds) {
     char text[64]{};
     std::snprintf(text, sizeof(text), "%.9f", seconds);
     return text;
+}
+
+void enqueue_watch_alarm(std::uint64_t id, WatchAnalysis::AlarmCondition condition, float threshold) {
+    Command command{};
+    command.kind = CommandKind::ConfigureFieldWatch;
+    command.reference_token = id;
+    command.int_value = static_cast<int>(condition);
+    command.float_value = threshold;
+    RuntimeModel::instance().enqueue(std::move(command));
 }
 
 void append_csv_value(std::string &out, std::string_view value) {
@@ -1834,8 +1853,7 @@ std::string friendly_trace_caller(std::string_view caller) {
     return std::string(caller);
 }
 
-// The hue is derived from the stable value/type text, rather than sampled every
-// frame.  It reads as varied data without flickering while a trace is live.
+// Derive hue from stable value/type text to prevent live-trace flicker.
 ImVec4 trace_value_color(std::string_view key) {
     std::uint32_t hash = 2166136261u;
     for (const unsigned char character : key) {
@@ -1977,7 +1995,15 @@ void render_method_trace(const MethodTracer::Snapshot &trace) {
                                   ImGuiTableFlags_BordersInnerV)) {
                 ImGui::TableSetupColumn("label", ImGuiTableColumnFlags_WidthFixed, 76.0f);
                 ImGui::TableSetupColumn("value", ImGuiTableColumnFlags_WidthStretch);
-                trace_card_row("Caller", caller, caller, false);
+                const std::string when = "+" + elapsed_text + " | thread " + std::to_string(record.thread_id);
+                const std::string what = trace.declaring_type + "." + trace.method_name;
+                trace_card_row("When", when, when, false);
+                trace_card_row("Who", caller, caller, false);
+                trace_card_row("What", what, what, false);
+                if (!trace.is_static)
+                    trace_card_row("Target", record.target_display, record.target_display.empty()
+                        ? std::string_view("<unavailable>") : std::string_view(record.target_display),
+                        !record.target_display.empty());
                 trace_card_row("Arguments", argument_summary,
                                argument_summary.empty() ? std::string_view("none") : std::string_view(argument_summary),
                                readable_arguments);
@@ -2160,9 +2186,13 @@ std::string short_field_component_name(std::string_view type_name) {
 }
 
 std::string field_watch_csv(const Snapshot::FieldWatch& watch) {
-    std::string out = "sequence,seconds,previous,current\n";
+    std::string out = "sequence,seconds,member_kind,source,alarm,previous,current\n";
     for (const Snapshot::FieldWatchEvent& event : watch.events) {
         out += std::to_string(event.sequence) + "," + trace_seconds_json(event.seconds_since_start) + ",";
+        append_csv_value(out, watch.property ? "property" : "field");
+        out += ",";
+        append_csv_value(out, event.source);
+        out += event.alarm_triggered ? ",true," : ",false,";
         append_csv_value(out, event.previous_value);
         out += ",";
         append_csv_value(out, event.current_value);
@@ -2173,8 +2203,8 @@ std::string field_watch_csv(const Snapshot::FieldWatch& watch) {
 
 void render_field_watches(const Snapshot &snapshot) {
     if (snapshot.field_watches.empty()) {
-        ImGui::TextDisabled("No watched fields. Use Watch next to an instance field to start one.");
-        ImGui::TextWrapped("A watch samples the value four times per second and records old -> new changes.");
+        ImGui::TextDisabled("No value watches. Use Watch next to a readable field or property.");
+        ImGui::TextWrapped("Values are sampled four times per second; numeric members also produce a chart and alarms.");
         return;
     }
     static std::uint64_t selected = 0;
@@ -2188,9 +2218,9 @@ void render_field_watches(const Snapshot &snapshot) {
 
     const float watch_list_width = std::clamp(ImGui::GetContentRegionAvail().x * 0.28f, 220.0f, 340.0f);
     ImGui::BeginChild("##field-watch-list", ImVec2(watch_list_width, 0.0f), true);
-    ImGui::TextDisabled("WATCHED FIELDS");
+    ImGui::TextDisabled("VALUE WATCHES");
     ImGui::SetNextItemWidth(-1.0f);
-    ImGui::InputTextWithHint("##field-watch-filter", "Filter fields...", watch_list_filter.data(),
+    ImGui::InputTextWithHint("##field-watch-filter", "Filter members...", watch_list_filter.data(),
                              watch_list_filter.size());
     ImGui::Separator();
     for (const Snapshot::FieldWatch &watch : snapshot.field_watches) {
@@ -2198,7 +2228,8 @@ void render_field_watches(const Snapshot &snapshot) {
         if (watch_list_filter[0] != '\0' &&
             !contains_case_insensitive(display_name, watch_list_filter.data()))
             continue;
-        const std::string label = std::string(watch.active ? "[REC] " : "[STOP] ") + display_name +
+        const std::string label = std::string(watch.alarm_active ? "[ALARM] " : watch.active ? "[REC] " : "[STOP] ") +
+                                  display_name + (watch.property ? "  P" : "  F") +
                                   "  (" + std::to_string(watch.change_count) + ")";
         if (ImGui::Selectable(label.c_str(), selected == watch.id))
             selected = watch.id;
@@ -2221,7 +2252,7 @@ void render_field_watches(const Snapshot &snapshot) {
     ImGui::SameLine();
     if (watch->active && ImGui::SmallButton("Stop"))
         enqueue_field_watch(watch->component_instance_id, static_cast<int>(watch->field_index), false,
-                            watch->object_inspector_token);
+                            watch->object_inspector_token, watch->property);
     if (!watch->active) {
         ImGui::SameLine();
         if (ImGui::SmallButton("Close"))
@@ -2234,26 +2265,62 @@ void render_field_watches(const Snapshot &snapshot) {
     if (ImGui::SmallButton("Copy CSV"))
         ImGui::SetClipboardText(field_watch_csv(*watch).c_str());
 
-    ImGui::SeparatorText("What changed?");
-    ImGui::TextWrapped("This field has changed %llu time%s. Current value: %s",
+    ImGui::SeparatorText("Live value");
+    ImGui::TextWrapped("%s changed %llu time%s. Current value: %s",
+                       watch->property ? "Property" : "Field",
                        static_cast<unsigned long long>(watch->change_count), watch->change_count == 1 ? "" : "s",
                        watch->current_value.empty() ? "<waiting for a sample>" : watch->current_value.c_str());
     if (!watch->current_reference.is_null && watch->current_reference.token != 0) {
-        ImGui::SameLine();
-        render_reference_button(&watch->current_reference);
+        render_reference_context_menu(&watch->current_reference);
     }
-    ImGui::TextDisabled("Samples every 0.25 seconds. It shows the value change, not the native code that wrote it.");
+    ImGui::TextDisabled(watch->property
+        ? "Property values are read through the getter. Source is exact only for Explorer writes; other rows are sampled runtime activity."
+        : "Direct field writes have no managed setter hook. Runtime source therefore means the change occurred inside the 250 ms sample window.");
+
+    ImGui::SeparatorText("Chart and threshold alarm");
+    static std::unordered_map<std::uint64_t, float> threshold_drafts;
+    float& threshold = threshold_drafts[watch->id];
+    if (!ImGui::IsAnyItemActive())
+        threshold = static_cast<float>(watch->alarm_threshold);
+    int condition = static_cast<int>(watch->alarm_condition);
+    constexpr const char* conditions[] = {"Disabled", ">", ">=", "<", "<=", "==", "!="};
+    ImGui::SetNextItemWidth(110.0f);
+    if (ImGui::Combo("Condition", &condition, conditions, IM_ARRAYSIZE(conditions)))
+        enqueue_watch_alarm(watch->id, static_cast<WatchAnalysis::AlarmCondition>(condition), threshold);
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(150.0f);
+    if (ImGui::InputFloat("Threshold", &threshold, 0.0f, 0.0f, "%.6g",
+                          ImGuiInputTextFlags_EnterReturnsTrue))
+        enqueue_watch_alarm(watch->id, static_cast<WatchAnalysis::AlarmCondition>(condition), threshold);
+    if (watch->alarm_condition != WatchAnalysis::AlarmCondition::Disabled) {
+        ImGui::SameLine();
+        ImGui::TextColored(watch->alarm_active ? ImVec4(0.94f, 0.38f, 0.30f, 1.0f)
+                                               : ImVec4(0.55f, 0.72f, 0.55f, 1.0f),
+                           "%s  (%llu trigger%s)", watch->alarm_active ? "ALARM" : "armed",
+                           static_cast<unsigned long long>(watch->alarm_count), watch->alarm_count == 1 ? "" : "s");
+    }
+    if (!watch->samples.empty()) {
+        ImGui::PlotLines("##watch-chart", &watch->samples.front().value,
+                         static_cast<int>(watch->samples.size()), 0, nullptr, FLT_MAX, FLT_MAX,
+                         ImVec2(-1.0f, 120.0f), sizeof(Snapshot::FieldWatchSample));
+        ImGui::TextDisabled("%zu numeric samples | %.2fs -> %.2fs", watch->samples.size(),
+                            watch->samples.front().seconds_since_start, watch->samples.back().seconds_since_start);
+    } else {
+        ImGui::TextDisabled("A chart becomes available when this member produces numeric samples.");
+    }
     if (watch->events.empty()) {
         ImGui::TextDisabled(watch->active ? "Waiting for the value to change..." : "No changes were recorded.");
         ImGui::EndChild();
         return;
     }
-    if (ImGui::BeginTable("##field-watch-events", 4,
+    if (ImGui::BeginTable("##field-watch-events", 6,
                           ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingStretchProp |
                               ImGuiTableFlags_ScrollX | ImGuiTableFlags_ScrollY,
                           ImVec2(0, std::max(150.0f, ImGui::GetContentRegionAvail().y)))) {
         ImGui::TableSetupColumn("#", ImGuiTableColumnFlags_WidthFixed, 42.0f);
         ImGui::TableSetupColumn("When", ImGuiTableColumnFlags_WidthFixed, 82.0f);
+        ImGui::TableSetupColumn("Source", ImGuiTableColumnFlags_WidthFixed, 190.0f);
+        ImGui::TableSetupColumn("Alarm", ImGuiTableColumnFlags_WidthFixed, 58.0f);
         ImGui::TableSetupColumn("Old value", ImGuiTableColumnFlags_WidthStretch);
         ImGui::TableSetupColumn("New value", ImGuiTableColumnFlags_WidthStretch);
         ImGui::TableHeadersRow();
@@ -2265,13 +2332,18 @@ void render_field_watches(const Snapshot &snapshot) {
             ImGui::TableSetColumnIndex(1);
             ImGui::Text("+%.3fs", event.seconds_since_start);
             ImGui::TableSetColumnIndex(2);
-            ImGui::TextUnformatted(event.previous_value.c_str());
+            ImGui::TextUnformatted(event.source.c_str());
             ImGui::TableSetColumnIndex(3);
+            ImGui::TextColored(event.alarm_triggered ? ImVec4(0.94f, 0.38f, 0.30f, 1.0f)
+                                                     : ImVec4(0.52f, 0.52f, 0.52f, 1.0f),
+                               "%s", event.alarm_triggered ? "YES" : "-");
+            ImGui::TableSetColumnIndex(4);
+            ImGui::TextUnformatted(event.previous_value.c_str());
+            ImGui::TableSetColumnIndex(5);
             ImGui::TextUnformatted(event.current_value.c_str());
             if (!event.current_reference.is_null && event.current_reference.token != 0) {
-                ImGui::SameLine();
                 ImGui::PushID(static_cast<int>(event.sequence));
-                render_reference_button(&event.current_reference);
+                render_reference_context_menu(&event.current_reference);
                 ImGui::PopID();
             }
         }
@@ -2288,16 +2360,17 @@ void render_method_result(const Snapshot &snapshot, int component_id, std::size_
             return result.component_instance_id == component_id && result.method_index == method_index &&
                    result.object_inspector_token == object_inspector_token;
         });
-    if (found == snapshot.method_results.end())
+    if (found == snapshot.method_results.end()) {
         return;
-	const Snapshot::MethodResult &result = found->second;
-	ImGui::TextColored(result.succeeded ? ImVec4(0.60f, 0.68f, 0.60f, 1.0f)
-		: ImVec4(0.78f, 0.42f, 0.38f, 1.0f), result.succeeded ? "Success" : "Failed");
-	ImGui::SameLine();
-	ImGui::TextDisabled("%.2f ms", result.elapsed_milliseconds);
-	ImGui::TextWrapped("%s", result.display.c_str());
+    }
+    const Snapshot::MethodResult &result = found->second;
+    ImGui::TextColored(result.succeeded ? ImVec4(0.60f, 0.68f, 0.60f, 1.0f)
+        : ImVec4(0.78f, 0.42f, 0.38f, 1.0f), result.succeeded ? "Success" : "Failed");
+    ImGui::SameLine();
+    ImGui::TextDisabled("%.2f ms", result.elapsed_milliseconds);
+    ImGui::TextWrapped("%s", result.display.c_str());
     if (!result.reference.is_null && result.reference.token != 0) {
-        render_reference_button(&result.reference);
+        render_reference_context_menu(&result.reference);
     }
 }
 
@@ -2316,22 +2389,6 @@ void render_member_write_result(const Snapshot& snapshot, int component_id, std:
                                        : ImVec4(0.78f, 0.42f, 0.38f, 1.0f),
                        "%s", result.display.c_str());
 }
-
-struct ComponentTabState {
-    int activate_component_id = 0;
-    std::vector<int> open_component_ids;
-};
-
-struct ObjectTabState {
-    struct Tab {
-        int instance_id = 0;
-        std::string name;
-    };
-    std::vector<Tab> tabs;
-    std::unordered_set<int> closed_instance_ids;
-    int last_seen_instance_id = 0;
-    int activate_instance_id = 0;
-};
 
 struct ObjectReferenceTabState {
     struct Tab {
@@ -2355,8 +2412,7 @@ void request_object_reference_tab(std::uint64_t token) {
     if (token == 0)
         return;
     ObjectReferenceTabState &state = object_reference_tabs();
-    // An explicit Inspect click is a new open request.  Do not let the
-    // previous close action suppress the same reference token forever.
+    // A new Inspect request reopens a previously closed token.
     state.closed_tokens.erase(token);
     state.requested_tokens.erase(token);
     state.pending_activation_token = token;
@@ -2385,7 +2441,7 @@ void remember_object_reference_tab(const ObjectInspectorInfo &info) {
         state.tabs.push_back({info.token, info.type_name});
     else
         found->label = info.type_name;
-    // Only an explicit Inspect action selects an existing tab.
+    // Select existing tabs only on explicit Inspect requests.
     if (state.pending_activation_token == info.token || (added && state.tabs.size() == 1)) {
         state.selected_token = info.token;
         state.pending_activation_token = 0;
@@ -2401,85 +2457,9 @@ void close_object_reference_tab(std::uint64_t token) {
     RuntimeModel::instance().enqueue(std::move(command));
 }
 
-ObjectTabState &object_tabs() {
-    static ObjectTabState state;
-    return state;
-}
-
-void remember_object_tab(const InspectorInfo &info) {
-    if (!info.valid)
-        return;
-    ObjectTabState &state = object_tabs();
-    const bool changed_selection = state.last_seen_instance_id != info.instance_id;
-    if (changed_selection) {
-        state.closed_instance_ids.erase(info.instance_id);
-    }
-    state.last_seen_instance_id = info.instance_id;
-    if (state.closed_instance_ids.contains(info.instance_id))
-        return;
-    const auto found = std::find_if(state.tabs.begin(), state.tabs.end(), [&info](const ObjectTabState::Tab &tab) {
-        return tab.instance_id == info.instance_id;
-    });
-    if (found == state.tabs.end()) {
-        state.tabs.push_back({info.instance_id, info.name});
-        state.activate_instance_id = info.instance_id;
-    } else {
-        found->name = info.name;
-        if (changed_selection)
-            state.activate_instance_id = info.instance_id;
-    }
-}
-
-std::unordered_map<int, ComponentTabState> &component_tabs() {
-    static std::unordered_map<int, ComponentTabState> states;
-    return states;
-}
-
-ComponentTabState &component_tab_state(int owner_instance_id) {
-    auto &states = component_tabs();
-    if (const auto found = states.find(owner_instance_id); found != states.end())
-        return found->second;
-    if (states.size() >= 128)
-        states.clear();
-    return states[owner_instance_id];
-}
-
-void open_component_tab(int owner_instance_id, int component_instance_id) {
-    ComponentTabState &state = component_tab_state(owner_instance_id);
-    if (std::find(state.open_component_ids.begin(), state.open_component_ids.end(), component_instance_id) ==
-        state.open_component_ids.end())
-        state.open_component_ids.push_back(component_instance_id);
-    state.activate_component_id = component_instance_id;
-}
-
-void render_component_list(const InspectorInfo &info) {
-    ImGui::SeparatorText("Components");
-    if (info.components.empty()) {
-        ImGui::TextDisabled("No additional components");
-        return;
-    }
-    for (const ComponentInfo &component : info.components) {
-        ImGui::PushID(component.instance_id);
-        if (component.enabled_supported) {
-            bool enabled = component.enabled;
-            if (ImGui::Checkbox("##enabled", &enabled)) {
-                Command command{.kind = CommandKind::SetComponentEnabled, .instance_id = component.instance_id};
-                command.bool_value = enabled;
-                RuntimeModel::instance().enqueue(std::move(command));
-            }
-            ImGui::SameLine();
-        }
-        if (ImGui::Selectable(component.type_name.c_str(), false, ImGuiSelectableFlags_None,
-                              ImVec2(0.0f, ImGui::GetFrameHeight())))
-            open_component_tab(info.instance_id, component.instance_id);
-        ImGui::PopID();
-    }
-}
-
 void render_components(const InspectorInfo &info, const Snapshot &snapshot, int only_component_id = 0,
                        const char *fixed_filter = nullptr, bool show_inherited = false) {
     const bool live_data = snapshot.live_data;
-    ImGui::SeparatorText("Component Inspector");
     for (const ComponentInfo &component : info.components) {
         if (only_component_id != 0 && component.instance_id != only_component_id)
             continue;
@@ -2498,21 +2478,36 @@ void render_components(const InspectorInfo &info, const Snapshot &snapshot, int 
         } else
             ImGui::Dummy(ImVec2(ImGui::GetFrameHeight(), ImGui::GetFrameHeight()));
         ImGui::SameLine();
+        ImGui::PushStyleColor(ImGuiCol_Header, ImVec4(0.235f, 0.240f, 0.248f, 1.0f));
+        ImGui::PushStyleColor(ImGuiCol_HeaderHovered, ImVec4(0.285f, 0.292f, 0.302f, 1.0f));
+        ImGui::PushStyleColor(ImGuiCol_HeaderActive, ImVec4(0.315f, 0.325f, 0.338f, 1.0f));
+        const std::string display_type = short_field_component_name(component.type_name);
         const bool open = ImGui::TreeNodeEx("##component",
                                             ImGuiTreeNodeFlags_OpenOnArrow | ImGuiTreeNodeFlags_OpenOnDoubleClick |
-                                                (only_component_id != 0 ? ImGuiTreeNodeFlags_DefaultOpen : 0),
-                                            "%s", component.type_name.c_str());
-        ImGui::SameLine();
-        ImGui::PushStyleColor(ImGuiCol_Button, IM_COL32(110, 48, 48, 210));
-        if (ImGui::SmallButton("Delete"))
-            enqueue_simple(CommandKind::DeleteComponent, component.instance_id);
-        ImGui::PopStyleColor();
-        ImGui::SameLine();
-        if (ImGui::SmallButton("Copy Ptr"))
-            ImGui::SetClipboardText(component.pointer_text.c_str());
+                                                ImGuiTreeNodeFlags_SpanAvailWidth | ImGuiTreeNodeFlags_Framed |
+                                                ImGuiTreeNodeFlags_FramePadding | ImGuiTreeNodeFlags_DefaultOpen,
+                                            "%s", display_type.c_str());
+        ImGui::PopStyleColor(3);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("%s\nRight-click for component actions", component.type_name.c_str());
+        if (ImGui::BeginPopupContextItem("##component-context")) {
+            if (ImGui::MenuItem("Copy Component Pointer"))
+                ImGui::SetClipboardText(component.pointer_text.c_str());
+            if (ImGui::MenuItem("Copy Runtime Type")) {
+                const std::string details = type_details_text(component.assembly_name, component.namespace_name,
+                                                              component.class_name, component.type_name);
+                ImGui::SetClipboardText(details.c_str());
+            }
+            ImGui::Separator();
+            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.95f, 0.55f, 0.50f, 1.0f));
+            if (ImGui::MenuItem("Remove Component"))
+                enqueue_simple(CommandKind::DeleteComponent, component.instance_id);
+            ImGui::PopStyleColor();
+            ImGui::EndPopup();
+        }
         if (open) {
-            render_type_details("Component Type", component.assembly_name, component.namespace_name,
-                                component.class_name, component.type_name);
+            render_type_details("Runtime Type", component.assembly_name, component.namespace_name,
+                                component.class_name, component.type_name, false);
             if (!component.metadata) {
                 enqueue_simple(CommandKind::LoadComponentMetadata, component.instance_id);
                 ImGui::TextDisabled("Loading member metadata...");
@@ -2635,7 +2630,6 @@ void render_components(const InspectorInfo &info, const Snapshot &snapshot, int 
                         filter_buffer.fill('\0');
                 }
                 const std::string_view filter(fixed_filter ? fixed_filter : filter_buffer.data());
-                // Report the reflected total as well as the filtered count.
                 const auto visible_member_count = [&](const auto &members) {
                     return static_cast<std::size_t>(
                         std::count_if(members.begin(), members.end(), [&](const auto &member) {
@@ -2655,14 +2649,13 @@ void render_components(const InspectorInfo &info, const Snapshot &snapshot, int 
                 };
                 auto member_table = [&](const char *id, const auto &members, const auto *values, CommandKind command,
                                         bool properties) {
-                    if (!ImGui::BeginTable(id, properties ? 2 : 3,
+                    if (!ImGui::BeginTable(id, 3,
                                            ImGuiTableFlags_BordersInnerV | ImGuiTableFlags_SizingStretchProp |
                                                ImGuiTableFlags_NoPadOuterX))
                         return;
                     ImGui::TableSetupColumn("Member", ImGuiTableColumnFlags_WidthFixed, 190.0f);
                     ImGui::TableSetupColumn("Value", ImGuiTableColumnFlags_WidthStretch);
-                    if (!properties)
-                        ImGui::TableSetupColumn("Watch", ImGuiTableColumnFlags_WidthFixed, 82.0f);
+                    ImGui::TableSetupColumn("Watch", ImGuiTableColumnFlags_WidthFixed, 82.0f);
                     std::vector<std::size_t> visible_members;
                     visible_members.reserve(members.size());
                     for (std::size_t index = 0; index < members.size(); ++index) {
@@ -2724,17 +2717,17 @@ void render_components(const InspectorInfo &info, const Snapshot &snapshot, int 
                                               snapshot.locked_member_keys.contains(key), true, 0, member.runtime_safe,
                                               member.capability_reason, &snapshot.managed_references);
 							render_member_write_result(snapshot, component.instance_id, index, properties);
-                            if (!properties) {
-                                const Snapshot::FieldWatch *watch = field_watch_for(snapshot, component.instance_id, index);
+							{
+								const Snapshot::FieldWatch *watch = field_watch_for(snapshot, component.instance_id, index, 0, properties);
                                 ImGui::TableSetColumnIndex(2);
                                 const char *label = watch && watch->active ? "Stop watch" : "Watch";
                                 if (ImGui::SmallButton(label))
                                     enqueue_field_watch(component.instance_id, static_cast<int>(index),
-                                                        !(watch && watch->active));
+                                                        !(watch && watch->active), 0, properties);
                                 if (ImGui::IsItemHovered())
                                     ImGui::SetTooltip(watch && watch->active
-                                                          ? "Stop recording changes for this field"
-                                                          : "Record old -> new changes for this field");
+                                                          ? "Stop recording changes for this member"
+                                                          : "Record samples and changes for this member");
                             }
                             ImGui::PopID();
                         }
@@ -2840,7 +2833,11 @@ void render_components(const InspectorInfo &info, const Snapshot &snapshot, int 
             ImGui::TreePop();
         ImGui::PopID();
     }
-    if (info.components.empty())
+    if (!info.component_query_error.empty()) {
+        ImGui::TextColored(ImVec4(0.95f, 0.45f, 0.38f, 1.0f), "Component query failed");
+        ImGui::TextWrapped("%s", info.component_query_error.c_str());
+    }
+    else if (info.components.empty())
         ImGui::TextDisabled("No additional components");
 }
 
@@ -2972,14 +2969,17 @@ void render_current_inspector(const Snapshot &snapshot) {
         return;
     }
 
-    ComponentTabState &tabs = component_tab_state(info.instance_id);
-    ImGui::TextDisabled("Selected GameObject:");
+    render_identity(info);
+    ImGui::Separator();
+    if (ImGui::SmallButton("Focus"))
+        enqueue_simple(CommandKind::FocusSelected, info.instance_id);
     ImGui::SameLine();
-    ImGui::TextColored(ImVec4(0.62f, 0.72f, 0.82f, 1.0f), "%s", info.name.c_str());
+    ImGui::BeginDisabled(!snapshot.camera_focus_active);
+    if (ImGui::SmallButton("Return"))
+        enqueue_simple(CommandKind::RestoreCamera, 0);
+    ImGui::EndDisabled();
     ImGui::SameLine();
-    ImGui::TextDisabled("Instance ID: %d", info.instance_id);
-    ImGui::SameLine();
-    if (ImGui::SmallButton("Save reference")) {
+    if (ImGui::SmallButton("Save Reference")) {
         Command command{};
         command.kind = CommandKind::PinManagedReference;
         command.instance_id = info.instance_id;
@@ -2987,20 +2987,9 @@ void render_current_inspector(const Snapshot &snapshot) {
     }
     ImGui::SameLine();
     if (info.camera_distance_valid)
-        ImGui::TextColored(ImVec4(0.60f, 0.68f, 0.60f, 1.0f), "%.1f units away", info.camera_distance);
+        ImGui::TextDisabled("%.1f units", info.camera_distance);
     else
         ImGui::TextDisabled("distance unavailable");
-    if (ImGui::SmallButton("Focus camera"))
-        enqueue_simple(CommandKind::FocusSelected, info.instance_id);
-    ImGui::SameLine();
-    ImGui::BeginDisabled(!snapshot.camera_focus_active);
-    if (ImGui::SmallButton("Return camera"))
-        enqueue_simple(CommandKind::RestoreCamera, 0);
-    ImGui::EndDisabled();
-    if (snapshot.camera_focus_active) {
-        ImGui::SameLine();
-        ImGui::TextDisabled("temporary focus");
-    }
     if (!snapshot.managed_references.empty()) {
         ImGui::SameLine();
         ImGui::TextDisabled("Saved refs: %zu", snapshot.managed_references.size());
@@ -3034,132 +3023,22 @@ void render_current_inspector(const Snapshot &snapshot) {
             RuntimeModel::instance().enqueue(std::move(command));
         }
     }
-    ImGui::PushStyleColor(ImGuiCol_Tab, ImVec4(0.13f, 0.13f, 0.13f, 1.0f));
-    ImGui::PushStyleColor(ImGuiCol_TabHovered, ImVec4(0.25f, 0.25f, 0.25f, 1.0f));
-    ImGui::PushStyleColor(ImGuiCol_TabSelected, ImVec4(0.30f, 0.43f, 0.56f, 1.0f));
-    if (ImGui::BeginTabBar("##inspector-tabs", ImGuiTabBarFlags_FittingPolicyScroll)) {
-        if (ImGui::BeginTabItem("GameObject")) {
-            render_identity(info);
     render_transform(info, snapshot.transform_clipboard);
-            render_component_list(info);
-            render_add_component_popup(info, snapshot);
-            ImGui::EndTabItem();
-        }
-        for (auto it = tabs.open_component_ids.begin(); it != tabs.open_component_ids.end();) {
-            const auto found =
-                std::find_if(info.components.begin(), info.components.end(),
-                             [id = *it](const ComponentInfo &component) { return component.instance_id == id; });
-            if (found == info.components.end()) {
-                it = tabs.open_component_ids.erase(it);
-                continue;
-            }
-            bool open = true;
-            ImGuiTabItemFlags flags =
-                tabs.activate_component_id == *it ? ImGuiTabItemFlags_SetSelected : ImGuiTabItemFlags_None;
-            const std::string label = found->type_name + "##component-tab-" + std::to_string(found->instance_id);
-            if (ImGui::BeginTabItem(label.c_str(), &open, flags)) {
-                std::array<char, 128> &filter = component_filter(found->instance_id);
-                bool &show_inherited = component_show_inherited(found->instance_id);
-                constexpr float scope_width = 190.0f;
-                const float available_width = ImGui::GetContentRegionAvail().x;
-                const bool scope_fits_inline = available_width >= scope_width + 150.0f;
-                ImGui::SetNextItemWidth(
-                    scope_fits_inline ? available_width - scope_width - ImGui::GetStyle().ItemSpacing.x : -1.0f);
-                ImGui::InputTextWithHint("##sticky-member-filter", "Filter fields, properties and methods...",
-                                         filter.data(), filter.size());
-                if (scope_fits_inline)
-                    ImGui::SameLine();
-                ImGui::SetNextItemWidth(scope_fits_inline ? scope_width : -1.0f);
-                if (ImGui::BeginCombo("##component-member-scope",
-                                      show_inherited ? "All members" : "Declared members only")) {
-                    if (ImGui::Selectable("All members (including inherited)", show_inherited))
-                        show_inherited = true;
-                    if (ImGui::Selectable("Declared members only", !show_inherited))
-                        show_inherited = false;
-                    ImGui::EndCombo();
-                }
-                ImGui::BeginChild("##component-tab-scroll", ImVec2(0.0f, 0.0f), false,
-                                  ImGuiWindowFlags_AlwaysVerticalScrollbar);
-                render_components(info, snapshot, found->instance_id, filter.data(), show_inherited);
-                ImGui::EndChild();
-                ImGui::EndTabItem();
-            }
-            if (!open)
-                it = tabs.open_component_ids.erase(it);
-            else
-                ++it;
-        }
-        tabs.activate_component_id = 0;
-        ImGui::EndTabBar();
-    }
-    ImGui::PopStyleColor(3);
+    std::array<char, 128>& filter = component_filter(info.instance_id);
+    bool& show_inherited = component_show_inherited(info.instance_id);
+    ImGui::SetNextItemWidth(std::max(120.0f, ImGui::GetContentRegionAvail().x - 135.0f));
+    ImGui::InputTextWithHint("##inspector-member-search", "Search Inspector members...", filter.data(), filter.size());
+    ImGui::SameLine();
+    ImGui::Checkbox("Debug", &show_inherited);
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Show inherited runtime members");
+    render_components(info, snapshot, 0, filter.data(), show_inherited);
+    render_add_component_popup(info, snapshot);
     ImGui::EndChild();
 }
 
 void render_inspector(const Snapshot &snapshot) {
-    ObjectTabState &tabs = object_tabs();
-    if (snapshot.inspector.valid)
-        remember_object_tab(snapshot.inspector);
-    else
-        tabs.last_seen_instance_id = 0;
-
-    // A click on the empty Hierarchy area intentionally clears the selection.
-    // The tab history is kept so objects can be revisited, but an empty
-    // selection is not an asynchronous load.  Rendering the tab bar here
-    // would make every remembered tab look stuck on "Loading..." until a new
-    // GameObject is selected.
-    if (!snapshot.inspector.valid) {
-        render_current_inspector(snapshot);
-        return;
-    }
-
-    if (tabs.tabs.empty()) {
-        render_current_inspector(snapshot);
-        return;
-    }
-    if (ImGui::BeginTabBar("##game-object-tabs", ImGuiTabBarFlags_FittingPolicyScroll)) {
-        int select_after_close = 0;
-        for (auto it = tabs.tabs.begin(); it != tabs.tabs.end();) {
-            bool open = true;
-            const int instance_id = it->instance_id;
-            const ImGuiTabItemFlags flags =
-                tabs.activate_instance_id == instance_id ? ImGuiTabItemFlags_SetSelected : ImGuiTabItemFlags_None;
-            const std::string label = it->name + "##game-object-tab-" + std::to_string(instance_id);
-            ImGui::PushStyleColor(ImGuiCol_Tab, ImVec4(0.13f, 0.13f, 0.13f, 1.0f));
-            ImGui::PushStyleColor(ImGuiCol_TabHovered, ImVec4(0.25f, 0.25f, 0.25f, 1.0f));
-            ImGui::PushStyleColor(ImGuiCol_TabSelected, ImVec4(0.30f, 0.43f, 0.56f, 1.0f));
-            if (ImGui::BeginTabItem(label.c_str(), &open, flags)) {
-                if (!snapshot.inspector.valid || snapshot.inspector.instance_id != instance_id) {
-                    // ImGui's visible tab can lag the model selection.
-                    const bool user_clicked_tab =
-                        ImGui::IsItemClicked(ImGuiMouseButton_Left) ||
-                        (ImGui::IsItemHovered() && ImGui::IsMouseReleased(ImGuiMouseButton_Left));
-                    if (user_clicked_tab)
-                        enqueue_simple(CommandKind::Select, instance_id);
-                    ImGui::TextDisabled("Loading %s...", it->name.c_str());
-                } else {
-                    render_current_inspector(snapshot);
-                }
-                ImGui::EndTabItem();
-            }
-            ImGui::PopStyleColor(3);
-            if (!open) {
-                const bool was_active = snapshot.inspector.valid && snapshot.inspector.instance_id == instance_id;
-                tabs.closed_instance_ids.insert(instance_id);
-                it = tabs.tabs.erase(it);
-                if (was_active && !tabs.tabs.empty())
-                    select_after_close = tabs.tabs.front().instance_id;
-                else if (was_active)
-                    select_after_close = -1;
-            } else {
-                ++it;
-            }
-        }
-        if (select_after_close != 0)
-            enqueue_simple(CommandKind::ClearSelection, 0);
-        tabs.activate_instance_id = 0;
-        ImGui::EndTabBar();
-    }
+    render_current_inspector(snapshot);
 }
 
 void render_current_object_inspector(const Snapshot &snapshot) {
@@ -3303,19 +3182,17 @@ void render_current_object_inspector(const Snapshot &snapshot) {
     if (ImGui::SmallButton("Clear"))
         filter_buffer.fill('\0');
     const std::string_view member_filter = filter_buffer.data();
-    // Keep the filter visible while member rows scroll.
     ImGui::BeginChild("##object-inspector-members", ImVec2(0.0f, 0.0f), false,
                       ImGuiWindowFlags_HorizontalScrollbar);
     auto render_members = [&](const char *id, const auto &members, const auto *values, const auto *references,
                               bool property_members) {
         if (!ImGui::BeginTable(
-                id, property_members ? 2 : 3,
+                id, 3,
                 ImGuiTableFlags_BordersInnerV | ImGuiTableFlags_SizingStretchProp | ImGuiTableFlags_NoPadOuterX))
             return;
         ImGui::TableSetupColumn("Member", ImGuiTableColumnFlags_WidthFixed, 190.0f);
         ImGui::TableSetupColumn("Value", ImGuiTableColumnFlags_WidthStretch);
-        if (!property_members)
-            ImGui::TableSetupColumn("Watch", ImGuiTableColumnFlags_WidthFixed, 82.0f);
+        ImGui::TableSetupColumn("Watch", ImGuiTableColumnFlags_WidthFixed, 82.0f);
         std::vector<std::size_t> visible_members;
         visible_members.reserve(members.size());
         for (std::size_t index = 0; index < members.size(); ++index)
@@ -3354,11 +3231,12 @@ void render_current_object_inspector(const Snapshot &snapshot) {
                                   snapshot.locked_member_keys.contains(key), true, info.token, member.runtime_safe,
                                   member.capability_reason, &snapshot.managed_references);
 				render_member_write_result(snapshot, 0, index, properties, info.token);
-                if (!property_members) {
-                    const Snapshot::FieldWatch* watch = field_watch_for(snapshot, 0, index, info.token);
+				{
+					const Snapshot::FieldWatch* watch = field_watch_for(snapshot, 0, index, info.token, property_members);
                     ImGui::TableSetColumnIndex(2);
                     if (ImGui::SmallButton(watch && watch->active ? "Stop watch" : "Watch"))
-                        enqueue_field_watch(0, static_cast<int>(index), !(watch && watch->active), info.token);
+                        enqueue_field_watch(0, static_cast<int>(index), !(watch && watch->active), info.token,
+                                            property_members);
                 }
                 ImGui::PopID();
             }
@@ -3459,15 +3337,21 @@ void render_object_inspector(const Snapshot &snapshot) {
         render_current_object_inspector(snapshot);
         return;
     }
-    // Keep object-tab selection explicit while content is updated asynchronously.
+    // Preserve explicit tab selection during asynchronous updates.
     if (tabs.selected_token == 0 ||
         std::none_of(tabs.tabs.begin(), tabs.tabs.end(),
                      [&tabs](const ObjectReferenceTabState::Tab &tab) { return tab.token == tabs.selected_token; }))
         tabs.selected_token = tabs.tabs.front().token;
 
     std::uint64_t close_token = 0;
+	bool close_all = false;
     ImGui::BeginChild("##object-reference-tab-strip", ImVec2(0.0f, 31.0f), false,
                       ImGuiWindowFlags_HorizontalScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
+	if (tabs.tabs.size() > 1) {
+		if (ImGui::SmallButton("Close all##object-reference-tabs"))
+			close_all = true;
+		ImGui::SameLine(0.0f, 6.0f);
+	}
     for (const ObjectReferenceTabState::Tab &tab : tabs.tabs) {
         ImGui::PushID(
             static_cast<int>(
@@ -3495,6 +3379,22 @@ void render_object_inspector(const Snapshot &snapshot) {
         ImGui::PopID();
     }
     ImGui::EndChild();
+	if (close_all) {
+		std::vector<std::uint64_t> tokens;
+		tokens.reserve(tabs.tabs.size());
+		for (const ObjectReferenceTabState::Tab& tab : tabs.tabs) {
+			tabs.closed_tokens.insert(tab.token);
+			tabs.requested_tokens.erase(tab.token);
+			tokens.push_back(tab.token);
+		}
+		tabs.tabs.clear();
+		tabs.pending_activation_token = 0;
+		tabs.selected_token = 0;
+		for (const std::uint64_t token : tokens)
+			close_object_reference_tab(token);
+		ImGui::TextDisabled("All object inspector tabs closed.");
+		return;
+	}
 
     if (close_token != 0) {
         tabs.closed_tokens.insert(close_token);
@@ -3723,6 +3623,7 @@ void render_class_browser(const Snapshot &snapshot) {
         command.class_name = state.selected.class_name;
         command.int_value = state.selected.is_component ? 1 : 0;
         command.bool_value = state.include_all_loaded;
+        command.class_is_unity_object = state.selected.is_unity_object;
         RuntimeModel::instance().enqueue(std::move(command));
     }
 
@@ -3960,6 +3861,10 @@ void render_class_browser(const Snapshot &snapshot) {
                             snapshot.class_browser_instances.size(), snapshot.class_browser_scanned_objects,
                             snapshot.class_browser_static_roots,
                             snapshot.class_browser_scan_truncated ? " (scan cap reached)" : "");
+        if (snapshot.class_browser_scan_active) {
+            ImGui::SameLine();
+            ImGui::TextColored(ImVec4(0.66f, 0.76f, 0.86f, 1.0f), "SCANNING...");
+        }
         ImGui::BeginChild("##class-browser-instances", ImVec2(0.0f, 150.0f), true);
         for (const ClassBrowserInstanceInfo &instance : snapshot.class_browser_instances) {
             ImGui::PushID(
@@ -4020,44 +3925,44 @@ int push_explorer_theme(float opacity) {
         return ImVec4(r, g, b, std::clamp(alpha * surface_opacity, 0.28f, 1.0f));
     };
 
-    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.91f, 0.95f, 0.99f, 1.0f));
-    ImGui::PushStyleColor(ImGuiCol_WindowBg, surface(0.045f, 0.070f, 0.110f, 0.96f));
-    ImGui::PushStyleColor(ImGuiCol_ChildBg, surface(0.065f, 0.100f, 0.145f, 0.92f));
-    ImGui::PushStyleColor(ImGuiCol_PopupBg, surface(0.075f, 0.100f, 0.155f, 0.98f));
-    ImGui::PushStyleColor(ImGuiCol_Border, color(0.27f, 0.47f, 0.61f, 0.72f));
+    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.82f, 0.82f, 0.82f, 1.0f));
+    ImGui::PushStyleColor(ImGuiCol_WindowBg, surface(0.176f, 0.176f, 0.176f, 0.99f));
+    ImGui::PushStyleColor(ImGuiCol_ChildBg, surface(0.157f, 0.157f, 0.157f, 0.97f));
+    ImGui::PushStyleColor(ImGuiCol_PopupBg, surface(0.205f, 0.205f, 0.205f, 0.99f));
+    ImGui::PushStyleColor(ImGuiCol_Border, color(0.105f, 0.105f, 0.105f, 0.95f));
     ImGui::PushStyleColor(ImGuiCol_BorderShadow, color(0.0f, 0.0f, 0.0f, 0.42f));
-    ImGui::PushStyleColor(ImGuiCol_TitleBg, surface(0.040f, 0.100f, 0.155f, 0.96f));
-    ImGui::PushStyleColor(ImGuiCol_TitleBgActive, surface(0.105f, 0.245f, 0.355f, 1.0f));
-    ImGui::PushStyleColor(ImGuiCol_FrameBg, color(0.085f, 0.145f, 0.205f, 0.90f));
-    ImGui::PushStyleColor(ImGuiCol_FrameBgHovered, color(0.125f, 0.220f, 0.295f, 0.96f));
-    ImGui::PushStyleColor(ImGuiCol_FrameBgActive, color(0.165f, 0.285f, 0.365f, 1.0f));
-    ImGui::PushStyleColor(ImGuiCol_Header, color(0.090f, 0.180f, 0.245f, 0.86f));
-    ImGui::PushStyleColor(ImGuiCol_HeaderHovered, color(0.115f, 0.255f, 0.335f, 0.96f));
-    ImGui::PushStyleColor(ImGuiCol_HeaderActive, color(0.155f, 0.320f, 0.405f, 1.0f));
-    ImGui::PushStyleColor(ImGuiCol_Button, color(0.095f, 0.175f, 0.245f, 0.92f));
-    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, color(0.135f, 0.255f, 0.345f, 0.98f));
-    ImGui::PushStyleColor(ImGuiCol_ButtonActive, color(0.185f, 0.325f, 0.425f, 1.0f));
-    ImGui::PushStyleColor(ImGuiCol_Separator, color(0.210f, 0.415f, 0.520f, 0.68f));
-    ImGui::PushStyleColor(ImGuiCol_SeparatorHovered, color(0.300f, 0.610f, 0.710f, 0.90f));
-    ImGui::PushStyleColor(ImGuiCol_SeparatorActive, color(0.370f, 0.710f, 0.790f, 1.0f));
-    ImGui::PushStyleColor(ImGuiCol_TableRowBg, color(0.060f, 0.115f, 0.165f, 0.78f));
-    ImGui::PushStyleColor(ImGuiCol_TableRowBgAlt, color(0.075f, 0.145f, 0.205f, 0.82f));
-    ImGui::PushStyleColor(ImGuiCol_TableHeaderBg, color(0.095f, 0.205f, 0.275f, 0.92f));
-    ImGui::PushStyleColor(ImGuiCol_TextDisabled, ImVec4(0.58f, 0.69f, 0.76f, 1.0f));
-    ImGui::PushStyleColor(ImGuiCol_CheckMark, ImVec4(0.32f, 0.88f, 0.72f, 1.0f));
-    ImGui::PushStyleColor(ImGuiCol_TextSelectedBg, color(0.235f, 0.520f, 0.680f, 0.86f));
-    ImGui::PushStyleColor(ImGuiCol_ScrollbarBg, color(0.035f, 0.070f, 0.100f, 0.86f));
-    ImGui::PushStyleColor(ImGuiCol_ScrollbarGrab, color(0.175f, 0.350f, 0.455f, 0.96f));
-    ImGui::PushStyleColor(ImGuiCol_ScrollbarGrabHovered, color(0.255f, 0.510f, 0.610f, 1.0f));
-    ImGui::PushStyleColor(ImGuiCol_ScrollbarGrabActive, color(0.335f, 0.620f, 0.700f, 1.0f));
-    ImGui::PushStyleColor(ImGuiCol_Tab, color(0.055f, 0.125f, 0.185f, 0.98f));
-    ImGui::PushStyleColor(ImGuiCol_TabHovered, color(0.150f, 0.340f, 0.445f, 1.0f));
-    ImGui::PushStyleColor(ImGuiCol_TabSelected, color(0.180f, 0.420f, 0.540f, 1.0f));
-    ImGui::PushStyleColor(ImGuiCol_TabDimmed, color(0.040f, 0.085f, 0.130f, 0.94f));
-    ImGui::PushStyleColor(ImGuiCol_TabDimmedSelected, color(0.105f, 0.245f, 0.315f, 0.98f));
+    ImGui::PushStyleColor(ImGuiCol_TitleBg, surface(0.145f, 0.145f, 0.145f, 0.99f));
+    ImGui::PushStyleColor(ImGuiCol_TitleBgActive, surface(0.205f, 0.205f, 0.205f, 1.0f));
+    ImGui::PushStyleColor(ImGuiCol_FrameBg, color(0.125f, 0.125f, 0.125f, 0.96f));
+    ImGui::PushStyleColor(ImGuiCol_FrameBgHovered, color(0.235f, 0.235f, 0.235f, 0.99f));
+    ImGui::PushStyleColor(ImGuiCol_FrameBgActive, color(0.270f, 0.270f, 0.270f, 1.0f));
+    ImGui::PushStyleColor(ImGuiCol_Header, color(0.235f, 0.235f, 0.235f, 0.95f));
+    ImGui::PushStyleColor(ImGuiCol_HeaderHovered, color(0.255f, 0.350f, 0.445f, 0.98f));
+    ImGui::PushStyleColor(ImGuiCol_HeaderActive, color(0.225f, 0.445f, 0.690f, 1.0f));
+    ImGui::PushStyleColor(ImGuiCol_Button, color(0.235f, 0.235f, 0.235f, 0.98f));
+    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, color(0.315f, 0.315f, 0.315f, 1.0f));
+    ImGui::PushStyleColor(ImGuiCol_ButtonActive, color(0.225f, 0.445f, 0.690f, 1.0f));
+    ImGui::PushStyleColor(ImGuiCol_Separator, color(0.105f, 0.105f, 0.105f, 0.95f));
+    ImGui::PushStyleColor(ImGuiCol_SeparatorHovered, color(0.32f, 0.49f, 0.62f, 0.95f));
+    ImGui::PushStyleColor(ImGuiCol_SeparatorActive, color(0.34f, 0.57f, 0.74f, 1.0f));
+    ImGui::PushStyleColor(ImGuiCol_TableRowBg, color(0.170f, 0.170f, 0.170f, 0.88f));
+    ImGui::PushStyleColor(ImGuiCol_TableRowBgAlt, color(0.195f, 0.195f, 0.195f, 0.90f));
+    ImGui::PushStyleColor(ImGuiCol_TableHeaderBg, color(0.235f, 0.235f, 0.235f, 0.98f));
+    ImGui::PushStyleColor(ImGuiCol_TextDisabled, ImVec4(0.57f, 0.59f, 0.62f, 1.0f));
+    ImGui::PushStyleColor(ImGuiCol_CheckMark, ImVec4(0.35f, 0.67f, 0.90f, 1.0f));
+    ImGui::PushStyleColor(ImGuiCol_TextSelectedBg, color(0.225f, 0.445f, 0.690f, 0.92f));
+    ImGui::PushStyleColor(ImGuiCol_ScrollbarBg, color(0.09f, 0.095f, 0.10f, 0.90f));
+    ImGui::PushStyleColor(ImGuiCol_ScrollbarGrab, color(0.28f, 0.29f, 0.31f, 0.98f));
+    ImGui::PushStyleColor(ImGuiCol_ScrollbarGrabHovered, color(0.36f, 0.38f, 0.40f, 1.0f));
+    ImGui::PushStyleColor(ImGuiCol_ScrollbarGrabActive, color(0.29f, 0.49f, 0.66f, 1.0f));
+    ImGui::PushStyleColor(ImGuiCol_Tab, color(0.145f, 0.145f, 0.145f, 0.99f));
+    ImGui::PushStyleColor(ImGuiCol_TabHovered, color(0.260f, 0.310f, 0.360f, 1.0f));
+    ImGui::PushStyleColor(ImGuiCol_TabSelected, color(0.235f, 0.235f, 0.235f, 1.0f));
+    ImGui::PushStyleColor(ImGuiCol_TabDimmed, color(0.125f, 0.125f, 0.125f, 0.97f));
+    ImGui::PushStyleColor(ImGuiCol_TabDimmedSelected, color(0.190f, 0.190f, 0.190f, 0.99f));
     ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 1.0f);
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 4.0f);
-    ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, 2.0f);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 0.0f);
+    ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, 0.0f);
     ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 1.0f);
     ImGui::PushStyleVar(ImGuiStyleVar_ChildBorderSize, 1.0f);
     ImGui::PushStyleVar(ImGuiStyleVar_FrameBorderSize, 1.0f);
@@ -4071,19 +3976,30 @@ int push_explorer_theme(float opacity) {
 
 int push_panel_accent(const ImVec4& accent, float opacity) {
     const float surface_opacity = std::clamp(opacity, 0.35f, 1.0f);
-    const auto tint = [&accent, surface_opacity](float base, float accent_weight, float alpha) {
-        return ImVec4(base + accent.x * accent_weight, base + accent.y * accent_weight,
-                      base + accent.z * accent_weight, std::clamp(alpha * surface_opacity, 0.25f, 1.0f));
+    const auto neutral = [surface_opacity](float base, float alpha) {
+        return ImVec4(base, base + 0.004f, base + 0.009f,
+                      std::clamp(alpha * surface_opacity, 0.25f, 1.0f));
     };
-    ImGui::PushStyleColor(ImGuiCol_WindowBg, tint(0.052f, 0.105f, 0.94f));
-    ImGui::PushStyleColor(ImGuiCol_ChildBg, tint(0.070f, 0.090f, 0.88f));
-    ImGui::PushStyleColor(ImGuiCol_Border, tint(0.170f, 0.240f, 0.78f));
-    ImGui::PushStyleColor(ImGuiCol_Separator, tint(0.145f, 0.190f, 0.66f));
-    ImGui::PushStyleColor(ImGuiCol_TitleBg, tint(0.040f, 0.145f, 0.97f));
-    ImGui::PushStyleColor(ImGuiCol_TitleBgActive, ImVec4(accent.x, accent.y, accent.z, 0.90f));
-    ImGui::PushStyleColor(ImGuiCol_TabSelected, tint(0.115f, 0.390f, 0.98f));
-    ImGui::PushStyleColor(ImGuiCol_TabHovered, tint(0.160f, 0.470f, 1.00f));
-    return 8;
+    ImGui::PushStyleColor(ImGuiCol_WindowBg, neutral(0.176f, 0.99f));
+    ImGui::PushStyleColor(ImGuiCol_ChildBg, neutral(0.157f, 0.97f));
+    ImGui::PushStyleColor(ImGuiCol_Border, neutral(0.105f, 0.95f));
+    ImGui::PushStyleColor(ImGuiCol_Separator, neutral(0.105f, 0.95f));
+    ImGui::PushStyleColor(ImGuiCol_TitleBg,
+                          ImVec4(0.105f + accent.x * 0.15f, 0.105f + accent.y * 0.15f,
+                                 0.105f + accent.z * 0.15f, 0.99f));
+    ImGui::PushStyleColor(ImGuiCol_TitleBgActive,
+                          ImVec4(0.125f + accent.x * 0.24f, 0.125f + accent.y * 0.24f,
+                                 0.125f + accent.z * 0.24f, 1.0f));
+    ImGui::PushStyleColor(ImGuiCol_TabSelected,
+                          ImVec4(0.145f + accent.x * 0.20f, 0.145f + accent.y * 0.20f,
+                                 0.145f + accent.z * 0.20f, 1.0f));
+    ImGui::PushStyleColor(ImGuiCol_TabHovered,
+                          ImVec4(0.155f + accent.x * 0.17f, 0.155f + accent.y * 0.17f,
+                                 0.155f + accent.z * 0.17f, 1.0f));
+    ImGui::PushStyleColor(ImGuiCol_Text,
+                          ImVec4(0.74f + accent.x * 0.14f, 0.74f + accent.y * 0.14f,
+                                 0.74f + accent.z * 0.14f, 1.0f));
+    return 9;
 }
 
 void draw_panel_accent_bar(const ImVec4& accent) {
@@ -4092,8 +4008,8 @@ void draw_panel_accent_bar(const ImVec4& accent) {
         return;
     const ImVec2 position = ImGui::GetWindowPos();
     const ImVec2 size = ImGui::GetWindowSize();
-    draw_list->AddRectFilled(position, ImVec2(position.x + 3.0f, position.y + size.y),
-                              ImGui::GetColorU32(ImVec4(accent.x, accent.y, accent.z, 0.82f)));
+    draw_list->AddLine(position, ImVec2(position.x + size.x, position.y),
+                       ImGui::GetColorU32(ImVec4(accent.x, accent.y, accent.z, 0.95f)), 2.0f);
 }
 
 void render_toggle_key_setting() {
@@ -4127,6 +4043,20 @@ void render_toggle_key_setting() {
 }
 
 void render_diagnostics(const Snapshot &snapshot) {
+    if (ImGui::Button("Create diagnostic bundle"))
+        RuntimeModel::instance().enqueue(Command{.kind = CommandKind::ExportDiagnosticBundle});
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Export backend, Unity version, capabilities, recent errors and the flight recorder");
+    if (!snapshot.diagnostic_bundle_path.empty()) {
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Copy bundle path"))
+            ImGui::SetClipboardText(snapshot.diagnostic_bundle_path.c_str());
+        ImGui::TextDisabled("Latest bundle: %s", snapshot.diagnostic_bundle_path.c_str());
+    }
+    ImGui::TextDisabled("%s | Unity %s | capabilities 0x%llX", snapshot.runtime_backend.c_str(),
+                        snapshot.unity_version.empty() ? "unavailable" : snapshot.unity_version.c_str(),
+                        static_cast<unsigned long long>(snapshot.runtime_capabilities));
+    ImGui::Separator();
     if (snapshot.diagnostics.empty()) {
         ImGui::TextDisabled("No errors or external overwrite events.");
     } else {
@@ -4156,6 +4086,10 @@ void render_diagnostics(const Snapshot &snapshot) {
     }
     if (ImGui::Button("Clear flight recorder"))
         RuntimeModel::instance().enqueue(Command{.kind = CommandKind::ClearFlightRecorder});
+}
+
+void render_reference_graph(const Snapshot& snapshot) {
+    ReferenceGraphUI::render(snapshot);
 }
 
 const ImGuiPlatformMonitor* find_secondary_monitor(const ImGuiViewport* main_viewport) {
@@ -4189,9 +4123,7 @@ void render_secondary_workspace(const ImGuiViewport* main_viewport) {
     if (!monitor || monitor->WorkSize.x <= 1.0f || monitor->WorkSize.y <= 1.0f)
         return;
 
-    // A panel-created viewport follows that panel while it is dragged, so it
-    // cannot act as a stable docking target. This separate host owns the
-    // secondary monitor's work area and stays in place while panels move.
+    // Use a stationary host as the secondary monitor's docking target.
     ImGuiWindowClass workspace_class{};
     workspace_class.ViewportFlagsOverrideSet =
         ImGuiViewportFlags_NoFocusOnAppearing | ImGuiViewportFlags_NoTaskBarIcon;
@@ -4224,7 +4156,6 @@ void render() {
 
     const auto snapshot = RuntimeModel::instance().snapshot();
     const ImGuiViewport *viewport = ImGui::GetMainViewport();
-    // Wait for a valid viewport before building the dock layout.
     if (!viewport || viewport->WorkSize.x <= 1.0f || viewport->WorkSize.y <= 1.0f)
         return;
     static const auto empty_hierarchy = std::make_shared<const HierarchyInfo>();
@@ -4239,8 +4170,8 @@ void render() {
     static bool show_class_browser = false;
     static bool show_method_traces = false;
     static bool show_field_watches = false;
+    static bool show_reference_graph = false;
     static bool show_diagnostics = false;
-    // Preserve the workspace size while tab contents change.
     static ImVec2 inspector_window_size{};
     static int previous_selection_id = 0;
     static std::uint64_t previous_object_token = 0;
@@ -4249,15 +4180,13 @@ void render() {
     static bool dock_layout_initialized = false;
     const bool selection_changed = snapshot->selected_instance_id != previous_selection_id;
     if (selection_changed) {
-        // Editor state belongs to the previous selection.
         member_buffers().clear();
         method_boolean_arguments().clear();
         component_filters().clear();
         component_inheritance_filters().clear();
         component_buffers() = {};
         previous_selection_id = snapshot->selected_instance_id;
-        // Selecting from the Hierarchy is also an explicit request to inspect
-        // that GameObject, even if the user previously closed the Inspector.
+        // Hierarchy selection reopens the Inspector.
         if (snapshot->selected_instance_id != 0)
             show_inspector = true;
     }
@@ -4275,12 +4204,13 @@ void render() {
     if (snapshot->method_traces.size() > previous_trace_count)
         show_method_traces = true;
     previous_trace_count = snapshot->method_traces.size();
+    if (snapshot->field_watches.size() > previous_field_watch_count)
+        show_field_watches = true;
     previous_field_watch_count = snapshot->field_watches.size();
 
     const int pushed_colors = push_explorer_theme(opacity);
     const ImGuiID dockspace_id = ImGui::GetID("URKExplorerDockSpace");
-    // Only establish the default layout once. Rebuilding it after a panel is
-    // opened or closed would forcibly pull panels back from a second monitor.
+    // Rebuilding the layout would pull detached panels back to the main viewport.
     if (!dock_layout_initialized || !ImGui::DockBuilderGetNode(dockspace_id)) {
         if (ImGui::DockBuilderGetNode(dockspace_id))
             ImGui::DockBuilderRemoveNode(dockspace_id);
@@ -4288,7 +4218,7 @@ void render() {
         ImGui::DockBuilderSetNodeSize(dockspace_id, work_size);
         ImGuiID workspace_dock = 0;
         ImGuiID content_dock = dockspace_id;
-        ImGui::DockBuilderSplitNode(content_dock, ImGuiDir_Up, 0.12f, &workspace_dock, &content_dock);
+        ImGui::DockBuilderSplitNode(content_dock, ImGuiDir_Up, 0.075f, &workspace_dock, &content_dock);
         ImGuiID hierarchy_dock = 0;
         ImGui::DockBuilderSplitNode(content_dock, ImGuiDir_Left, 0.27f, &hierarchy_dock, &content_dock);
         ImGuiID inspector_dock = 0;
@@ -4308,6 +4238,8 @@ void render() {
             ImGui::DockBuilderDockWindow("###urk-method-traces", content_dock);
         if (show_field_watches)
             ImGui::DockBuilderDockWindow("###urk-field-watches", content_dock);
+        if (show_reference_graph)
+            ImGui::DockBuilderDockWindow("###urk-reference-graph", content_dock);
         if (show_diagnostics)
             ImGui::DockBuilderDockWindow("###urk-diagnostics", diagnostics_dock);
         ImGui::DockBuilderFinish(dockspace_id);
@@ -4317,15 +4249,15 @@ void render() {
     render_secondary_workspace(viewport);
 
     ImGui::SetNextWindowPos(ImVec2(work_pos.x + 12.0f, work_pos.y + 12.0f), ImGuiCond_FirstUseEver);
-    ImGui::SetNextWindowSize(ImVec2(std::min(900.0f, work_size.x - 24.0f), 96.0f), ImGuiCond_FirstUseEver);
-    // Keep the workspace toolbar available while the overlay is open.
+    ImGui::SetNextWindowSize(ImVec2(std::min(980.0f, work_size.x - 24.0f), 74.0f), ImGuiCond_FirstUseEver);
     if (ImGui::Begin("URK Explorer Workspace", nullptr, ImGuiWindowFlags_NoCollapse)) {
-        ImGui::TextColored(ImVec4(0.62f, 0.72f, 0.82f, 1.0f), "%s", ModConfig::display_name);
+        ImGui::TextColored(ImVec4(0.91f, 0.92f, 0.94f, 1.0f), "%s", ModConfig::display_name);
         ImGui::SameLine();
-        ImGui::TextDisabled("%s Runtime Explorer  |  %s  |  v%s",
-                            ModConfig::backend_name, ModConfig::author, ModConfig::version);
+        ImGui::TextColored(ImVec4(0.42f, 0.69f, 0.91f, 1.0f), "%s", ModConfig::backend_name);
+        ImGui::SameLine();
+        ImGui::TextDisabled("Runtime Explorer  |  %s  |  v%s", ModConfig::author, ModConfig::version);
         ImGui::Separator();
-        if (ImGui::SmallButton("Panels"))
+        if (workspace_button("Panels", ImVec4(0.27f, 0.29f, 0.32f, 1.0f)))
             ImGui::OpenPopup("##workspace-panels");
         if (ImGui::BeginPopup("##workspace-panels")) {
             ImGui::TextDisabled("Visible panels");
@@ -4333,21 +4265,34 @@ void render() {
             ImGui::Checkbox("Inspector", &show_inspector);
             ImGui::Checkbox("Object Inspector", &show_object_inspector);
             ImGui::Checkbox("Class Browser", &show_class_browser);
-            ImGui::Checkbox("Method Traces", &show_method_traces);
-            ImGui::Checkbox("Field Watches", &show_field_watches);
+            ImGui::Checkbox("Method Calls", &show_method_traces);
+            ImGui::Checkbox("Value Watches", &show_field_watches);
+            ImGui::Checkbox("Reference Graph", &show_reference_graph);
             ImGui::Checkbox("Activity log", &show_diagnostics);
             ImGui::EndPopup();
         }
         ImGui::SameLine();
-        if (ImGui::SmallButton("Refresh"))
+        if (workspace_button("Refresh", ImVec4(0.22f, 0.39f, 0.54f, 1.0f)))
             enqueue_simple(CommandKind::Refresh, 0);
         ImGui::SameLine();
-        if (ImGui::SmallButton("Options"))
+        if (workspace_button("Runtime Monitor", ImVec4(0.47f, 0.34f, 0.20f, 1.0f))) {
+            show_method_traces = true;
+            show_field_watches = true;
+        }
+        ImGui::SameLine();
+        if (workspace_button("Reference Graph", ImVec4(0.20f, 0.40f, 0.48f, 1.0f)))
+            show_reference_graph = true;
+        ImGui::SameLine();
+        if (workspace_button("Diagnostics", ImVec4(0.47f, 0.27f, 0.24f, 1.0f)))
+            show_diagnostics = true;
+        ImGui::SameLine();
+        if (workspace_button("Options", ImVec4(0.29f, 0.29f, 0.31f, 1.0f)))
             ImGui::OpenPopup("##workspace-options");
         ImGui::SameLine();
         workspace_link_button("GitHub", ModConfig::url, ImVec4(0.24f, 0.34f, 0.44f, 1.0f));
         ImGui::SameLine();
-        workspace_link_button("Support", ModConfig::social, ImVec4(0.24f, 0.24f, 0.24f, 1.0f));
+        workspace_link_button("Support", ModConfig::social, ImVec4(0.88f, 0.66f, 0.13f, 1.0f),
+                              ImVec4(0.10f, 0.085f, 0.045f, 1.0f));
         if (ImGui::BeginPopup("##workspace-options")) {
             ImGui::SeparatorText("Overlay");
             bool live_data = snapshot->live_data;
@@ -4451,9 +4396,6 @@ void render() {
         const int panel_colors = push_panel_accent(accent, opacity);
         if (ImGui::Begin("Hierarchy##urk-hierarchy", &show_hierarchy, ImGuiWindowFlags_NoCollapse)) {
             draw_panel_accent_bar(accent);
-            ImGui::TextColored(ImVec4(0.68f, 0.68f, 0.68f, 1.0f), "%zu objects", hierarchy->objects);
-            ImGui::SameLine();
-            ImGui::TextDisabled("in %zu roots", hierarchy->roots);
             render_hierarchy(*hierarchy, snapshot->selected_instance_id, snapshot->transform_clipboard);
         }
         ImGui::End();
@@ -4461,7 +4403,7 @@ void render() {
     }
 
     if (show_inspector) {
-        const float inspector_width = std::max(480.0f, work_size.x * 0.46f);
+        const float inspector_width = std::max(340.0f, work_size.x * 0.30f);
         ImGui::SetNextWindowPos(ImVec2(work_pos.x + work_size.x - inspector_width - 12.0f, work_pos.y + 120.0f),
                                 ImGuiCond_FirstUseEver);
         if (inspector_window_size.x > 0.0f && inspector_window_size.y > 0.0f)
@@ -4469,9 +4411,7 @@ void render() {
         else
             ImGui::SetNextWindowSize(ImVec2(inspector_width, std::max(480.0f, work_size.y * 0.80f)),
                                      ImGuiCond_FirstUseEver);
-        const std::string title = snapshot->inspector.valid
-                                      ? "Inspector - " + snapshot->inspector.name + "###urk-inspector"
-                                      : "Inspector###urk-inspector";
+        const std::string title = "Inspector###urk-inspector";
         const ImVec4 accent(0.32f, 0.50f, 0.74f, 1.0f);
         const int panel_colors = push_panel_accent(accent, opacity);
         if (ImGui::Begin(title.c_str(), &show_inspector, ImGuiWindowFlags_NoCollapse)) {
@@ -4518,7 +4458,7 @@ void render() {
         ImGui::SetNextWindowPos(ImVec2(work_pos.x + work_size.x * 0.18f, work_pos.y + 145.0f), ImGuiCond_FirstUseEver);
         ImGui::SetNextWindowSize(ImVec2(std::max(680.0f, work_size.x * 0.58f), std::max(420.0f, work_size.y * 0.62f)),
                                  ImGuiCond_FirstUseEver);
-        const std::string title = "Method Traces (" + std::to_string(snapshot->method_traces.size()) + ")###urk-method-traces";
+        const std::string title = "Runtime Monitor - Calls (" + std::to_string(snapshot->method_traces.size()) + ")###urk-method-traces";
         const ImVec4 accent(0.72f, 0.51f, 0.30f, 1.0f);
         const int panel_colors = push_panel_accent(accent, opacity);
         if (ImGui::Begin(title.c_str(), &show_method_traces, ImGuiWindowFlags_NoCollapse)) {
@@ -4534,12 +4474,25 @@ void render() {
         ImGui::SetNextWindowSize(ImVec2(std::max(650.0f, work_size.x * 0.54f), std::max(360.0f, work_size.y * 0.54f)),
                                  ImGuiCond_FirstUseEver);
         const std::string title =
-            "Field Watches (" + std::to_string(snapshot->field_watches.size()) + ")###urk-field-watches";
+            "Runtime Monitor - Values (" + std::to_string(snapshot->field_watches.size()) + ")###urk-field-watches";
         const ImVec4 accent(0.63f, 0.42f, 0.54f, 1.0f);
         const int panel_colors = push_panel_accent(accent, opacity);
         if (ImGui::Begin(title.c_str(), &show_field_watches, ImGuiWindowFlags_NoCollapse)) {
             draw_panel_accent_bar(accent);
             render_field_watches(*snapshot);
+        }
+        ImGui::End();
+        ImGui::PopStyleColor(panel_colors);
+    }
+
+    if (show_reference_graph) {
+        ImGui::SetNextWindowPos(ImVec2(work_pos.x + work_size.x * 0.18f, work_pos.y + 145.0f), ImGuiCond_FirstUseEver);
+        ImGui::SetNextWindowSize(ImVec2(std::max(760.0f, work_size.x * 0.62f),
+                                       std::max(480.0f, work_size.y * 0.68f)), ImGuiCond_FirstUseEver);
+        const int panel_colors = push_panel_accent(ImVec4(0.31f, 0.55f, 0.68f, 1.0f), opacity);
+        if (ImGui::Begin("Reference Graph###urk-reference-graph", &show_reference_graph, ImGuiWindowFlags_NoCollapse)) {
+            draw_panel_accent_bar(ImVec4(0.31f, 0.55f, 0.68f, 1.0f));
+            render_reference_graph(*snapshot);
         }
         ImGui::End();
         ImGui::PopStyleColor(panel_colors);

@@ -47,6 +47,10 @@ class RuntimeModel {
     void load_component_class_catalog();
     void load_class_browser_catalog();
     void find_class_instances(const Command &command);
+    void build_reference_graph(const Command &command);
+    void clear_reference_graph();
+    void continue_class_instance_scan();
+    void clear_class_instance_scan();
     void load_class_browser_static_state(const Command &command);
     void load_class_browser_members(const Command &command);
     void set_class_browser_static_field(const Command &command);
@@ -65,6 +69,7 @@ class RuntimeModel {
     void clear_method_trace(MethodTracer::TraceId id);
     void close_method_trace(MethodTracer::TraceId id);
     void set_field_watch(const Command &command);
+    void configure_field_watch(const Command &command);
     void clear_field_watch(std::uint64_t id);
     void close_field_watch(std::uint64_t id);
     void release_all_field_watches();
@@ -157,16 +162,22 @@ class RuntimeModel {
     std::string active_metadata_stage_;
     std::shared_ptr<const ComponentClassCatalog> component_class_catalog_;
     std::shared_ptr<const ClassBrowserCatalog> class_browser_catalog_;
+    struct ClassInstanceScan;
+    std::unique_ptr<ClassInstanceScan> class_instance_scan_;
     ComponentReflection class_browser_reflection_;
     std::unordered_map<std::uint64_t, URK::Unity::Inspect::ObjectHandle> class_browser_handles_;
     std::unordered_map<std::uint64_t, URK::Unity::Inspect::ObjectHandle> class_browser_static_handles_;
+    std::unordered_map<std::uint64_t, URK::Unity::Inspect::ObjectHandle> reference_graph_handles_;
     std::unordered_set<std::uint64_t> sampled_component_members_;
     struct FieldWatchState {
         Snapshot::FieldWatch snapshot;
         URK::Unity::Inspect::FieldInfo field;
+        URK::Unity::Inspect::PropertyInfo property;
         URK::Unity::Inspect::ObjectHandle target_handle;
         URK::Unity::Inspect::ValueInfo last_value;
         bool has_baseline = false;
+        bool alarm_latched = false;
+        bool explorer_write_pending = false;
         Clock::time_point started{};
     };
     std::unordered_map<std::uint64_t, FieldWatchState> field_watches_;
@@ -204,6 +215,7 @@ class RuntimeModel {
         Clock::time_point requested{};
     } pending_scene_load_;
     std::string logged_hierarchy_signature_;
+    std::string logged_component_query_error_;
     Clock::time_point next_inspector_refresh_{};
     // Highlight bounds refresh more often than reflective inspector data.
     Clock::time_point next_highlight_refresh_{};
@@ -211,6 +223,7 @@ class RuntimeModel {
     Clock::time_point next_member_value_refresh_{};
     Clock::time_point next_field_watch_refresh_{};
     Clock::time_point next_trace_publish_{};
+    Clock::time_point next_class_scan_publish_{};
     bool event_refresh_pending_ = false;
     bool live_data_ = false;
     std::atomic<bool> native_faulted_{false};

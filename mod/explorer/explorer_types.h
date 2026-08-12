@@ -3,6 +3,7 @@
 
 #include "byte_data_decoder.h"
 #include "method_tracer.h"
+#include "watch_analysis.h"
 #include "sdk/unity/unity.h"
 #include "sdk/unity/unity_inspect.h"
 
@@ -257,9 +258,34 @@ struct InspectorInfo {
     float camera_distance = 0.0f;
     bool camera_distance_valid = false;
     std::vector<ComponentInfo> components;
+    std::string component_query_error;
 };
 
 struct Snapshot {
+    struct ReferenceGraph {
+        struct Node {
+            enum class Kind : std::uint8_t { ManagedObject, UnityObject, GameObject, Component, Array };
+            std::uint64_t token = 0;
+            std::string label;
+            std::string type_name;
+            std::string pointer_text;
+            std::size_t depth = 0;
+            float x = 0.0f;
+            float y = 0.0f;
+            Kind kind = Kind::ManagedObject;
+        };
+        struct Edge {
+            enum class Kind : std::uint8_t { Field, ArrayElement, Component, Owner, BackReference };
+            std::size_t from = 0;
+            std::size_t to = 0;
+            std::string label;
+            Kind kind = Kind::Field;
+        };
+        std::vector<Node> nodes;
+        std::vector<Edge> edges;
+        bool truncated = false;
+        std::string status;
+    };
     struct TransformClipboard {
         bool valid = false;
         int source_instance_id = 0;
@@ -280,14 +306,21 @@ struct Snapshot {
         double seconds_since_start = 0.0;
         std::string previous_value;
         std::string current_value;
+        std::string source;
+        bool alarm_triggered = false;
         // Lets the history open a referenced object while it remains alive.
         ComponentInfo::LiveValues::Reference current_reference;
+    };
+    struct FieldWatchSample {
+        double seconds_since_start = 0.0;
+        float value = 0.0f;
     };
     struct FieldWatch {
         std::uint64_t id = 0;
         int component_instance_id = 0;
         std::uint64_t object_inspector_token = 0;
         std::size_t field_index = 0;
+        bool property = false;
         std::string component_type;
         std::string field_name;
         std::string field_type;
@@ -296,7 +329,12 @@ struct Snapshot {
         std::string current_value;
         ComponentInfo::LiveValues::Reference current_reference;
         std::uint64_t change_count = 0;
+        WatchAnalysis::AlarmCondition alarm_condition = WatchAnalysis::AlarmCondition::Disabled;
+        double alarm_threshold = 0.0;
+        bool alarm_active = false;
+        std::uint64_t alarm_count = 0;
         std::vector<FieldWatchEvent> events;
+        std::vector<FieldWatchSample> samples;
     };
     struct MethodResult {
         int component_instance_id = 0;
@@ -331,6 +369,7 @@ struct Snapshot {
     std::size_t class_browser_scanned_objects = 0;
     std::size_t class_browser_static_roots = 0;
     bool class_browser_scan_truncated = false;
+    bool class_browser_scan_active = false;
     InspectorInfo inspector;
     ObjectInspectorInfo object_inspector;
     TransformClipboard transform_clipboard;
@@ -345,6 +384,11 @@ struct Snapshot {
     bool camera_focus_active = false;
     int selected_instance_id = 0;
     std::string status;
+    std::string runtime_backend;
+    std::string unity_version;
+    std::uint64_t runtime_capabilities = 0;
+    std::string diagnostic_bundle_path;
+    ReferenceGraph reference_graph;
     std::vector<std::string> diagnostics;
     // Native-only breadcrumb data: retained across an SEH recovery so the
     // operation that faulted is still visible after managed state is released.

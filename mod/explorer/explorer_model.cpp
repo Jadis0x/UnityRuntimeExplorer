@@ -2,6 +2,9 @@
 #include "explorer_model.h"
 
 #include "method_trace_value_decoder.h"
+#include "diagnostic_bundle.h"
+#include "reference_graph_layout.h"
+#include "config/mod_config.h"
 
 #include "support/mod_log.h"
 #include "ui/highlight.h"
@@ -44,8 +47,7 @@ namespace Explorer {
 		constexpr int kMaxHierarchyDepth = 256;
 		constexpr std::size_t kMaxCensusCandidates = 250000;
 		constexpr std::size_t kArrayPageSize = 128;
-		// The byte decoder receives a native copy of managed data. Keep that copy
-		// bounded so a large asset cannot create an unbounded inspector snapshot.
+		// Bound native byte snapshots before decoding.
 		constexpr std::size_t kMaxByteArrayInspectionBytes = 256 * 1024;
 		constexpr std::size_t kLiveByteArrayRefreshLimit = 4096;
 		constexpr std::size_t kMaxHighlightRenderers = 48;
@@ -100,8 +102,7 @@ namespace Explorer {
 			bool active = false;
 		};
 
-		// Owns a temporary managed root while a queued GameObject command is running.
-		// The root is transferred to RuntimeModel for a successful selection.
+		// Temporary root transferred to RuntimeModel after selection succeeds.
 		struct ScopedObjectRoot {
 			Inspect::ObjectHandle handle{};
 
@@ -534,50 +535,6 @@ namespace Explorer {
 			return memory.State == MEM_COMMIT && (memory.Protect & (PAGE_NOACCESS | PAGE_GUARD)) == 0;
 		}
 
-		bool copy_readable_c_string(const char* value, std::string& output) {
-			output.clear();
-			if (!value)
-				return true;
-			constexpr std::size_t kMaxMetadataString = 512;
-			for (std::size_t index = 0; index < kMaxMetadataString; ++index) {
-				if (!readable_address(reinterpret_cast<std::uintptr_t>(value + index)))
-					return false;
-				if (value[index] == '\0') {
-					output.assign(value, index);
-					return true;
-				}
-			}
-			return false;
-		}
-
-		bool safe_class_display_name(const void* klass, std::string& output) {
-			output.clear();
-			if (!klass || !readable_address(reinterpret_cast<std::uintptr_t>(klass)))
-				return false;
-#if defined(_WIN32)
-			__try {
-#endif
-			const char* namespc = URK::managed::class_get_namespace(
-				static_cast<const URK::managed::Class*>(klass));
-			const char* name = URK::managed::class_get_name(
-				static_cast<const URK::managed::Class*>(klass));
-			std::string namespace_text;
-			std::string name_text;
-			if (!copy_readable_c_string(namespc, namespace_text) ||
-				!copy_readable_c_string(name, name_text) || name_text.empty())
-				return false;
-			output = namespace_text.empty() ? std::move(name_text)
-				: namespace_text + "." + name_text;
-			return true;
-#if defined(_WIN32)
-			} __except (capture_native_fault(_exception_info())) {
-				clear_error();
-				output.clear();
-				return false;
-			}
-#endif
-		}
-
 		// Destroyed Unity wrappers can keep a valid address and instance ID.
 		// UnityEngine.Object.op_Implicit is the backend-neutral Unity lifetime check.
 		bool safe_object_alive(Object object) {
@@ -674,11 +631,8 @@ namespace Explorer {
 			if (!method.handle || method.name.empty())
 				return;
 #if defined(URK_BACKEND_MONO)
-			// mono_compile_method is not a metadata query: Unity Mono can reject
-			// abstract, internal-call, or otherwise non-JITtable methods with a
-			// native exception. Caller naming is optional, so never compile every
-			// inspected method just to populate this best-effort index. The trace
-			// path still compiles only the explicit method selected by the user.
+			// Avoid compiling arbitrary Mono metadata methods; non-JITtable methods
+			// can raise native exceptions. Explicit trace targets remain supported.
 			return;
 #else
 #if defined(_WIN32)
@@ -697,10 +651,28 @@ namespace Explorer {
 #if defined(_WIN32)
 			}
 			__except (capture_native_fault(_exception_info())) {
-				// Caller names are optional. Do not fall back to a domain-wide scan here.
+				// Caller names do not justify a domain-wide fallback scan.
 			}
 #endif
 		#endif
+		}
+
+		std::string unity_version_text() {
+			constexpr const char* images[] = {"UnityEngine.CoreModule.dll", "UnityEngine.dll", ""};
+			for (const char* image : images) {
+				const URK::managed::Class* application =
+					URK::managed::find_class(image, "UnityEngine", "Application");
+				if (!application)
+					continue;
+				for (const Inspect::PropertyInfo& property : Inspect::properties_from_class(application, true)) {
+					if (property.name != "unityVersion" || !property.is_static || !property.can_read)
+						continue;
+					const Inspect::ValueInfo value = Inspect::ReadProperty({}, property);
+					if (value.readable && !value.display.empty())
+						return value.display;
+				}
+			}
+			return "unavailable";
 		}
 
 		std::string managed_caller_location(std::uintptr_t address) {
@@ -723,10 +695,7 @@ namespace Explorer {
 			if (!readable_address(address))
 				return fallback + " (reference no longer readable)";
 
-			// The detour only records a raw register value. Resolve its runtime
-			// type later on the Explorer thread, under the normal SEH boundary.
-			// This keeps managed calls out of the hook while making a live
-			// reference substantially more useful than an address-only label.
+			// Resolve captured register values on the Explorer thread under SEH.
 			const Inspect::TypeInfo actual = safe_type_of(Object{reinterpret_cast<void*>(address)});
 			if (!actual.handle)
 				return fallback + " (runtime type unavailable)";
@@ -734,35 +703,6 @@ namespace Explorer {
 			if (!declared_type.empty() && actual_name != declared_type)
 				return actual_name + " (declared " + std::string(declared_type) + ")";
 			return actual_name;
-		}
-
-		std::string describe_traced_string(std::uint64_t raw) {
-			const std::uintptr_t address = static_cast<std::uintptr_t>(raw);
-			const std::string fallback = "System.String @ " + pointer_text(reinterpret_cast<void*>(address));
-			if (!address)
-				return "null";
-			if (!readable_address(address))
-				return fallback + " (no longer readable)";
-
-			// Decode strings on the Explorer thread, inside the normal native-fault guard.
-#if defined(_WIN32)
-			__try {
-#endif
-				auto* value = reinterpret_cast<URK::managed::String*>(address);
-				const std::int32_t length = URK::managed::string_length(value);
-				if (length < 0 || length > 4096)
-					return fallback + " (invalid length)";
-				std::vector<char> utf8(static_cast<std::size_t>(length) * 4u + 1u, '\0');
-				if (!URK::managed::string_to_utf8(value, utf8.data(), utf8.size()))
-					return fallback + " (could not decode)";
-				return "\"" + std::string(utf8.data()) + "\"";
-#if defined(_WIN32)
-			}
-			__except (capture_native_fault(_exception_info())) {
-				clear_error();
-				return fallback + " (unavailable)";
-			}
-#endif
 		}
 
 		std::string assembly_name(const Inspect::TypeInfo& type) {
@@ -786,6 +726,24 @@ namespace Explorer {
 		std::unordered_map<int, std::size_t> flat_indices;
 		Clock::time_point started{};
 		std::chrono::microseconds max_slice{};
+	};
+
+	struct RuntimeModel::ClassInstanceScan {
+		enum class Phase { StaticRoots, UnityRoots, ReachableGraph };
+		struct PendingObject {
+			Inspect::ObjectHandle handle;
+			int depth = 0;
+			bool array = false;
+			std::string source;
+		};
+		Phase phase = Phase::StaticRoots;
+		const URK::managed::Class* target = nullptr;
+		const URK::managed::Class* unity_object_base = nullptr;
+		bool include_all_loaded = true;
+		std::size_t assembly_index = 0;
+		std::size_t class_index = 0;
+		std::deque<PendingObject> pending;
+		std::unordered_set<void*> seen;
 	};
 
 	RuntimeModel::~RuntimeModel() = default;
@@ -812,6 +770,7 @@ namespace Explorer {
 		next_member_value_refresh_ = Clock::now();
 		next_field_watch_refresh_ = Clock::now();
 		next_trace_publish_ = Clock::now();
+		next_class_scan_publish_ = Clock::now();
 		request_refresh();
 	}
 
@@ -824,15 +783,11 @@ namespace Explorer {
 
 	void RuntimeModel::tick() {
 		if (native_faulted_.exchange(false, std::memory_order_acq_rel)) {
-			// An invalid managed pointer may also make gchandle_free unsafe.  Drop
-			// the native copies first, then wait for the current Unity transition
-			// to settle before asking the managed runtime for a new hierarchy.
+			// Defer managed handle release after faults; the handle may be invalid.
 			discard_managed_state_after_native_fault();
 			{
 				std::lock_guard<std::mutex> lock(command_mutex_);
-				// Preserve navigation/lifecycle input received after the fault.
-				// These commands re-resolve their targets and do not depend on the
-				// discarded reflection pointers.
+				// Preserve commands that re-resolve targets after recovery.
 				std::erase_if(commands_, [](const Command& command) {
 					return command.kind != CommandKind::Select && command.kind != CommandKind::ClearSelection &&
 						command.kind != CommandKind::Refresh && command.kind != CommandKind::SceneHint &&
@@ -862,6 +817,8 @@ namespace Explorer {
 		if (native_faulted_.load(std::memory_order_acquire))
 			return;
 		update_pending_scene_load();
+		if (class_instance_scan_)
+			continue_class_instance_scan();
 
 		const Clock::time_point now = Clock::now();
 		update_camera_focus();
@@ -920,6 +877,8 @@ namespace Explorer {
 	void RuntimeModel::stop() {
 		MethodTracer::stop_all();
 		hierarchy_census_.reset();
+		clear_class_instance_scan();
+		clear_reference_graph();
 		clear_selection();
 		ModUI::Highlight::enqueue_clear();
 		hierarchy_instance_ids_.clear();
@@ -1062,10 +1021,7 @@ namespace Explorer {
 			}
 			if (native_fault) {
 				record_flight("FAULT", command_name(command.kind), "native access violation");
-				// A malformed member record belongs to one component. Keep the
-				// rooted GameObject, hierarchy, and unrelated inspector state
-				// intact, and expose an explicit retry instead of converting a
-				// reflection failure into a workspace-wide recovery.
+				// Isolate malformed metadata to its component and retain other state.
 				if (command.kind == CommandKind::LoadComponentMetadata) {
 					const auto component = std::find_if(
 						working_.inspector.components.begin(), working_.inspector.components.end(),
@@ -1122,9 +1078,7 @@ namespace Explorer {
 					commands_ = std::move(retry);
 				}
 				ModLog::warn("Command fault disposition: safe_requeued=%zu unsafe_dropped=%zu", safe_requeued, dropped);
-				// Do not continue this tick: publishing, refreshing, or freeing a
-				// stale handle can immediately repeat the same fault. The next
-				// tick uses the native-only recovery path.
+				// Defer publication and managed cleanup to the recovery tick.
 				notify_native_fault(g_native_fault.code, g_native_fault.address, g_native_fault.instruction);
 				return;
 			}
@@ -1166,6 +1120,8 @@ namespace Explorer {
 			command.kind == CommandKind::InvokeMethod ||
 			command.kind == CommandKind::SetMethodTrace || command.kind == CommandKind::ClearMethodTrace ||
 			command.kind == CommandKind::CloseMethodTrace || command.kind == CommandKind::SetFieldWatch ||
+			command.kind == CommandKind::ConfigureFieldWatch ||
+			command.kind == CommandKind::BuildReferenceGraph || command.kind == CommandKind::ClearReferenceGraph ||
 			command.kind == CommandKind::ClearFieldWatch || command.kind == CommandKind::CloseFieldWatch ||
 			command.kind == CommandKind::InspectReference || command.kind == CommandKind::InspectRawReference ||
 			command.kind == CommandKind::CloseObjectInspectorTab ||
@@ -1178,10 +1134,12 @@ namespace Explorer {
 			command.kind == CommandKind::SetCameraFocusOffset ||
 			command.kind == CommandKind::LoadScene || command.kind == CommandKind::PinManagedReference ||
 			command.kind == CommandKind::ReleaseManagedReference || command.kind == CommandKind::ClearManagedReferences;
+		// Diagnostic export is native-only and does not require a selected GameObject.
+		const bool diagnostic_command = command.kind == CommandKind::ExportDiagnosticBundle;
 		const bool event_command = command.kind == CommandKind::ObjectDestroyRequested;
 		ScopedObjectRoot command_root;
 		GameObject object{};
-		const bool needs_object = !component_command && !event_command && command.kind != CommandKind::Refresh &&
+		const bool needs_object = !component_command && !event_command && !diagnostic_command && command.kind != CommandKind::Refresh &&
 			command.kind != CommandKind::ClearSelection && command.kind != CommandKind::SceneHint &&
 			command.kind != CommandKind::ClearDiagnostics && command.kind != CommandKind::ClearFlightRecorder &&
 			command.kind != CommandKind::RestoreCamera;
@@ -1204,7 +1162,7 @@ namespace Explorer {
 		if (!object && command.kind != CommandKind::Refresh && command.kind != CommandKind::ClearSelection &&
 			command.kind != CommandKind::SceneHint && command.kind != CommandKind::ClearDiagnostics &&
 			command.kind != CommandKind::ClearFlightRecorder && command.kind != CommandKind::RestoreCamera && !component_command &&
-			!event_command) {
+			!event_command && !diagnostic_command) {
 			set_status("Object is no longer available");
 			request_refresh();
 			return;
@@ -1218,9 +1176,7 @@ namespace Explorer {
 			full_inspector_refresh = true;
 			break;
 		case CommandKind::FocusSelected:
-			// A hierarchy double-click is both a selection and a focus action.
-			// Keeping the old Inspector selection made the highlight point at one
-			// object while the camera followed another.
+			// Keep selection and camera focus on the same hierarchy target.
 			if (object.GetInstanceID() != working_.selected_instance_id) {
 				select_object(object, command_root.release());
 				refresh_inspector(true);
@@ -1260,6 +1216,35 @@ namespace Explorer {
 			return;
 		case CommandKind::SetFieldWatch:
 			set_field_watch(command);
+			publish();
+			return;
+		case CommandKind::ExportDiagnosticBundle: {
+			working_.runtime_backend = ModConfig::backend_name;
+			working_.runtime_capabilities = URK::runtime_capabilities();
+			if (working_.unity_version.empty())
+				working_.unity_version = unity_version_text();
+			const DiagnosticBundle::Result result = DiagnosticBundle::write(working_);
+			if (result.succeeded) {
+				working_.diagnostic_bundle_path = result.path;
+				set_status("Diagnostic bundle saved: " + result.path);
+			}
+			else {
+				set_status("Diagnostic bundle failed: " + result.error);
+			}
+			publish();
+			return;
+		}
+		case CommandKind::BuildReferenceGraph:
+			build_reference_graph(command);
+			publish();
+			return;
+		case CommandKind::ClearReferenceGraph:
+			clear_reference_graph();
+			set_status("Reference graph cleared");
+			publish();
+			return;
+		case CommandKind::ConfigureFieldWatch:
+			configure_field_watch(command);
 			publish();
 			return;
 		case CommandKind::ClearFieldWatch:
@@ -1619,15 +1604,14 @@ namespace Explorer {
 		case CommandKind::SceneHint:
 			++scene_generation_;
 			hierarchy_census_.reset();
+			clear_class_instance_scan();
+			clear_reference_graph();
 			ModLog::info("Scene generation advanced: generation=%llu handle=%d name=%s",
 				static_cast<unsigned long long>(scene_generation_), command.int_value,
 				command.text.empty() ? "<unknown>" : command.text.c_str());
 			active_scene_handle_hint_ = command.int_value;
 			active_scene_name_hint_ = command.text;
-			// The runtime scene callback is the authoritative activation signal.
-			// Do not require a second reflection call through Unity's boxed Scene
-			// value type: older Mono players can reject that query while the scene
-			// has already been activated successfully.
+			// Treat the runtime callback as authoritative for scene activation.
 			if (pending_scene_load_.active) {
 				const bool build_index_matches = pending_scene_load_.build_index >= 0 &&
 					command.member_index == pending_scene_load_.build_index;
@@ -1664,10 +1648,7 @@ namespace Explorer {
 		}
 
 		refresh_inspector(full_inspector_refresh);
-		// A selection already validates and snapshots the GameObject.  Defer the
-		// optional global camera/renderer census to a later refresh: it is the
-		// broadest Unity traversal in this path and must not make a valid
-		// hierarchy selection fail on games that destroy objects mid-frame.
+		// Defer the global camera/renderer census beyond the selection path.
 		if (command.kind != CommandKind::Select)
 			update_highlight();
 		publish();
@@ -1919,9 +1900,7 @@ namespace Explorer {
 		working_.hierarchy = hierarchy_;
 
 		if (working_.selected_instance_id != 0) {
-			// Do not replace the rooted selection with the hierarchy's raw wrapper.
-			// The census array no longer roots those wrappers after this function
-			// returns, which made high-churn games reuse freed managed addresses.
+			// Keep the rooted selection; census wrappers expire with their array.
 			if (!hierarchy_instance_ids_.contains(working_.selected_instance_id) || !resolve_selected_object())
 				clear_selection();
 		}
@@ -1959,8 +1938,22 @@ namespace Explorer {
 			info.namespace_name = object_type.namespc;
 			info.class_name = object_type.name;
 			info.components.clear();
+			info.component_query_error.clear();
 			clear_component_cache();
 			const auto components = selected_.GetComponentsRooted<Component>();
+			if (const char* error = last_error(); error && error[0]) {
+				info.component_query_error = error;
+				const std::string signature = std::to_string(instance_id) + "|" + info.component_query_error;
+				if (signature != logged_component_query_error_) {
+					logged_component_query_error_ = signature;
+					ModLog::warn("component query failed: gameObject=%s id=%d error=%s", info.name.c_str(),
+						instance_id, info.component_query_error.c_str());
+				}
+				clear_error();
+			}
+			else {
+				logged_component_query_error_.clear();
+			}
 			for (const Component& candidate : components) {
 				if (!candidate)
 					continue;
@@ -2237,9 +2230,7 @@ namespace Explorer {
 			if (const char* error = last_error(); error && error[0])
 				metadata_warnings.push_back(std::string(section) + ": " + error);
 			};
-		// Capture the class once from the rooted component. Re-reading it before
-		// each section allowed a destroyed/recreated wrapper to mix metadata from
-		// different objects into one snapshot.
+		// Capture one class identity for the complete component snapshot.
 		enumerate("Fields", [&] { reflection.fields = Inspect::fields_from_class(klass, true); });
 		enumerate("Properties", [&] { reflection.properties = Inspect::properties_from_class(klass, true); });
 		enumerate("Methods", [&] { reflection.methods = Inspect::methods_from_class(klass, true); });
@@ -2520,6 +2511,7 @@ namespace Explorer {
 	}
 
 	void RuntimeModel::find_class_instances(const Command& command) {
+		clear_class_instance_scan();
 		for (auto& [_, handle] : class_browser_handles_)
 			Inspect::FreeObjectHandle(handle);
 		class_browser_handles_.clear();
@@ -2534,6 +2526,16 @@ namespace Explorer {
 		working_.class_browser_query.full_name =
 			command.namespc.empty() ? command.class_name : command.namespc + "." + command.class_name;
 		working_.class_browser_query.is_component = command.int_value != 0;
+		working_.class_browser_query.is_unity_object = command.class_is_unity_object;
+		if (class_browser_catalog_) {
+			const auto selected = std::find_if(class_browser_catalog_->classes.begin(), class_browser_catalog_->classes.end(),
+				[&](const BrowserClassInfo& entry) {
+					return entry.image == command.image && entry.namespc == command.namespc &&
+						entry.class_name == command.class_name;
+				});
+			if (selected != class_browser_catalog_->classes.end())
+				working_.class_browser_query = *selected;
+		}
 		if (command.class_name.empty()) {
 			set_status("Choose a class before finding instances");
 			return;
@@ -2546,7 +2548,9 @@ namespace Explorer {
 			return;
 		}
 
-		// Query instances through Unity's managed API; inspect statics separately.
+		// UnityEngine.Object subclasses have a complete, direct runtime query and
+		// do not need the managed reachability scan used for ordinary classes.
+		if (working_.class_browser_query.is_unity_object) {
 		const auto direct_instances = command.bool_value
 			? detail::FindObjectsUsingRooted<Object>(ResourcesType, "FindObjectsOfTypeAll", command.image,
 				command.namespc, command.class_name)
@@ -2583,44 +2587,68 @@ namespace Explorer {
 		set_status("Found " + std::to_string(working_.class_browser_instances.size()) + " Unity instance(s) of " +
 			working_.class_browser_query.full_name);
 		return;
+		}
 
-		const URK::managed::Class* object_base =
+		class_instance_scan_ = std::make_unique<ClassInstanceScan>();
+		class_instance_scan_->target = target;
+		class_instance_scan_->include_all_loaded = command.bool_value;
+		class_instance_scan_->unity_object_base =
 			URK::managed::find_class("UnityEngine.CoreModule.dll", "UnityEngine", "Object");
-		if (!object_base)
-			object_base = URK::managed::find_class("UnityEngine.dll", "UnityEngine", "Object");
+		if (!class_instance_scan_->unity_object_base)
+			class_instance_scan_->unity_object_base =
+				URK::managed::find_class("UnityEngine.dll", "UnityEngine", "Object");
+		working_.class_browser_scan_active = true;
+		next_class_scan_publish_ = Clock::now();
+		set_status("Scanning managed roots for " + working_.class_browser_query.full_name + "...");
+	}
 
-		struct PendingObject {
-			Object object;
-			int depth = 0;
-			bool array = false;
-			std::string source;
-		};
+	void RuntimeModel::clear_class_instance_scan() {
+		if (class_instance_scan_) {
+			for (ClassInstanceScan::PendingObject& pending : class_instance_scan_->pending)
+				Inspect::FreeObjectHandle(pending.handle);
+			class_instance_scan_.reset();
+		}
+		working_.class_browser_scan_active = false;
+	}
+
+	void RuntimeModel::continue_class_instance_scan() {
+		if (!class_instance_scan_)
+			return;
+		ClassInstanceScan& scan = *class_instance_scan_;
 		constexpr std::size_t kMaxGraphNodes = 30000;
 		constexpr std::size_t kMaxArrayElements = 256;
 		constexpr int kMaxGraphDepth = 5;
 		constexpr std::size_t kMaxInstanceResults = 512;
-		std::deque<PendingObject> pending;
-		std::unordered_set<void*> seen;
+		const Clock::time_point deadline = Clock::now() + std::chrono::milliseconds(3);
 		const auto enqueue_object = [&](Object object, int depth, bool array, std::string source) {
-			if (!object.handle() || seen.size() >= kMaxGraphNodes)
+			if (!object.handle() || scan.seen.size() >= kMaxGraphNodes)
 				return false;
-			if (!seen.insert(object.handle()).second)
-				return true;
-			pending.push_back({ object, depth, array, std::move(source) });
+			if (!scan.seen.insert(object.handle()).second)
+				return false;
+			Inspect::ObjectHandle handle = Inspect::PinObject(object);
+			if (!handle.handle) {
+				scan.seen.erase(object.handle());
+				return false;
+			}
+			scan.pending.push_back({handle, depth, array, std::move(source)});
 			return true;
-			};
+		};
 
-		// Static references cover non-Unity managed singletons and interfaces.
-		const std::size_t assembly_count = std::min<std::size_t>(URK::managed::domain_get_assembly_count(), 4096);
-		for (std::size_t assembly_index = 0; assembly_index < assembly_count && seen.size() < kMaxGraphNodes;
-			++assembly_index) {
-			const URK::managed::Assembly* assembly = URK::managed::domain_get_assembly(assembly_index);
-			const URK::managed::Image* image = assembly ? URK::managed::assembly_get_image(assembly) : nullptr;
-			if (!image)
-				continue;
-			const std::size_t class_count = std::min<std::size_t>(URK::managed::image_get_class_count(image), 1000000);
-			for (std::size_t class_index = 0; class_index < class_count && seen.size() < kMaxGraphNodes; ++class_index) {
-				const URK::managed::Class* klass = URK::managed::image_get_class(image, class_index);
+		if (scan.phase == ClassInstanceScan::Phase::StaticRoots) {
+			const std::size_t assembly_count =
+				std::min<std::size_t>(URK::managed::domain_get_assembly_count(), 4096);
+			while (scan.assembly_index < assembly_count && Clock::now() < deadline &&
+				scan.seen.size() < kMaxGraphNodes) {
+				const URK::managed::Assembly* assembly = URK::managed::domain_get_assembly(scan.assembly_index);
+				const URK::managed::Image* image = assembly ? URK::managed::assembly_get_image(assembly) : nullptr;
+				const std::size_t class_count = image
+					? std::min<std::size_t>(URK::managed::image_get_class_count(image), 1000000) : 0;
+				if (!image || scan.class_index >= class_count) {
+					++scan.assembly_index;
+					scan.class_index = 0;
+					continue;
+				}
+				const URK::managed::Class* klass = URK::managed::image_get_class(image, scan.class_index++);
 				if (!klass)
 					continue;
 				const Inspect::TypeInfo owner = Inspect::DescribeClass(klass);
@@ -2629,90 +2657,288 @@ namespace Explorer {
 						continue;
 					const Inspect::ValueInfo value = Inspect::ReadField({}, field);
 					if ((value.kind != Inspect::ValueKind::ObjectReference &&
-						value.kind != Inspect::ValueKind::ArrayReference) ||
-						!value.object)
+						value.kind != Inspect::ValueKind::ArrayReference) || !value.object)
 						continue;
-					if (enqueue_object(Object{ value.object }, 0, value.kind == Inspect::ValueKind::ArrayReference,
+					if (enqueue_object(Object{value.object}, 0,
+						value.kind == Inspect::ValueKind::ArrayReference,
 						"static " + owner.full_name + "." + field.name))
 						++working_.class_browser_static_roots;
 				}
 			}
+			if (scan.assembly_index >= assembly_count || scan.seen.size() >= kMaxGraphNodes)
+				scan.phase = ClassInstanceScan::Phase::UnityRoots;
 		}
 
-		const auto unity_roots = command.bool_value ? Object::FindObjectsOfTypeAllRooted<Object>()
-			: Object::FindObjectsOfTypeRooted<Object>();
-		for (const Object& root : unity_roots) {
-			if (seen.size() >= kMaxGraphNodes)
-				break;
-			enqueue_object(root, 0, false, "Unity root");
+		if (scan.phase == ClassInstanceScan::Phase::UnityRoots && Clock::now() < deadline) {
+			const auto unity_roots = scan.include_all_loaded ? Object::FindObjectsOfTypeAllRooted<Object>()
+				: Object::FindObjectsOfTypeRooted<Object>();
+			for (const Object& root : unity_roots) {
+				if (scan.seen.size() >= kMaxGraphNodes)
+					break;
+				enqueue_object(root, 0, false, "Unity root");
+			}
+			scan.phase = ClassInstanceScan::Phase::ReachableGraph;
 		}
 
-		while (!pending.empty()) {
-			PendingObject current = std::move(pending.front());
-			pending.pop_front();
+		while (scan.phase == ClassInstanceScan::Phase::ReachableGraph && !scan.pending.empty() &&
+			Clock::now() < deadline) {
+			ClassInstanceScan::PendingObject current = std::move(scan.pending.front());
+			scan.pending.pop_front();
+			const Object object = Inspect::ResolveObjectHandle(current.handle);
+			if (!object) {
+				Inspect::FreeObjectHandle(current.handle);
+				continue;
+			}
 			++working_.class_browser_scanned_objects;
 			const URK::managed::Class* actual =
-				URK::managed::object_get_class(static_cast<URK::managed::Object*>(current.object.handle()));
-			if (!actual)
-				continue;
-			if (URK::managed::class_is_assignable_from(target, actual) != 0 &&
+				URK::managed::object_get_class(static_cast<URK::managed::Object*>(object.handle()));
+			if (actual && URK::managed::class_is_assignable_from(scan.target, actual) != 0 &&
 				working_.class_browser_instances.size() < kMaxInstanceResults) {
-				const Inspect::TypeInfo type = Inspect::DescribeClass(actual);
-				Inspect::ObjectHandle handle = Inspect::PinObject(current.object);
-				if (handle.handle) {
-					const std::uint64_t token = 0x9000000000000000ull | (next_reference_token_++ & 0x0fffffffffffffffull);
-					class_browser_handles_[token] = handle;
+				Inspect::ObjectHandle result_handle = Inspect::PinObject(object);
+				if (result_handle.handle) {
+					const Inspect::TypeInfo type = Inspect::DescribeClass(actual);
+					const std::uint64_t token = 0x9000000000000000ull |
+						(next_reference_token_++ & 0x0fffffffffffffffull);
+					class_browser_handles_[token] = result_handle;
 					ClassBrowserInstanceInfo result{};
 					result.token = token;
 					result.type_name = type.full_name.empty() ? working_.class_browser_query.full_name : type.full_name;
-					result.pointer_text = pointer_text(current.object.handle());
+					result.pointer_text = pointer_text(object.handle());
 					result.source = current.source;
 					result.name = result.type_name;
-					if (object_base && URK::managed::class_is_assignable_from(object_base, actual) != 0)
-						result.name = current.object.name();
-					if (current.depth == 0 && working_.class_browser_query.is_component) {
-						const GameObject owner = Component{ current.object.handle() }.gameObject();
-						if (owner) {
-							result.game_object_instance_id = owner.GetInstanceID();
-							result.game_object_name = owner.name();
-						}
-					}
+					if (scan.unity_object_base &&
+						URK::managed::class_is_assignable_from(scan.unity_object_base, actual) != 0)
+						result.name = object.name();
 					if (result.name.empty())
 						result.name = result.type_name;
 					working_.class_browser_instances.push_back(std::move(result));
 				}
 			}
-			if (current.depth >= kMaxGraphDepth)
-				continue;
-			if (current.array) {
-				Inspect::ValueInfo array{};
-				array.kind = Inspect::ValueKind::ArrayReference;
-				array.object = current.object.handle();
-				const std::size_t array_length = std::min(Inspect::ArrayLength(array), kMaxArrayElements);
-				for (std::size_t index = 0; index < array_length; ++index) {
-					const Inspect::ValueInfo element = Inspect::ReadArrayElement(array, index);
-					if ((element.kind == Inspect::ValueKind::ObjectReference ||
-						element.kind == Inspect::ValueKind::ArrayReference) &&
-						element.object)
-						enqueue_object(Object{ element.object }, current.depth + 1,
-							element.kind == Inspect::ValueKind::ArrayReference, current.source + "[]");
+
+			if (actual && current.depth < kMaxGraphDepth && scan.seen.size() < kMaxGraphNodes) {
+				if (current.array) {
+					Inspect::ValueInfo array{};
+					array.kind = Inspect::ValueKind::ArrayReference;
+					array.object = object.handle();
+					const std::size_t length = std::min(Inspect::ArrayLength(array), kMaxArrayElements);
+					for (std::size_t index = 0; index < length; ++index) {
+						const Inspect::ValueInfo element = Inspect::ReadArrayElement(array, index);
+						if ((element.kind == Inspect::ValueKind::ObjectReference ||
+							element.kind == Inspect::ValueKind::ArrayReference) && element.object)
+							enqueue_object(Object{element.object}, current.depth + 1,
+								element.kind == Inspect::ValueKind::ArrayReference, current.source + "[]");
+					}
 				}
-				continue;
+				else {
+					for (const Inspect::FieldInfo& field : Inspect::fields_from_class(actual, true)) {
+						if (field.is_static || field.is_value_type)
+							continue;
+						const Inspect::ValueInfo value = Inspect::ReadField(object, field);
+						if ((value.kind == Inspect::ValueKind::ObjectReference ||
+							value.kind == Inspect::ValueKind::ArrayReference) && value.object)
+							enqueue_object(Object{value.object}, current.depth + 1,
+								value.kind == Inspect::ValueKind::ArrayReference,
+								current.source + " -> " + field.name);
+					}
+				}
 			}
-			for (const Inspect::FieldInfo& field : Inspect::fields_from_class(actual, true)) {
-				if (field.is_static || field.is_value_type)
-					continue;
-				const Inspect::ValueInfo value = Inspect::ReadField(current.object, field);
-				if ((value.kind == Inspect::ValueKind::ObjectReference ||
-					value.kind == Inspect::ValueKind::ArrayReference) &&
-					value.object)
-					enqueue_object(Object{ value.object }, current.depth + 1,
-						value.kind == Inspect::ValueKind::ArrayReference, current.source + " -> " + field.name);
+			Inspect::FreeObjectHandle(current.handle);
+		}
+
+		working_.class_browser_scan_truncated = scan.seen.size() >= kMaxGraphNodes;
+		const bool complete = scan.phase == ClassInstanceScan::Phase::ReachableGraph && scan.pending.empty();
+		if (complete) {
+			const std::size_t found = working_.class_browser_instances.size();
+			const std::size_t scanned = working_.class_browser_scanned_objects;
+			clear_class_instance_scan();
+			set_status("Found " + std::to_string(found) + " instance(s); scanned " +
+				std::to_string(scanned) + " reachable object(s)");
+		}
+		else {
+			working_.class_browser_scan_active = true;
+		}
+		const Clock::time_point now = Clock::now();
+		if (complete || now >= next_class_scan_publish_) {
+			next_class_scan_publish_ = now + std::chrono::milliseconds(100);
+			publish();
+		}
+	}
+
+	void RuntimeModel::clear_reference_graph() {
+		for (auto& [_, handle] : reference_graph_handles_)
+			Inspect::FreeObjectHandle(handle);
+		reference_graph_handles_.clear();
+		working_.reference_graph = {};
+	}
+
+	void RuntimeModel::build_reference_graph(const Command& command) {
+		clear_reference_graph();
+		Object root{};
+		if (command.object_inspector_token != 0 && working_.object_inspector.valid &&
+			working_.object_inspector.token == command.object_inspector_token)
+			root = Inspect::ResolveObjectHandle(object_inspector_handle_);
+		else if (working_.selected_instance_id != 0)
+			root = resolve_selected_object();
+		if (!root) {
+			set_status("Reference graph needs a selected GameObject or open Object Inspector target");
+			return;
+		}
+
+		struct Pending {
+			Inspect::ObjectHandle handle;
+			std::size_t node = 0;
+			std::size_t depth = 0;
+		};
+		constexpr std::size_t kMaxNodes = 128;
+		constexpr std::size_t kMaxEdges = 384;
+		constexpr std::size_t kMaxArrayElements = 64;
+		constexpr std::size_t kMaxDepth = 4;
+		std::deque<Pending> pending;
+		std::unordered_map<void*, std::size_t> seen;
+		std::vector<ReferenceGraphLayout::NodePosition> positions;
+		const URK::managed::Class* unity_object_base =
+			URK::managed::find_class("", "UnityEngine", "Object");
+		const URK::managed::Class* component_base =
+			URK::managed::find_class("", "UnityEngine", "Component");
+
+		const auto add_node = [&](Object object, std::size_t depth) -> std::optional<std::size_t> {
+			if (!object.handle())
+				return std::nullopt;
+			if (const auto existing = seen.find(object.handle()); existing != seen.end())
+				return existing->second;
+			if (working_.reference_graph.nodes.size() >= kMaxNodes) {
+				working_.reference_graph.truncated = true;
+				return std::nullopt;
+			}
+			Inspect::ObjectHandle traversal = Inspect::PinObject(object);
+			Inspect::ObjectHandle retained = Inspect::WeakObject(object);
+			if (!traversal.handle || !retained.handle) {
+				Inspect::FreeObjectHandle(traversal);
+				Inspect::FreeObjectHandle(retained);
+				return std::nullopt;
+			}
+			const Inspect::TypeInfo type = safe_type_of(object);
+			const std::uint64_t token = 0xd000000000000000ull |
+				(next_reference_token_++ & 0x0fffffffffffffffull);
+			reference_graph_handles_[token] = retained;
+			Snapshot::ReferenceGraph::Node node{};
+			node.token = token;
+			node.type_name = type.full_name.empty() ? "<unknown managed type>" : type.full_name;
+			node.label = node.type_name;
+			const auto* runtime_class = static_cast<const URK::managed::Class*>(type.handle);
+			if (runtime_class && URK::managed::class_get_element_class(runtime_class))
+				node.kind = Snapshot::ReferenceGraph::Node::Kind::Array;
+			else if (type.full_name == "UnityEngine.GameObject")
+				node.kind = Snapshot::ReferenceGraph::Node::Kind::GameObject;
+			else if (component_base && runtime_class &&
+				URK::managed::class_is_assignable_from(component_base, runtime_class) != 0)
+				node.kind = Snapshot::ReferenceGraph::Node::Kind::Component;
+			else if (unity_object_base && runtime_class &&
+				URK::managed::class_is_assignable_from(unity_object_base, runtime_class) != 0)
+				node.kind = Snapshot::ReferenceGraph::Node::Kind::UnityObject;
+			if (unity_object_base && type.handle &&
+				URK::managed::class_is_assignable_from(unity_object_base,
+					static_cast<const URK::managed::Class*>(type.handle)) != 0) {
+				const std::string name = object.name();
+				if (!name.empty())
+					node.label = name;
+			}
+			node.pointer_text = pointer_text(object.handle());
+			node.depth = depth;
+			const std::size_t index = working_.reference_graph.nodes.size();
+			working_.reference_graph.nodes.push_back(std::move(node));
+			positions.push_back({depth});
+			seen[object.handle()] = index;
+			pending.push_back({traversal, index, depth});
+			return index;
+		};
+		const auto add_edge = [&](std::size_t from, std::size_t to, std::string label,
+			Snapshot::ReferenceGraph::Edge::Kind kind) {
+			if (from >= working_.reference_graph.nodes.size() || to >= working_.reference_graph.nodes.size())
+				return;
+			if ((kind == Snapshot::ReferenceGraph::Edge::Kind::Field ||
+				kind == Snapshot::ReferenceGraph::Edge::Kind::ArrayElement) &&
+				working_.reference_graph.nodes[to].depth <= working_.reference_graph.nodes[from].depth)
+				kind = Snapshot::ReferenceGraph::Edge::Kind::BackReference;
+			working_.reference_graph.edges.push_back({from, to, std::move(label), kind});
+		};
+
+		const std::optional<std::size_t> root_node = add_node(root, 0);
+		const Inspect::TypeInfo root_type = safe_type_of(root);
+		if (root_node && root_type.full_name == "UnityEngine.GameObject") {
+			const auto components = GameObject{root.handle()}.GetComponentsRooted<Object>();
+			for (const Object& component : components) {
+				if (const auto child = add_node(component, 1))
+					add_edge(*root_node, *child, "component", Snapshot::ReferenceGraph::Edge::Kind::Component);
 			}
 		}
-		working_.class_browser_scan_truncated = seen.size() >= kMaxGraphNodes;
-		set_status("Found " + std::to_string(working_.class_browser_instances.size()) + " instance(s); scanned " +
-			std::to_string(working_.class_browser_scanned_objects) + " reachable object(s)");
+		while (!pending.empty() && working_.reference_graph.edges.size() < kMaxEdges) {
+			Pending current = std::move(pending.front());
+			pending.pop_front();
+			const Object object = Inspect::ResolveObjectHandle(current.handle);
+			if (!object || current.depth >= kMaxDepth) {
+				Inspect::FreeObjectHandle(current.handle);
+				continue;
+			}
+			const URK::managed::Class* klass =
+				URK::managed::object_get_class(static_cast<URK::managed::Object*>(object.handle()));
+			if (!klass) {
+				Inspect::FreeObjectHandle(current.handle);
+				continue;
+			}
+			const bool is_array = URK::managed::class_get_element_class(klass) != nullptr;
+			if (component_base && URK::managed::class_is_assignable_from(component_base, klass) != 0) {
+				const GameObject owner = Component{object.handle()}.gameObject();
+				if (owner) {
+					if (const auto child = add_node(owner, current.depth + 1))
+						add_edge(current.node, *child, "gameObject", Snapshot::ReferenceGraph::Edge::Kind::Owner);
+				}
+			}
+			if (is_array) {
+				Inspect::ValueInfo array{};
+				array.kind = Inspect::ValueKind::ArrayReference;
+				array.object = object.handle();
+				const std::size_t length = std::min(Inspect::ArrayLength(array), kMaxArrayElements);
+				for (std::size_t index = 0; index < length && working_.reference_graph.edges.size() < kMaxEdges; ++index) {
+					const Inspect::ValueInfo value = Inspect::ReadArrayElement(array, index);
+					if ((value.kind != Inspect::ValueKind::ObjectReference &&
+						value.kind != Inspect::ValueKind::ArrayReference) || !value.object)
+						continue;
+					if (const auto child = add_node(Object{value.object}, current.depth + 1))
+						add_edge(current.node, *child, "[" + std::to_string(index) + "]",
+							Snapshot::ReferenceGraph::Edge::Kind::ArrayElement);
+				}
+			}
+			else {
+				for (const Inspect::FieldInfo& field : Inspect::fields_from_class(klass, true)) {
+					if (field.is_static || field.is_value_type || working_.reference_graph.edges.size() >= kMaxEdges)
+						continue;
+					const Inspect::ValueInfo value = Inspect::ReadField(object, field);
+					if ((value.kind != Inspect::ValueKind::ObjectReference &&
+						value.kind != Inspect::ValueKind::ArrayReference) || !value.object)
+						continue;
+					if (const auto child = add_node(Object{value.object}, current.depth + 1))
+						add_edge(current.node, *child, field.name, Snapshot::ReferenceGraph::Edge::Kind::Field);
+				}
+			}
+			Inspect::FreeObjectHandle(current.handle);
+		}
+		for (Pending& remaining : pending)
+			Inspect::FreeObjectHandle(remaining.handle);
+		if (working_.reference_graph.edges.size() >= kMaxEdges)
+			working_.reference_graph.truncated = true;
+		std::vector<ReferenceGraphLayout::Edge> layout_edges;
+		layout_edges.reserve(working_.reference_graph.edges.size());
+		for (const Snapshot::ReferenceGraph::Edge& edge : working_.reference_graph.edges)
+			layout_edges.push_back({edge.from, edge.to});
+		ReferenceGraphLayout::arrange(positions, layout_edges);
+		for (std::size_t index = 0; index < positions.size(); ++index) {
+			working_.reference_graph.nodes[index].x = positions[index].x;
+			working_.reference_graph.nodes[index].y = positions[index].y;
+		}
+		working_.reference_graph.status = std::to_string(working_.reference_graph.nodes.size()) + " nodes, " +
+			std::to_string(working_.reference_graph.edges.size()) + " references";
+		set_status("Built reference graph: " + working_.reference_graph.status);
 	}
 
 	void RuntimeModel::load_class_browser_static_state(const Command& command) {
@@ -3434,6 +3660,12 @@ namespace Explorer {
 		if (written && prepared && !verify)
 			return;
 		if (written) {
+			for (auto& [_, watch] : field_watches_) {
+				if (watch.snapshot.component_instance_id == command.instance_id &&
+					watch.snapshot.object_inspector_token == (nested ? command.object_inspector_token : 0) &&
+					watch.snapshot.field_index == index && watch.snapshot.property == property)
+					watch.explorer_write_pending = true;
+			}
 			// Keep the write result before refreshing the component.
 			publish_write_result(true);
 			// Refresh the component so the new value is visible.
@@ -3566,9 +3798,7 @@ namespace Explorer {
 				do {
 					reference_token = 0x1000000000000000ull | (next_reference_token_++ & 0x0fffffffffffffffull);
 				} while (reference_handles_.contains(reference_token));
-				// An Execute result must remain inspectable after the UI snapshot is
-				// published. A weak handle can disappear before the user reaches the
-				// Inspect button, so method results own a strong handle until replaced.
+				// Root object results until the method result is replaced.
 				Inspect::ObjectHandle rooted = Inspect::PinObject(Object{value->object});
 				const Object returned = Inspect::ResolveObjectHandle(rooted);
 				if (rooted.handle && returned) {
@@ -3975,22 +4205,23 @@ namespace Explorer {
 
 	void RuntimeModel::set_field_watch(const Command& command) {
 		if (command.member_index < 0) {
-			set_status("Cannot watch an invalid field");
+			set_status("Cannot watch an invalid member");
 			return;
 		}
 		const std::size_t field_index = static_cast<std::size_t>(command.member_index);
 		auto found = std::find_if(field_watches_.begin(), field_watches_.end(), [&](const auto& entry) {
 			return entry.second.snapshot.component_instance_id == command.instance_id &&
 				entry.second.snapshot.object_inspector_token == command.object_inspector_token &&
-				entry.second.snapshot.field_index == field_index;
+				entry.second.snapshot.field_index == field_index &&
+				entry.second.snapshot.property == command.member_is_property;
 			});
 		if (!command.bool_value) {
 			if (found == field_watches_.end() || !found->second.snapshot.active) {
-				set_status("Field watch is no longer active");
+				set_status("Value watch is no longer active");
 				return;
 			}
 			found->second.snapshot.active = false;
-			set_status("Field watch stopped");
+			set_status("Value watch stopped");
 			return;
 		}
 
@@ -4003,7 +4234,7 @@ namespace Explorer {
 			if (!working_.object_inspector.valid || command.object_inspector_token == 0 ||
 				command.object_inspector_token != working_.object_inspector.token ||
 				!working_.object_inspector.component.metadata) {
-				set_status("Object Inspector field is no longer available to watch");
+				set_status("Object Inspector member is no longer available to watch");
 				return;
 			}
 			metadata = working_.object_inspector.component.metadata.get();
@@ -4018,7 +4249,7 @@ namespace Explorer {
 			const auto component_reflection = component_reflection_.find(command.instance_id);
 			if (component == working_.inspector.components.end() || !component->metadata ||
 				component_reflection == component_reflection_.end()) {
-				set_status("Component field is no longer available to watch");
+				set_status("Component member is no longer available to watch");
 				return;
 			}
 			metadata = component->metadata.get();
@@ -4026,9 +4257,14 @@ namespace Explorer {
 			target = resolve_component(command.instance_id);
 			component_type = component->type_name;
 		}
-		if (!target || !metadata || !reflection || field_index >= metadata->fields.size() ||
-			field_index >= reflection->fields.size()) {
-			set_status("Field is no longer available to watch");
+		const bool property = command.member_is_property;
+		const bool member_available = property
+			? field_index < metadata->properties.size() && field_index < reflection->properties.size() &&
+				metadata->properties[field_index].can_read
+			: field_index < metadata->fields.size() && field_index < reflection->fields.size();
+		if (!target || !metadata || !reflection || !member_available) {
+			set_status(property ? "Property is not readable or is no longer available to watch"
+				: "Field is no longer available to watch");
 			return;
 		}
 
@@ -4039,13 +4275,17 @@ namespace Explorer {
 			created.snapshot.component_instance_id = command.instance_id;
 			created.snapshot.object_inspector_token = nested ? command.object_inspector_token : 0;
 			created.snapshot.field_index = field_index;
+			created.snapshot.property = property;
 			created.snapshot.component_type = component_type;
-			created.snapshot.field_name = metadata->fields[field_index].name;
-			created.snapshot.field_type = metadata->fields[field_index].type_name;
-			created.field = reflection->fields[field_index];
+			created.snapshot.field_name = property ? metadata->properties[field_index].name : metadata->fields[field_index].name;
+			created.snapshot.field_type = property ? metadata->properties[field_index].type_name : metadata->fields[field_index].type_name;
+			if (property)
+				created.property = reflection->properties[field_index];
+			else
+				created.field = reflection->fields[field_index];
 			created.target_handle = Inspect::WeakObject(target);
 			if (!created.target_handle.handle) {
-				set_status("Field watch could not retain its runtime target");
+				set_status("Value watch could not retain its runtime target");
 				return;
 			}
 			const auto inserted = field_watches_.emplace(created.snapshot.id, std::move(created));
@@ -4053,23 +4293,31 @@ namespace Explorer {
 		}
 		else {
 			state = &found->second;
-			state->field = reflection->fields[field_index];
+			if (property)
+				state->property = reflection->properties[field_index];
+			else
+				state->field = reflection->fields[field_index];
 			if (!Inspect::ResolveObjectHandle(state->target_handle)) {
 				Inspect::FreeObjectHandle(state->target_handle);
 				state->target_handle = Inspect::WeakObject(target);
 			}
 			if (!state->target_handle.handle) {
-				set_status("Field watch could not retain its runtime target");
+				set_status("Value watch could not retain its runtime target");
 				return;
 			}
 			state->snapshot.active = true;
 			release_field_watch_references(state->snapshot);
 			state->snapshot.events.clear();
+			state->snapshot.samples.clear();
 			state->snapshot.change_count = 0;
+			state->snapshot.alarm_count = 0;
+			state->alarm_latched = false;
 		}
 
 		const Inspect::ValueInfo value = guarded_managed_read(state->snapshot.field_type, [&] {
-			return Inspect::ReadField(Inspect::ResolveObjectHandle(state->target_handle), state->field);
+			const Object watched_target = Inspect::ResolveObjectHandle(state->target_handle);
+			return property ? Inspect::ReadProperty(watched_target, state->property)
+				: Inspect::ReadField(watched_target, state->field);
 			});
 		state->started = Clock::now();
 		state->last_value = value;
@@ -4079,11 +4327,27 @@ namespace Explorer {
 		state->snapshot.current_value = watched_value_display(value);
 		state->snapshot.current_reference = watch_reference_for(value);
 		if (nested)
-			sampled_object_fields_.insert(field_index);
+			(property ? sampled_object_properties_ : sampled_object_fields_).insert(field_index);
 		else
-			sampled_component_members_.insert(component_sample_token(command.instance_id, false, field_index));
+			sampled_component_members_.insert(component_sample_token(command.instance_id, property, field_index));
 		set_status("Watching " + state->snapshot.component_type + "." + state->snapshot.field_name +
-			" for value changes");
+			" (" + (property ? "property" : "field") + ") for value changes");
+	}
+
+	void RuntimeModel::configure_field_watch(const Command& command) {
+		const auto found = field_watches_.find(command.reference_token);
+		if (found == field_watches_.end()) {
+			set_status("Value watch is no longer available");
+			return;
+		}
+		const int raw_condition = std::clamp(command.int_value, 0,
+			static_cast<int>(WatchAnalysis::AlarmCondition::NotEqual));
+		found->second.snapshot.alarm_condition = static_cast<WatchAnalysis::AlarmCondition>(raw_condition);
+		found->second.snapshot.alarm_threshold = static_cast<double>(command.float_value);
+		found->second.snapshot.alarm_active = false;
+		found->second.alarm_latched = false;
+		set_status(found->second.snapshot.alarm_condition == WatchAnalysis::AlarmCondition::Disabled
+			? "Watch alarm disabled" : "Watch alarm configured");
 	}
 
 	void RuntimeModel::clear_field_watch(std::uint64_t id) {
@@ -4094,8 +4358,12 @@ namespace Explorer {
 		}
 		release_field_watch_references(found->second.snapshot);
 		found->second.snapshot.events.clear();
+		found->second.snapshot.samples.clear();
 		found->second.snapshot.change_count = 0;
+		found->second.snapshot.alarm_count = 0;
+		found->second.snapshot.alarm_active = false;
 		found->second.has_baseline = false;
+		found->second.alarm_latched = false;
 		found->second.snapshot.value_available = false;
 		found->second.snapshot.current_value = "Waiting for a sample...";
 		found->second.started = Clock::now();
@@ -4129,13 +4397,15 @@ namespace Explorer {
 
 	void RuntimeModel::refresh_field_watches() {
 		constexpr std::size_t kMaxFieldWatchEvents = 256;
+		constexpr std::size_t kMaxFieldWatchSamples = 512;
 		const Clock::time_point now = Clock::now();
 		for (auto& [_, state] : field_watches_) {
 			Snapshot::FieldWatch& watch = state.snapshot;
 			if (!watch.active)
 				continue;
 			const Object target = Inspect::ResolveObjectHandle(state.target_handle);
-			if (!target || !state.field.handle) {
+			const bool metadata_available = watch.property ? state.property.handle != nullptr : state.field.handle != nullptr;
+			if (!target || !metadata_available) {
 				watch.active = false;
 				watch.value_available = false;
 				watch.current_value = "<runtime target is no longer available>";
@@ -4143,13 +4413,28 @@ namespace Explorer {
 				continue;
 			}
 			const Inspect::ValueInfo value = guarded_managed_read(watch.field_type, [&] {
-				return Inspect::ReadField(target, state.field);
+				return watch.property ? Inspect::ReadProperty(target, state.property) : Inspect::ReadField(target, state.field);
 				});
 			watch.value_available = value.readable;
 			watch.current_value = watched_value_display(value);
 			if (!value.readable) {
 				record_value_error(watch.component_type + "." + watch.field_name, value);
 				continue;
+			}
+			const double elapsed = std::chrono::duration<double>(now - state.started).count();
+			if (const std::optional<double> numeric = WatchAnalysis::numeric_value(value)) {
+				if (watch.samples.size() == kMaxFieldWatchSamples)
+					watch.samples.erase(watch.samples.begin());
+				watch.samples.push_back({elapsed, static_cast<float>(*numeric)});
+				const bool alarm_now = WatchAnalysis::evaluate(watch.alarm_condition, *numeric, watch.alarm_threshold);
+				if (alarm_now && !state.alarm_latched)
+					++watch.alarm_count;
+				state.alarm_latched = alarm_now;
+				watch.alarm_active = alarm_now;
+			}
+			else {
+				watch.alarm_active = false;
+				state.alarm_latched = false;
 			}
 			if (!state.has_baseline) {
 				state.last_value = value;
@@ -4163,9 +4448,13 @@ namespace Explorer {
 				continue;
 			Snapshot::FieldWatchEvent event{};
 			event.sequence = ++watch.change_count;
-			event.seconds_since_start = std::chrono::duration<double>(now - state.started).count();
+			event.seconds_since_start = elapsed;
 			event.previous_value = watched_value_display(state.last_value);
 			event.current_value = watched_value_display(value);
+			event.source = state.explorer_write_pending ? "Explorer write" :
+				(watch.property ? "Runtime / property getter sample" : "Runtime / sampled write window");
+			event.alarm_triggered = watch.alarm_active;
+			state.explorer_write_pending = false;
 			// The newest history entry already retains the current reference.
 			if (watch.current_reference.token != 0 &&
 				(watch.events.empty() || watch.events.back().current_reference.token != watch.current_reference.token))
@@ -4202,8 +4491,10 @@ namespace Explorer {
 		auto reference = reference_handles_.find(token);
 		const auto browser_reference = class_browser_handles_.find(token);
 		const auto static_reference = class_browser_static_handles_.find(token);
+		const auto graph_reference = reference_graph_handles_.find(token);
 		if (retained == object_inspector_history_.end() && reference == reference_handles_.end() &&
-			browser_reference == class_browser_handles_.end() && static_reference == class_browser_static_handles_.end()) {
+			browser_reference == class_browser_handles_.end() && static_reference == class_browser_static_handles_.end() &&
+			graph_reference == reference_graph_handles_.end()) {
 			std::string error;
 			const Object saved = managed_references_.object(token, error);
 			if (!saved) {
@@ -4222,7 +4513,8 @@ namespace Explorer {
 			: reference != reference_handles_.end() ? reference->second
 			: browser_reference != class_browser_handles_.end()
 			? browser_reference->second
-			: static_reference->second;
+			: static_reference != class_browser_static_handles_.end() ? static_reference->second
+			: graph_reference->second;
 		const Object object = Inspect::ResolveObjectHandle(source);
 		if (!object) {
 			set_status("Referenced object was released");
@@ -4230,10 +4522,7 @@ namespace Explorer {
 		}
 		const Inspect::TypeInfo type = safe_type_of(object);
 		if (type.full_name == "UnityEngine.GameObject") {
-			// GameObjects have a dedicated hierarchy/Inspector flow.  Sending one
-			// through the generic Object Inspector only reflects the GameObject
-			// class itself, which hides the referenced instance's name, components,
-			// and scene context.
+			// Route GameObjects through the hierarchy-aware Inspector.
 			Inspect::ObjectHandle selection_root = Inspect::PinObject(object);
 			if (!selection_root.handle) {
 				set_status("Could not root referenced GameObject");
@@ -4435,10 +4724,7 @@ namespace Explorer {
 					}
 				}
 			}
-			// Only byte arrays have a format-independent representation. Copy their
-			// contents while the object is rooted on the game thread, then decode the
-			// native snapshot without retaining any managed pointer. Small arrays stay live; larger arrays are
-			// refreshed on demand to avoid repeated managed calls.
+			// Decode byte arrays from a native snapshot; refresh large arrays on demand.
 			const bool capture_bytes = is_byte_array &&
 				(force || !working_.object_inspector.byte_array || length <= kLiveByteArrayRefreshLimit);
 			if (capture_bytes) {
@@ -5117,10 +5403,7 @@ namespace Explorer {
 			return;
 		}
 
-		// Never carry a screen-dominating renderer rectangle into the draw list.
-		// If the pivot is not projectable, discard the rectangle and use the
-		// off-screen locator below. Previously the failed fallback left the old
-		// giant bounds intact, producing the solid blue screen in the report.
+		// Reject screen-dominating bounds and fall back to the off-screen locator.
 		if (projected &&
 			(max_x - min_x > screen_width * 0.65f || max_y - min_y > screen_height * 0.65f)) {
 			projected = use_transform_anchor();
@@ -5197,6 +5480,8 @@ namespace Explorer {
 	void RuntimeModel::discard_managed_state_after_native_fault() {
 		const std::uint64_t quarantined_before = Inspect::QuarantinedObjectHandleCount();
 		hierarchy_census_.reset();
+		clear_class_instance_scan();
+		clear_reference_graph();
 		if (highlight_id_ != 0)
 			ModUI::Highlight::enqueue_remove(highlight_id_);
 		if (highlight_locator_id_ != 0)
@@ -5243,9 +5528,7 @@ namespace Explorer {
 		working_.class_browser_members = {};
 		working_.managed_references.clear();
 
-		// HierarchyInfo and its strings are native snapshot data and remain safe
-		// to render. Keeping them avoids a blank workspace while the next census
-		// rebuilds the non-owning object index.
+		// Retain native hierarchy data while rebuilding the object index.
 		working_.hierarchy = hierarchy_;
 		const std::uint64_t quarantined_after = Inspect::QuarantinedObjectHandleCount();
 		if (quarantined_after != quarantined_before)
@@ -5278,6 +5561,11 @@ namespace Explorer {
 		case CommandKind::SampleMemberValue: return "Read member";
 		case CommandKind::InvokeMethod: return "Execute method";
 		case CommandKind::SetMethodTrace: return "Configure method trace";
+		case CommandKind::SetFieldWatch: return "Configure value watch";
+		case CommandKind::ConfigureFieldWatch: return "Configure watch alarm";
+		case CommandKind::ExportDiagnosticBundle: return "Export diagnostic bundle";
+		case CommandKind::BuildReferenceGraph: return "Build reference graph";
+		case CommandKind::ClearReferenceGraph: return "Clear reference graph";
 		case CommandKind::InspectReference: return "Inspect reference";
 		case CommandKind::SetActive: return "Set GameObject active";
 		case CommandKind::DeleteObject: return "Delete GameObject";
@@ -5340,6 +5628,10 @@ namespace Explorer {
 	}
 
 	void RuntimeModel::publish() {
+		working_.runtime_backend = ModConfig::backend_name;
+		working_.runtime_capabilities = URK::runtime_capabilities();
+		if (working_.unity_version.empty())
+			working_.unity_version = unity_version_text();
 		working_.hierarchy = hierarchy_;
 		working_.component_class_catalog = component_class_catalog_;
 		working_.class_browser_catalog = class_browser_catalog_;
@@ -5363,17 +5655,14 @@ namespace Explorer {
 				return left.id < right.id;
 			});
 		for (MethodTracer::Snapshot& trace : working_.method_traces) {
-			// Decode captured bytes only on the Explorer thread.  The detour itself
-			// records ABI lanes and never calls managed runtime APIs.
+			// Decode ABI captures on the Explorer thread, outside the detour.
 			MethodTraceValueDecoder::resolve_displays(trace);
 			for (MethodTracer::Record& record : trace.records)
 				record.caller_display = managed_caller_location(record.caller_address);
 		}
 		std::unordered_set<TraceReturnKey, TraceReturnKeyHash> live_trace_returns;
 		for (MethodTracer::Snapshot& trace : working_.method_traces) {
-			// A trace can retain thousands of records across sessions. Keep the
-			// newest returned managed objects strongly rooted so they can be opened
-			// reliably, while older rows remain available as raw diagnostics.
+			// Root only recent object results; older trace rows remain raw diagnostics.
 			constexpr std::size_t kMaxRootedTraceReturns = 128;
 			const std::size_t first_rooted_reference = trace.records.size() > kMaxRootedTraceReturns
 				? trace.records.size() - kMaxRootedTraceReturns : 0;

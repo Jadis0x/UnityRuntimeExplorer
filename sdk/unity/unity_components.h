@@ -21,6 +21,7 @@ struct Component : Object {
     template<class T = Object> std::vector<T> GetComponentsInParent(bool includeInactive=false) const;
     template<class T = Object> detail::RootedObjectArray<T> GetComponentsRooted() const;
     template<class T = Object> detail::RootedObjectArray<T> GetComponentsInChildrenRooted(bool includeInactive=false) const;
+    template<class T = Object> detail::RootedObjectArray<T> GetComponentsInParentRooted(bool includeInactive=false) const;
     template<class T> T AddComponent() const;
     Object AddComponent(std::string_view image, std::string_view namespc, std::string_view className) const;
     template<class T> bool HasComponent() const;
@@ -993,14 +994,33 @@ struct GameObject : Object {
     Object GetComponent(std::string_view image, std::string_view namespc, std::string_view className) const { detail::clear_error(); void* type=TypeRef{image,namespc,className}.resolve_type_object(); if(!type){ detail::set_error(std::string("Unity GameObject::GetComponent failed: component class not found: ")+std::string(image)+":"+std::string(namespc)+"."+std::string(className)); detail::append_backend_error(); return {}; } return CallExact<Object>("GetComponent", {"System.Type"}, TypeObject{type}); }
     Object GetComponentInChildren(std::string_view image, std::string_view namespc, std::string_view className, bool includeInactive=false) const { detail::clear_error(); void* type=TypeRef{image,namespc,className}.resolve_type_object(); if(!type){ detail::set_error(std::string("Unity GameObject::GetComponentInChildren failed: component class not found: ")+std::string(image)+":"+std::string(namespc)+"."+std::string(className)); detail::append_backend_error(); return {}; } return includeInactive ? CallExact<Object>("GetComponentInChildren", {"System.Type","System.Boolean"}, TypeObject{type}, includeInactive) : CallExact<Object>("GetComponentInChildren", {"System.Type"}, TypeObject{type}); }
     Object GetComponentInParent(std::string_view image, std::string_view namespc, std::string_view className, bool includeInactive=false) const { detail::clear_error(); void* type=TypeRef{image,namespc,className}.resolve_type_object(); if(!type){ detail::set_error(std::string("Unity GameObject::GetComponentInParent failed: component class not found: ")+std::string(image)+":"+std::string(namespc)+"."+std::string(className)); detail::append_backend_error(); return {}; } return includeInactive ? CallExact<Object>("GetComponentInParent", {"System.Type","System.Boolean"}, TypeObject{type}, includeInactive) : CallExact<Object>("GetComponentInParent", {"System.Type"}, TypeObject{type}); }
-    template<class T = Object> std::vector<T> GetComponents() const { const TypeRef type = T::unity_type(); return GetComponents<T>(type.image, type.namespc, type.name); }
-    template<class T = Object> std::vector<T> GetComponents(std::string_view image, std::string_view namespc, std::string_view className) const { detail::clear_error(); void* type=TypeRef{image,namespc,className}.resolve_type_object(); if(!type){ detail::set_error(std::string("Unity GameObject::GetComponents failed: component class not found: ")+std::string(image)+":"+std::string(namespc)+"."+std::string(className)); detail::append_backend_error(); return {}; } return CallArrayExact<T>("GetComponents", {"System.Type"}, TypeObject{type}); }
-    template<class T = Object> std::vector<T> GetComponentsInChildren(bool includeInactive=false) const { const TypeRef type = T::unity_type(); return GetComponentsInChildren<T>(type.image, type.namespc, type.name, includeInactive); }
-    template<class T = Object> std::vector<T> GetComponentsInChildren(std::string_view image, std::string_view namespc, std::string_view className, bool includeInactive=false) const { detail::clear_error(); void* type=TypeRef{image,namespc,className}.resolve_type_object(); if(!type){ detail::set_error(std::string("Unity GameObject::GetComponentsInChildren failed: component class not found: ")+std::string(image)+":"+std::string(namespc)+"."+std::string(className)); detail::append_backend_error(); return {}; } return includeInactive ? CallArrayExact<T>("GetComponentsInChildren", {"System.Type","System.Boolean"}, TypeObject{type}, includeInactive) : CallArrayExact<T>("GetComponentsInChildren", {"System.Type"}, TypeObject{type}); }
-    template<class T = Object> std::vector<T> GetComponentsInParent(bool includeInactive=false) const { const TypeRef type = T::unity_type(); return GetComponentsInParent<T>(type.image, type.namespc, type.name, includeInactive); }
-    template<class T = Object> std::vector<T> GetComponentsInParent(std::string_view image, std::string_view namespc, std::string_view className, bool includeInactive=false) const { detail::clear_error(); void* type=TypeRef{image,namespc,className}.resolve_type_object(); if(!type){ detail::set_error(std::string("Unity GameObject::GetComponentsInParent failed: component class not found: ")+std::string(image)+":"+std::string(namespc)+"."+std::string(className)); detail::append_backend_error(); return {}; } return includeInactive ? CallArrayExact<T>("GetComponentsInParent", {"System.Type","System.Boolean"}, TypeObject{type}, includeInactive) : CallArrayExact<T>("GetComponentsInParent", {"System.Type"}, TypeObject{type}); }
-    template<class T = Object> detail::RootedObjectArray<T> GetComponentsRooted() const { const TypeRef type = T::unity_type(); detail::clear_error(); void* type_object=type.resolve_type_object(); if(!type_object){ detail::set_error(std::string("Unity GameObject::GetComponentsRooted failed: component class not found: ")+std::string(type.image)+":"+std::string(type.namespc)+"."+std::string(type.name)); detail::append_backend_error(); return {}; } return CallArrayExactRooted<T>("GetComponents", {"System.Type"}, TypeObject{type_object}); }
-    template<class T = Object> detail::RootedObjectArray<T> GetComponentsInChildrenRooted(bool includeInactive=false) const { const TypeRef type = T::unity_type(); detail::clear_error(); void* type_object=type.resolve_type_object(); if(!type_object){ detail::set_error(std::string("Unity GameObject::GetComponentsInChildrenRooted failed: component class not found: ")+std::string(type.image)+":"+std::string(type.namespc)+"."+std::string(type.name)); detail::append_backend_error(); return {}; } return includeInactive ? CallArrayExactRooted<T>("GetComponentsInChildren", {"System.Type","System.Boolean"}, TypeObject{type_object}, includeInactive) : CallArrayExactRooted<T>("GetComponentsInChildren", {"System.Type"}, TypeObject{type_object}); }
+    template<class T = Object> std::vector<T> GetComponents() const {
+        return GetComponentsRooted<T>().copy_items();
+    }
+    template<class T = Object> std::vector<T> GetComponents(std::string_view image, std::string_view namespc, std::string_view className) const {
+        return detail::QueryComponentsRooted<T>(*this, TypeRef{image, namespc, className}, false, true, false).copy_items();
+    }
+    template<class T = Object> std::vector<T> GetComponentsInChildren(bool includeInactive=false) const {
+        return GetComponentsInChildrenRooted<T>(includeInactive).copy_items();
+    }
+    template<class T = Object> std::vector<T> GetComponentsInChildren(std::string_view image, std::string_view namespc, std::string_view className, bool includeInactive=false) const {
+        return detail::QueryComponentsRooted<T>(*this, TypeRef{image, namespc, className}, true, includeInactive, false).copy_items();
+    }
+    template<class T = Object> std::vector<T> GetComponentsInParent(bool includeInactive=false) const {
+        return GetComponentsInParentRooted<T>(includeInactive).copy_items();
+    }
+    template<class T = Object> std::vector<T> GetComponentsInParent(std::string_view image, std::string_view namespc, std::string_view className, bool includeInactive=false) const {
+        return detail::QueryComponentsRooted<T>(*this, TypeRef{image, namespc, className}, true, includeInactive, true).copy_items();
+    }
+    template<class T = Object> detail::RootedObjectArray<T> GetComponentsRooted() const {
+        return detail::QueryComponentsRooted<T>(*this, T::unity_type(), false, true, false);
+    }
+    template<class T = Object> detail::RootedObjectArray<T> GetComponentsInChildrenRooted(bool includeInactive=false) const {
+        return detail::QueryComponentsRooted<T>(*this, T::unity_type(), true, includeInactive, false);
+    }
+    template<class T = Object> detail::RootedObjectArray<T> GetComponentsInParentRooted(bool includeInactive=false) const {
+        return detail::QueryComponentsRooted<T>(*this, T::unity_type(), true, includeInactive, true);
+    }
     template<class T> T AddComponent() const { if constexpr (std::is_same_v<T, Transform>) return T{}; else return T{AddComponent(T::unity_type().image, T::unity_type().namespc, T::unity_type().name).handle()}; }
     Object AddComponent(std::string_view image, std::string_view namespc, std::string_view className) const { detail::clear_error(); if (className == "Transform" && (namespc.empty() || namespc == "UnityEngine")) { detail::set_error("Unity GameObject::AddComponent failed: Transform is owned by GameObject and cannot be added"); return {}; } void* type=TypeRef{image,namespc,className}.resolve_type_object(); if(!type){ detail::set_error(std::string("Unity GameObject::AddComponent failed: component class not found: ")+std::string(image)+":"+std::string(namespc)+"."+std::string(className)); detail::append_backend_error(); return {}; } return CallExact<Object>("AddComponent", {"System.Type"}, TypeObject{type}); }
     template<class T> bool HasComponent() const { return static_cast<bool>(GetComponent<T>()); }

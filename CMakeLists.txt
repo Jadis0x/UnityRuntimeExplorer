@@ -35,6 +35,26 @@ function(urk_disable_vs_vcpkg_integration target_name)
     endif()
 endfunction()
 
+function(urk_enable_project_warnings target_name)
+    if(MSVC)
+        target_compile_options(${target_name} PRIVATE /W4 /permissive- /EHsc /utf-8 /bigobj)
+    elseif(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+        # Permit SEH at managed/native boundaries and diagnose unreachable code.
+        target_compile_options(${target_name} PRIVATE
+            -Wall
+            -Wextra
+            -Wpedantic
+            -Wunreachable-code-aggressive
+            -Wno-language-extension-token
+            # Command aggregates omit fields that use default member values.
+            -Wno-missing-field-initializers
+            -Wno-missing-designated-field-initializers
+        )
+    elseif(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+        target_compile_options(${target_name} PRIVATE -Wall -Wextra -Wpedantic -Wunreachable-code)
+    endif()
+endfunction()
+
 include(FetchContent)
 FetchContent_Declare(imgui
     GIT_REPOSITORY https://github.com/ocornut/imgui.git
@@ -74,10 +94,14 @@ set(URK_COMMON_SOURCES
         mod/explorer/explorer_model.cpp
         mod/explorer/explorer_ui.cpp
         mod/explorer/byte_data_decoder.cpp
+        mod/explorer/diagnostic_bundle.cpp
+        mod/explorer/reference_graph_layout.cpp
+        mod/explorer/reference_graph_ui.cpp
         mod/explorer/managed_reference_store.cpp
         mod/explorer/method_trace_value_decoder.cpp
         mod/explorer/method_trace_format.cpp
         mod/explorer/method_tracer.cpp
+        mod/explorer/watch_analysis.cpp
         mod/explorer/camera/camera_focus_controller.cpp
         mod/ui/highlight.cpp
 )
@@ -118,10 +142,14 @@ set(URK_COMMON_HEADERS
         mod/explorer/explorer_model.h
         mod/explorer/explorer_ui.h
         mod/explorer/byte_data_decoder.h
+        mod/explorer/diagnostic_bundle.h
+        mod/explorer/reference_graph_layout.h
+        mod/explorer/reference_graph_ui.h
         mod/explorer/managed_reference_store.h
         mod/explorer/method_trace_value_decoder.h
         mod/explorer/method_trace_format.h
         mod/explorer/method_tracer.h
+        mod/explorer/watch_analysis.h
         mod/explorer/camera/camera_focus_controller.h
         mod/hooks/mod_hooks.h
         mod/lifecycle/mod_network.h
@@ -166,8 +194,8 @@ function(urk_add_explorer_target target_name backend_definition)
         ${backend_definition}
     )
     target_link_libraries(${target_name} PRIVATE imgui d3d11 d3d12 dxgi opengl32 ntdll)
+    urk_enable_project_warnings(${target_name})
     if(MSVC)
-        target_compile_options(${target_name} PRIVATE /W4 /permissive- /EHsc /utf-8 /bigobj)
         target_link_options(${target_name} PRIVATE
             "$<$<NOT:$<CONFIG:Debug>>:/INCREMENTAL:NO>"
             "$<$<NOT:$<CONFIG:Debug>>:/OPT:REF>"

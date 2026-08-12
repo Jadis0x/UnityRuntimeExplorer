@@ -916,13 +916,49 @@ namespace ModRenderHook {
 	inline void clear_tracked_input() {
 		g_physical_keyboard.fill(KeyboardButtonState{});
 		g_game_keyboard.fill(KeyboardButtonState{});
+		g_menu_released_keyboard.fill(false);
 		g_physical_mouse.fill(MouseButtonState{});
 		g_game_mouse.fill(MouseButtonState{});
+		g_menu_released_mouse.fill(false);
 	}
 
-	inline void clear_game_input() {
-		g_game_keyboard.fill(KeyboardButtonState{});
-		g_game_mouse.fill(MouseButtonState{});
+	inline bool any_game_mouse_button_down() {
+		for (const MouseButtonState& state : g_game_mouse)
+			if (state.down) return true;
+		return false;
+	}
+
+	inline bool any_menu_released_mouse_button_pending() {
+		for (const bool pending : g_menu_released_mouse)
+			if (pending) return true;
+		return false;
+	}
+
+	inline void release_game_input_for_menu(HWND hwnd, WNDPROC old_wndproc) {
+		// Close game-owned transitions before the overlay takes input ownership.
+		for (std::size_t key = 0; key < g_game_keyboard.size(); ++key) {
+			KeyboardButtonState& state = g_game_keyboard[key];
+			if (!state.down) continue;
+			state.down = false;
+			const UINT message = state.system ? WM_SYSKEYUP : WM_KEYUP;
+			call_previous_window_proc(hwnd, old_wndproc, message, static_cast<WPARAM>(key),
+				keyboard_transition_lparam(state.lparam, false));
+			g_menu_released_keyboard[key] = true;
+		}
+
+		POINT client{};
+		LPARAM mouse_position = 0;
+		if (GetCursorPos(&client) && ScreenToClient(hwnd, &client))
+			mouse_position = MAKELPARAM(client.x, client.y);
+		for (int button = 0; button < static_cast<int>(g_game_mouse.size()); ++button) {
+			MouseButtonState& state = g_game_mouse[static_cast<std::size_t>(button)];
+			if (!state.down) continue;
+			const LPARAM position = mouse_position != 0 ? mouse_position : state.lparam;
+			state.down = false;
+			call_previous_window_proc(hwnd, old_wndproc, mouse_button_message(button, false),
+				mouse_transition_wparam(button, g_game_mouse), position);
+			g_menu_released_mouse[static_cast<std::size_t>(button)] = true;
+		}
 	}
 
 	inline bool any_window_mouse_button_down() {
@@ -933,9 +969,7 @@ namespace ModRenderHook {
 
 	inline void queue_input_event(const InputEvent& event) {
 		std::lock_guard lock(g_input_mutex);
-		// A stalled or replaced Present chain must never turn queued Win32 input
-		// into unbounded process memory. The next successful frame resynchronizes
-		// ImGui from the current physical mouse state.
+		// Bound the queue if Present stalls; the next frame resynchronizes input.
 		if (g_input_events.size() >= 512) {
 			g_input_events.clear();
 			InputEvent reset{};
@@ -1039,7 +1073,9 @@ namespace ModRenderHook {
 		g_menu_input_applied.store(open ? 1 : 0, std::memory_order_release);
 		g_imgui_wants_mouse.store(false, std::memory_order_release);
 		g_imgui_wants_keyboard.store(false, std::memory_order_release);
-		// Keep game focus; the WndProc consumes input only when ImGui needs it.
+		if (open)
+			release_game_input_for_menu(hwnd, old_wndproc);
+		// Retain game focus and consume only ImGui-owned input.
 		clear_window_mouse_buttons(hwnd, true);
 		queue_release_all_input(hwnd);
 	}
@@ -1517,8 +1553,19 @@ namespace ModRenderHook {
 		if (is_mouse_button_message(message)) {
 			const int button = mouse_button_for_message(message, wparam);
 			const bool down = is_mouse_button_down(message);
-			const bool was_down = button >= 0 && g_wndproc_mouse_down[button];
-			const bool capture_mouse = wants_mouse || was_down;
+			const bool menu_owned = button >= 0 && g_wndproc_mouse_down[button];
+			const bool game_owned = button >= 0 && g_game_mouse[button].down;
+			bool transition_released = false;
+			if (button >= 0) {
+				if (down) {
+					g_menu_released_mouse[button] = false;
+				} else if (g_menu_released_mouse[button]) {
+					g_menu_released_mouse[button] = false;
+					transition_released = true;
+				}
+			}
+			// Route each release to the owner of its matching press.
+			const bool capture_mouse = down ? wants_mouse : menu_owned && !game_owned;
 			if (button >= 0 && down && capture_mouse) {
 				if (!any_window_mouse_button_down() && GetCapture() != hwnd)
 					SetCapture(hwnd);
@@ -1531,7 +1578,7 @@ namespace ModRenderHook {
 					ReleaseCapture();
 			}
 
-			if (visible && (capture_mouse || !down && was_down)) {
+			if (visible && (capture_mouse || (!down && menu_owned) || transition_released)) {
 				queue_mouse_button(hwnd, button, down);
 			}
 			if (capture_mouse) consumed = true;
@@ -1541,12 +1588,14 @@ namespace ModRenderHook {
 				queue_mouse_client_position(
 					hwnd, GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam));
 			}
-			consumed = wants_mouse || any_window_mouse_button_down();
+			consumed = !any_game_mouse_button_down() && !any_menu_released_mouse_button_pending() &&
+				(wants_mouse || any_window_mouse_button_down());
 		}
 		else if (message == WM_INPUT && visible) {
 			if (!g_cursor_lease.load(std::memory_order_acquire))
 				queue_raw_mouse_input(hwnd, lparam);
-			consumed = wants_mouse || any_window_mouse_button_down();
+			consumed = !any_game_mouse_button_down() && !any_menu_released_mouse_button_pending() &&
+				(wants_mouse || any_window_mouse_button_down());
 		}
 		else if ((message == WM_MOUSEWHEEL || message == WM_MOUSEHWHEEL) && visible) {
 			InputEvent event{};
@@ -1582,7 +1631,28 @@ namespace ModRenderHook {
 			event.wparam = wparam;
 			event.lparam = lparam;
 			queue_input_event(event);
-			consumed = wants_keyboard;
+			if (is_keyboard_button_message(message) && wparam < g_game_keyboard.size()) {
+				const std::size_t key = static_cast<std::size_t>(wparam);
+				const bool down = is_keyboard_button_down(message);
+				const bool game_owned = g_game_keyboard[key].down;
+				bool transition_release = false;
+				bool suppressed_repeat = false;
+				if (down) {
+					constexpr LPARAM was_down_mask = 1LL << 30;
+					if (g_menu_released_keyboard[key] && (lparam & was_down_mask) != 0)
+						suppressed_repeat = true;
+					else
+						g_menu_released_keyboard[key] = false;
+				} else if (g_menu_released_keyboard[key]) {
+					g_menu_released_keyboard[key] = false;
+					transition_release = true;
+				}
+				// Preserve press ownership when keyboard focus changes.
+				consumed = consumed || suppressed_repeat ||
+					(wants_keyboard && !game_owned && !transition_release);
+			} else {
+				consumed = consumed || wants_keyboard;
+			}
 		}
 
 		if (relayed || consumed) {

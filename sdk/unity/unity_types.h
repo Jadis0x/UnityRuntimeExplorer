@@ -506,6 +506,8 @@ template<class Ret, class... Args> Ret InvokeStatic(TypeRef type, std::string_vi
 template<class T, class... Args> std::vector<T> StaticArrayCall(TypeRef type, std::string_view methodName, Args&&... args);
 template<class T, class... ExtraArgs> std::vector<T> FindObjectsUsing(TypeRef owner, std::string_view methodName, std::string_view image, std::string_view namespc, std::string_view className, ExtraArgs&&... extraArgs);
 template<class T, class... ExtraArgs> RootedObjectArray<T> FindObjectsUsingRooted(TypeRef owner, std::string_view methodName, std::string_view image, std::string_view namespc, std::string_view className, ExtraArgs&&... extraArgs);
+template<class T> RootedObjectArray<T> QueryComponentsRooted(const Object& target, TypeRef componentType,
+    bool recursive, bool includeInactive, bool reverse);
 }
 struct TypeObject { void* handle_ = nullptr; explicit TypeObject(void* h=nullptr) : handle_(h) {} void* handle() const { return handle_; } explicit operator bool() const { return handle_ != nullptr; } };
 

@@ -20,6 +20,9 @@ inline Object Component::GetComponentInParent(std::string_view image, std::strin
 template<class T> inline std::vector<T> Component::GetComponents() const { return gameObject().GetComponents<T>(); }
 template<class T> inline std::vector<T> Component::GetComponentsInChildren(bool includeInactive) const { return gameObject().GetComponentsInChildren<T>(includeInactive); }
 template<class T> inline std::vector<T> Component::GetComponentsInParent(bool includeInactive) const { return gameObject().GetComponentsInParent<T>(includeInactive); }
+template<class T> inline detail::RootedObjectArray<T> Component::GetComponentsRooted() const { return gameObject().GetComponentsRooted<T>(); }
+template<class T> inline detail::RootedObjectArray<T> Component::GetComponentsInChildrenRooted(bool includeInactive) const { return gameObject().GetComponentsInChildrenRooted<T>(includeInactive); }
+template<class T> inline detail::RootedObjectArray<T> Component::GetComponentsInParentRooted(bool includeInactive) const { return gameObject().GetComponentsInParentRooted<T>(includeInactive); }
 template<class T> inline T Component::AddComponent() const { return gameObject().AddComponent<T>(); }
 inline Object Component::AddComponent(std::string_view image, std::string_view namespc, std::string_view className) const { return gameObject().AddComponent(image, namespc, className); }
 template<class T> inline bool Component::HasComponent() const { return gameObject().HasComponent<T>(); }
@@ -404,6 +407,47 @@ template<class T, class... Args> detail::RootedObjectArray<T> Object::CallArrayE
         return {};
     }
     return detail::RootedObjectArray<T>::from_managed_array(array, "Unity Object::CallArrayExactRooted");
+}
+template<class T> detail::RootedObjectArray<T> detail::QueryComponentsRooted(const Object& target,
+    TypeRef componentType, bool recursive, bool includeInactive, bool reverse) {
+    clear_error();
+    void* typeObject = componentType.resolve_type_object();
+    if (!typeObject) {
+        set_error(std::string("Unity component query failed: component class not found: ") +
+            std::string(componentType.image) + ":" + std::string(componentType.namespc) + "." +
+            std::string(componentType.name));
+        append_backend_error();
+        return {};
+    }
+
+    // Use the native-backed implementation when stripped managed wrappers have
+    // metadata but no callable body.
+    auto result = target.CallArrayExactRooted<T>("GetComponentsInternal",
+        {"System.Type", "System.Boolean", "System.Boolean", "System.Boolean", "System.Boolean", "System.Object"},
+        TypeObject{typeObject}, false, recursive, includeInactive, reverse, Object{});
+    if (result)
+        return result;
+
+    const std::string internalError = fallback_error() ? fallback_error() : "GetComponentsInternal returned no rooted array";
+    clear_error();
+    if (!recursive) {
+        result = target.CallArrayExactRooted<T>("GetComponents", {"System.Type"}, TypeObject{typeObject});
+    }
+    else if (reverse) {
+        result = target.CallArrayExactRooted<T>("GetComponentsInParent",
+            {"System.Type", "System.Boolean"}, TypeObject{typeObject}, includeInactive);
+    }
+    else {
+        result = target.CallArrayExactRooted<T>("GetComponentsInChildren",
+            {"System.Type", "System.Boolean"}, TypeObject{typeObject}, includeInactive);
+    }
+    if (result)
+        return result;
+
+    const std::string publicError = fallback_error() ? fallback_error() : "public component query returned no rooted array";
+    set_error("Unity component query failed through native and public paths; native: " + internalError +
+        "; public: " + publicError);
+    return {};
 }
 inline std::vector<std::string> Object::CallStringArrayExact(std::string_view methodName, const std::vector<const char*>& parameterTypeNames) const { std::vector<std::string> out; detail::clear_error(); if(!handle_) { detail::set_error("Unity Object::CallStringArrayExact failed: target object is null"); return out; } const void* k=detail::Backend::object_get_class(handle_); if(!k) { detail::set_error("Unity Object::CallStringArrayExact failed: object_get_class failed"); detail::append_backend_error(); return out; } const void* m=detail::Backend::find_method_exact(k, methodName, parameterTypeNames); if(!m) { const std::string lookupDetail = detail::fallback_error() ? detail::fallback_error() : ""; detail::set_error(std::string("Unity Object::CallStringArrayExact failed: exact method not found: ")+detail::signature_text(methodName, parameterTypeNames)+(lookupDetail.empty() ? std::string{} : std::string("; detail: ")+lookupDetail)); detail::append_backend_error(); return out; } void* array=nullptr; void* ex=nullptr; if(!detail::Backend::runtime_invoke(m,handle_,nullptr,&array,&ex) || ex) { detail::set_error(std::string("Unity Object::CallStringArrayExact failed: runtime_invoke exception in ")+detail::signature_text(methodName, parameterTypeNames)); detail::append_backend_error(); return out; } if(!array) { detail::set_error(std::string("Unity Object::CallStringArrayExact failed: returned array was null: ")+std::string(methodName)); detail::append_backend_error(); return out; } if(!detail::Backend::has_array_length()) { detail::set_error("Unity Object::CallStringArrayExact failed: backend array_length API is unavailable"); detail::append_backend_error(); return out; } const std::size_t count=detail::Backend::array_length(array); if(count==0) return out; if(!detail::Backend::has_array_ref_at()) { detail::set_error("Unity Object::CallStringArrayExact failed: backend array_ref_at API is unavailable"); detail::append_backend_error(); return out; } out.reserve(count); for(std::size_t i=0; i<count; ++i) { void* item=detail::Backend::array_ref_at(array, i); if(!item) { detail::set_error(std::string("Unity Object::CallStringArrayExact failed: string array contains a null element in ")+std::string(methodName)); detail::append_backend_error(); out.clear(); return out; } out.emplace_back(detail::managed_string_to_utf8(item)); if(detail::fallback_error()) { out.clear(); return out; } } return out; }
 
