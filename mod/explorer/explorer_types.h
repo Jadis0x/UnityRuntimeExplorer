@@ -23,6 +23,11 @@ struct HierarchyNode {
     std::string tag;
     std::string pointer_text;
     bool active = false;
+    // Immutable discovery signatures. They contain type names only and never
+    // retain managed objects or native addresses.
+    std::vector<std::string> component_types;
+    std::vector<std::string> dynamic_behaviour_types;
+    bool discovery_signature_complete = true;
     std::vector<HierarchyNode> children;
 };
 
@@ -49,6 +54,7 @@ struct HierarchyInfo {
     std::string source;
     std::size_t roots = 0;
     std::size_t objects = 0;
+    std::size_t discovery_signature_failures = 0;
     std::uint64_t revision = 0;
     std::uint64_t scene_generation = 0;
 };

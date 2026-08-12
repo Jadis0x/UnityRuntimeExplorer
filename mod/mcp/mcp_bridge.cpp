@@ -2,6 +2,7 @@
 #include "mcp_bridge.h"
 
 #include "explorer/explorer_model.h"
+#include "config/mod_config.h"
 #include "mcp/core/bridge_protocol.h"
 #include "mcp_runtime_tools.h"
 #include "support/mod_log.h"
@@ -24,6 +25,25 @@ namespace Explorer::Mcp::Bridge {
 namespace {
 using Clock = std::chrono::steady_clock;
 
+CapabilityMask current_capabilities() {
+    if (!ModConfig::enable_mcp.load(std::memory_order_acquire))
+        return 0;
+    CapabilityMask result = capability_bit(Capability::Read);
+    if (ModConfig::enable_mcp_auto_discovery.load(std::memory_order_acquire))
+        result |= capability_bit(Capability::AutoDiscovery);
+    if (ModConfig::enable_mcp_property_access.load(std::memory_order_acquire))
+        result |= capability_bit(Capability::PropertyAccess);
+    if (ModConfig::enable_mcp_writes.load(std::memory_order_acquire))
+        result |= capability_bit(Capability::Write);
+    if (ModConfig::enable_mcp_tracing.load(std::memory_order_acquire))
+        result |= capability_bit(Capability::Trace);
+    if (ModConfig::enable_mcp_invocation.load(std::memory_order_acquire))
+        result |= capability_bit(Capability::Invoke);
+    if (ModConfig::enable_mcp_destructive_operations.load(std::memory_order_acquire))
+        result |= capability_bit(Capability::Destructive);
+    return result;
+}
+
 struct PendingRequest {
     Request request;
     std::promise<Response> completion;
@@ -33,6 +53,7 @@ struct PendingRequest {
 struct State {
     std::atomic<bool> stopping{false};
     std::atomic<bool> running{false};
+    std::atomic<bool> revoke_instrumentation{false};
     std::mutex mutex;
     std::deque<std::shared_ptr<PendingRequest>> pending;
     std::thread server_thread;
@@ -72,7 +93,9 @@ bool write_discovery(std::string& error) {
     }
     const std::string pipe(g_state.pipe_name.begin(), g_state.pipe_name.end());
     output << nlohmann::json{{"protocol", bridge_protocol_version}, {"pid", GetCurrentProcessId()},
-                             {"pipe", pipe}, {"read_only", true}}.dump();
+                             {"pipe", pipe},
+                             {"permission_authority", "explorer_config"},
+                             {"capabilities", current_capabilities()}}.dump();
     output.flush();
     if (!output) {
         error = "MCP discovery file write did not complete";
@@ -187,8 +210,10 @@ void server_main(HANDLE first_pipe) {
     HANDLE pipe = first_pipe;
     while (!g_state.stopping.load(std::memory_order_acquire)) {
         const BOOL connected = ConnectNamedPipe(pipe, nullptr) ? TRUE : GetLastError() == ERROR_PIPE_CONNECTED;
-        if (connected && !g_state.stopping.load(std::memory_order_acquire))
+        if (connected && !g_state.stopping.load(std::memory_order_acquire)) {
             serve_client(pipe);
+            g_state.revoke_instrumentation.store(true, std::memory_order_release);
+        }
         FlushFileBuffers(pipe);
         DisconnectNamedPipe(pipe);
         CloseHandle(pipe);
@@ -232,6 +257,8 @@ bool start(std::string& error) {
 }
 
 void tick(RuntimeModel& model) {
+    if (g_state.revoke_instrumentation.exchange(false, std::memory_order_acq_rel))
+        g_state.tools.revoke_instrumentation(model, "MCP helper disconnected");
     constexpr std::size_t kMaxRequestsPerFrame = 4;
     for (std::size_t index = 0; index < kMaxRequestsPerFrame; ++index) {
         std::shared_ptr<PendingRequest> pending;
@@ -245,6 +272,7 @@ void tick(RuntimeModel& model) {
         if (pending->cancelled.load(std::memory_order_acquire))
             continue;
         try {
+            pending->request.context.capabilities = current_capabilities();
             pending->completion.set_value(g_state.tools.execute(model, pending->request));
         } catch (const std::exception&) {
             pending->completion.set_value(failure(pending->request.id, "internal_error",

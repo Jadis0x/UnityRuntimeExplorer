@@ -46,6 +46,7 @@ namespace Explorer {
 		constexpr int kMaxBuildSceneCount = 4096;
 		constexpr int kMaxHierarchyDepth = 256;
 		constexpr std::size_t kMaxCensusCandidates = 250000;
+		constexpr std::size_t kMinCensusObjectsPerSlice = 8;
 		constexpr std::size_t kArrayPageSize = 128;
 		// Bound native byte snapshots before decoding.
 		constexpr std::size_t kMaxByteArrayInspectionBytes = 256 * 1024;
@@ -100,7 +101,72 @@ namespace Explorer {
 			std::string name;
 			std::string tag;
 			bool active = false;
+			std::vector<std::string> component_types;
+			std::vector<std::string> dynamic_behaviour_types;
+			bool discovery_signature_complete = true;
 		};
+
+		std::string normalized_type(std::string_view name);
+
+		void capture_discovery_signature(GameObject object, FlatObject& record) {
+			clear_error();
+			const auto components = object.GetComponentsRooted<Object>();
+			if (const char* error = last_error(); error && error[0]) {
+				record.discovery_signature_complete = false;
+				clear_error();
+				return;
+			}
+			if (components.empty())
+				record.discovery_signature_complete = false;
+
+			for (const Object& component : components) {
+				if (!component) {
+					record.discovery_signature_complete = false;
+					continue;
+				}
+				const auto* klass = static_cast<const URK::managed::Class*>(
+					URK::managed::object_get_class(static_cast<URK::managed::Object*>(component.handle())));
+				if (!klass) {
+					record.discovery_signature_complete = false;
+					continue;
+				}
+				const Inspect::TypeInfo type = Inspect::DescribeClass(klass);
+				std::string type_name = type.full_name;
+				if (type_name.empty())
+					type_name = type.name;
+				if (type_name.empty()) {
+					record.discovery_signature_complete = false;
+					continue;
+				}
+				record.component_types.push_back(type_name);
+
+				const std::string normalized = normalized_type(type_name);
+				if (normalized.find("dynamicmonobehaviour") == std::string::npos &&
+					normalized.find("dynamicbehaviour") == std::string::npos &&
+					normalized.find("dynamicbehavior") == std::string::npos)
+					continue;
+
+				// DynamicMonoBehaviour exposes this serialized type discriminator as
+				// a field. Reading it does not invoke game code and avoids enumerating
+				// complete reflection metadata for every bridge instance in the census.
+				clear_error();
+				const std::string behaviour_type = component.GetField<std::string>("BehaviourType");
+				if (last_error() && last_error()[0])
+					record.discovery_signature_complete = false;
+				else if (!behaviour_type.empty())
+					record.dynamic_behaviour_types.push_back(behaviour_type);
+				clear_error();
+			}
+
+			std::sort(record.component_types.begin(), record.component_types.end());
+			record.component_types.erase(
+				std::unique(record.component_types.begin(), record.component_types.end()),
+				record.component_types.end());
+			std::sort(record.dynamic_behaviour_types.begin(), record.dynamic_behaviour_types.end());
+			record.dynamic_behaviour_types.erase(
+				std::unique(record.dynamic_behaviour_types.begin(), record.dynamic_behaviour_types.end()),
+				record.dynamic_behaviour_types.end());
+		}
 
 		// Temporary root transferred to RuntimeModel after selection succeeds.
 		struct ScopedObjectRoot {
@@ -816,6 +882,15 @@ namespace Explorer {
 		process_commands();
 		if (native_faulted_.load(std::memory_order_acquire))
 			return;
+		if ((!ModConfig::enable_mcp.load() || !ModConfig::enable_mcp_tracing.load()) &&
+			!mcp_method_trace_ids_.empty()) {
+			for (const MethodTracer::TraceId id : mcp_method_trace_ids_)
+				MethodTracer::stop(id);
+			record_flight("MCP", "Revoke method tracing", "in-game permission disabled");
+			mcp_method_trace_ids_.clear();
+			set_status("MCP method traces stopped because tracing permission was disabled");
+			publish();
+		}
 		update_pending_scene_load();
 		if (class_instance_scan_)
 			continue_class_instance_scan();
@@ -876,6 +951,7 @@ namespace Explorer {
 
 	void RuntimeModel::stop() {
 		MethodTracer::stop_all();
+		mcp_method_trace_ids_.clear();
 		hierarchy_census_.reset();
 		clear_class_instance_scan();
 		clear_reference_graph();
@@ -1769,7 +1845,7 @@ namespace Explorer {
 
 		// Build parent-child relations natively after one managed census.
 		for (; state.candidate_index < state.candidate_count; ++state.candidate_index) {
-			if (processed_this_slice >= 64 && Clock::now() >= deadline) {
+			if (processed_this_slice >= kMinCensusObjectsPerSlice && Clock::now() >= deadline) {
 				state.max_slice = std::max(state.max_slice,
 					std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - slice_started));
 				return false;
@@ -1801,6 +1877,7 @@ namespace Explorer {
 				record.name = "<unnamed>";
 			record.tag = object.tag();
 			record.active = object.activeSelf();
+			capture_discovery_signature(object, record);
 			flat_indices.emplace(instance_id, flat.size());
 			flat.push_back(std::move(record));
 		}
@@ -1843,6 +1920,11 @@ namespace Explorer {
 			node.tag = source.tag;
 			node.pointer_text = pointer_text(source.object.handle());
 			node.active = source.active;
+			node.component_types = source.component_types;
+			node.dynamic_behaviour_types = source.dynamic_behaviour_types;
+			node.discovery_signature_complete = source.discovery_signature_complete;
+			if (!source.discovery_signature_complete)
+				++next.discovery_signature_failures;
 			node.children.reserve(children[index].size());
 			for (const std::size_t child_index : children[index]) {
 				HierarchyNode child = build_node(child_index, depth + 1);
@@ -1885,11 +1967,13 @@ namespace Explorer {
 		}
 
 		const std::string signature = next.source + "|" + std::to_string(next.scenes.size()) + "|" +
-			std::to_string(next.roots) + "|" + std::to_string(next.objects);
+			std::to_string(next.roots) + "|" + std::to_string(next.objects) + "|" +
+			std::to_string(next.discovery_signature_failures);
 		if (signature != logged_hierarchy_signature_) {
 			logged_hierarchy_signature_ = signature;
-			ModLog::info("hierarchy refreshed: source=%s scenes=%zu roots=%zu objects=%zu", next.source.c_str(),
-				next.scenes.size(), next.roots, next.objects);
+			ModLog::info("hierarchy refreshed: source=%s scenes=%zu roots=%zu objects=%zu signatures_incomplete=%zu",
+				next.source.c_str(), next.scenes.size(), next.roots, next.objects,
+				next.discovery_signature_failures);
 		}
 
 		const auto census_elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - state.started);
@@ -3258,6 +3342,10 @@ namespace Explorer {
 		}
 		for (const Inspect::MethodInfo& method : Inspect::methods_from_class(klass, true)) {
 			class_browser_reflection_.methods.push_back(method);
+			// Types inspected through the Class Browser or MCP contribute names to
+			// caller resolution. IL2CPP can index existing method pointers without
+			// executing game code; Mono deliberately keeps its JIT-safe behavior.
+			remember_managed_method(method);
 			ComponentInfo::Method entry{};
 			entry.name = method.name;
 			entry.return_type = method.return_type;

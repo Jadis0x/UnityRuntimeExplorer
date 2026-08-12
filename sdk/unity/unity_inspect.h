@@ -1243,12 +1243,41 @@ inline bool method_argument_pointer(const MethodParamInfo& parameter, const Valu
 		return false;
 	}
 	if (parameter.is_by_ref) {
-		if (parameter.is_value_type) {
-			detail::set_error(std::string("Unity Inspect::InvokeMethod cannot marshal by-reference value type without its ABI: ") +
+		// BYREF metadata describes the wrapper rather than the element traits.
+		// Resolve it only at the explicit invocation boundary so primitive and
+		// enum ref/out parameters use owned WriteStorage instead of being
+		// misclassified as managed object references.
+		const TypeInfo element = DescribeType(parameter.type);
+		if (element.is_enum) {
+			const std::string underlying = enum_underlying_type_name(parameter.type);
+			if (underlying.empty()) {
+				detail::set_error(std::string("Unity Inspect::InvokeMethod failed: by-reference enum underlying type unavailable: ") +
+					parameter.name);
+				return false;
+			}
+			return scalar_write_pointer(underlying, value, storage, pointer, "InvokeMethod");
+		}
+		std::string element_name = parameter.type_name;
+		if (!element_name.empty() && element_name.back() == '&')
+			element_name.pop_back();
+		const std::string normalized_element = detail::normalized_type_name(element_name);
+		const bool primitive_or_structured =
+			normalized_element == "system.boolean" || normalized_element == "system.sbyte" ||
+			normalized_element == "system.byte" || normalized_element == "system.int16" ||
+			normalized_element == "system.uint16" || normalized_element == "system.int32" ||
+			normalized_element == "system.uint32" || normalized_element == "system.int64" ||
+			normalized_element == "system.uint64" || normalized_element == "system.intptr" ||
+			normalized_element == "system.uintptr" || normalized_element == "system.char" ||
+			normalized_element == "system.single" || normalized_element == "system.double" ||
+			structured_component_count(element_name) != 0;
+		if (primitive_or_structured)
+			return scalar_write_pointer(element_name, value, storage, pointer, "InvokeMethod");
+		if (element.is_value_type) {
+			detail::set_error(std::string("Unity Inspect::InvokeMethod cannot marshal custom by-reference value type without its ABI: ") +
 				parameter.type_name);
 			return false;
 		}
-		if (!reference_write_value(parameter.type_name, value, storage, "InvokeMethod"))
+		if (!reference_write_value(element_name, value, storage, "InvokeMethod"))
 			return false;
 		pointer = &storage.reference;
 		return true;

@@ -1,6 +1,8 @@
 // Copyright (c) 2026 Jadis0x. All rights reserved.
 #pragma once
 
+#include <atomic>
+
 namespace ModConfig {
 #if defined(URK_BACKEND_MONO)
 inline constexpr const char *project_name = "URK_Mono_UnityRuntimeExplorer";
@@ -17,11 +19,21 @@ inline constexpr const char *mod_id = "URK_Il2cpp_UnityRuntimeExplorer_24859613"
 #endif
 // Stable namespace for this mod's deployed resources. Do not change it after release.
 inline constexpr const char *author = "Jadis0x";
-inline constexpr const char *version = "0.2.0";
+inline constexpr const char *version = "0.4.0";
 inline constexpr const char *url = "https://github.com/Jadis0x/UnityRuntimeExplorer";
 inline constexpr const char *social = "https://buymeacoffee.com/jadis0x";
-inline constexpr const char *description = "A live in-game hierarchy and inspector for Windows x64 Unity games";
+inline constexpr const char *description = "A live IL2CPP and Mono Unity inspector with secure MCP research and method tracing, built on URKit";
 inline bool show_menu = false;
+// Instrumentation through MCP requires an explicit, persisted in-game opt-in.
+// MCP permissions are authoritative in the injected Explorer. The helper never
+// grants itself capabilities through request arguments.
+inline std::atomic<bool> enable_mcp{true};
+inline std::atomic<bool> enable_mcp_auto_discovery{true};
+inline std::atomic<bool> enable_mcp_property_access{true};
+inline std::atomic<bool> enable_mcp_writes{true};
+inline std::atomic<bool> enable_mcp_tracing{true};
+inline std::atomic<bool> enable_mcp_invocation{true};
+inline std::atomic<bool> enable_mcp_destructive_operations{true};
 // English is used as the fixed language when localization support is not generated.
 inline bool enable_localization = false;
 inline constexpr const char *default_language = "en";

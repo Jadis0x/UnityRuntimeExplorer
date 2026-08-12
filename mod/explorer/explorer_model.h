@@ -144,6 +144,9 @@ class RuntimeModel {
         }
     };
     std::unordered_map<TraceReturnKey, std::uint64_t, TraceReturnKeyHash> traced_return_references_;
+    // Only traces installed through MCP are revoked when the MCP permission is
+    // disabled; traces started from the in-game UI remain under UI control.
+    std::unordered_set<MethodTracer::TraceId> mcp_method_trace_ids_;
     ManagedReferenceStore managed_references_;
     // Object Inspector tabs retain their own managed handles.
     std::unordered_map<std::uint64_t, URK::Unity::Inspect::ObjectHandle> object_inspector_history_;

@@ -34,8 +34,8 @@ the Explorer UI and the inspection model on top of those services.
   and captured value types.
 - Focus the camera on an object and highlight it in the game.
 - Use a dockable ImGui interface with DX11, DX12, and OpenGL render paths.
-- Expose the live hierarchy and Inspector to MCP clients through a separate,
-  read-only helper process.
+- Investigate the live game from MCP clients through a separate helper,
+  including managed type discovery and explicitly approved method tracing.
 
 The Inspector resolves type and member information from the runtime rather than
 using a game-specific type list. As a result, unsupported or unsafe operations
@@ -153,23 +153,63 @@ The helper discovers running Explorer instances through:
 When one compatible game is running, it attaches automatically. If several are
 running, pass `--game-pid <pid>` in the MCP client configuration.
 
-The current MCP release publishes these read-only tools:
+The MCP helper publishes a complete discovery and control catalog. Explorer's
+**Config** tab is the authoritative permission boundary; clients cannot grant
+themselves capabilities through tool arguments or helper flags.
 
 | Tool | Purpose |
 | --- | --- |
 | `runtime_status` | Runtime backend, scene, GC, revision, and diagnostic status. |
-| `hierarchy_search` | Bounded search by object name, tag, or instance ID. |
+| `discover_runtime` | Search GameObjects and loaded managed types in one bounded discovery pass. |
+| `hierarchy_search` | Bounded search by name, path, tag, instance ID, component, or dynamic behaviour type. |
+| `find_game_objects` | Rank objects by name/path, components, dynamic behaviour types, scene, activity, and semantic role. |
 | `get_selected_object` | Return the object selected in the Explorer. |
 | `inspect_game_object` | Inspect identity, state, transform, and components. |
 | `list_components` | List component types and opaque component references. |
 | `read_member` | Read one explicitly requested field or readable property. |
+| `inspect_managed_object` | Traverse fields on components and ordinary managed objects; property getters are opt-in. |
+| `read_array` | Page through managed arrays while preserving reference elements as opaque tokens. |
+| `decode_byte_array` | Copy and decode bounded byte arrays as MessagePack, JSON, text, compressed-payload detection, or hex. |
+| `start_instance_scan` | Start a direct Unity-object query or a time-sliced reachable managed-object scan. |
+| `get_instance_scan` | Read scan progress and page through discovered managed instances. |
+| `search_types` | Search loaded Mono/IL2CPP types and assemblies. |
+| `search_members` | Search fields, properties, and methods across bounded matching types. |
+| `inspect_type` | Inspect fields, properties, methods, and signatures. |
+| `list_method_traces` | List active and retained trace sessions. |
+| `get_method_trace` | Read decoded calls, callers, arguments, and results. |
+| `build_call_graph` | Aggregate caller-to-target relationships from captured calls. |
+| `get_activity_log` | Read recent Explorer activity and MCP audit events. |
 | `build_reference_graph` | Build a bounded graph for the current selection. |
 | `get_watch_history` | Return watched values and recent changes. |
 | `export_diagnostic_bundle` | Export a diagnostic bundle to the fixed local directory. |
+| `write_member` | Write fields or writable properties using bounded JSON values and opaque references. |
+| `mutate_game_object` | Rename, retag, relayer, activate, transform, duplicate, or destroy a GameObject. |
+| `manage_component` | Add, remove, or enable components. |
+| `load_scene` | Load a build scene by index or name. |
 
-Object and component references are opaque, short-lived tokens. Managed
-pointers, native addresses, and raw handles are never sent to the MCP client.
-Write and method-invocation tools are not exposed in this release.
+Object, component, managed-object, scan, type, method, and trace references are opaque, bounded
+tokens. Managed pointers, native addresses, raw ABI values, and runtime handles
+are never sent to the MCP client.
+
+The Config tab provides **Enable full access** and **Read-only preset** actions,
+plus independent controls for automatic discovery, property getters, writes,
+method tracing, managed invocation, and destructive Unity operations. Tool
+calls are schema-validated, bounded, rate-limited, and audited. Raw pointers,
+native-address execution, scripting, and assembly loading remain outside the
+MCP surface because they bypass Explorer's managed object/lifetime model.
+
+A typical investigation is:
+
+```text
+runtime_status
+  -> discover_runtime / find_game_objects / search_members
+  -> inspect_game_object / inspect_type / start_instance_scan
+  -> inspect_managed_object / read_array / decode_byte_array
+  -> start_method_trace
+  -> reproduce the behavior in game
+  -> get_method_trace / build_call_graph
+  -> stop_method_trace
+```
 
 Client-specific setup instructions, security properties, troubleshooting, and
 remote HTTPS/tunnel guidance are in [docs/MCP.md](docs/MCP.md).
@@ -204,9 +244,9 @@ any data that matters.
 
 ### An MCP reference has expired
 
-Run `hierarchy_search` again after a scene load or hierarchy change. References
-are intentionally invalidated when the scene generation or hierarchy revision
-changes.
+Run `find_game_objects` or `hierarchy_search` again after a scene-generation
+change. Object and component references survive ordinary hierarchy refreshes;
+graph references remain tied to the hierarchy revision that produced them.
 
 ### A member cannot be read
 

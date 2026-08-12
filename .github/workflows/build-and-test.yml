@@ -1,0 +1,31 @@
+name: build-and-test
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  windows-clang:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure
+        run: cmake --preset clang-release -DURK_BUILD_TESTS=ON
+      - name: Build
+        run: cmake --build --preset clang-release --parallel
+      - name: Contract tests
+        run: ctest --test-dir out/build/clang-release --output-on-failure
+      - name: MCP stdio smoke test
+        shell: pwsh
+        run: |
+          $request = @(
+            '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"ci","version":"1"}}}'
+            '{"jsonrpc":"2.0","method":"notifications/initialized"}'
+            '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}'
+          )
+          $response = $request | & out/build/clang-release/URK_UnityRuntimeExplorer_McpServer.exe --game-pid 4294967295 2>$null
+          $messages = @($response | ForEach-Object { $_ | ConvertFrom-Json })
+          $initialize = $messages | Where-Object id -eq 1
+          $catalog = $messages | Where-Object id -eq 2
+          if ($initialize.result.protocolVersion -ne '2025-11-25') { throw 'MCP version negotiation failed' }
+          if (@($catalog.result.tools).Count -lt 31) { throw 'MCP tool catalog is incomplete' }

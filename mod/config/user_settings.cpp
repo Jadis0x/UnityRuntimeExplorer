@@ -9,6 +9,7 @@
 #include <cstdio>
 #include <filesystem>
 #include <string>
+#include <string_view>
 #include <utility>
 
 namespace ModConfig::UserSettings {
@@ -47,6 +48,23 @@ void set_win32_error(std::string operation) {
     g_last_error = std::move(operation) + " failed (Win32 " + std::to_string(GetLastError()) + ")";
 }
 
+bool save_mcp_value(const wchar_t* key, bool enabled, std::atomic<bool>& destination,
+                    std::string_view operation) {
+    g_last_error.clear();
+    const std::filesystem::path path = settings_path();
+    if (path.empty()) {
+        g_last_error = "Could not resolve the Explorer DLL directory";
+        return false;
+    }
+    if (!WritePrivateProfileStringW(L"MCP", key, enabled ? L"1" : L"0", path.c_str())) {
+        set_win32_error(std::string(operation));
+        return false;
+    }
+    WritePrivateProfileStringW(nullptr, nullptr, nullptr, path.c_str());
+    destination.store(enabled, std::memory_order_release);
+    return true;
+}
+
 } // namespace
 
 bool load() {
@@ -63,6 +81,14 @@ bool load() {
         return false;
     }
     menu_toggle_key = stored;
+    enable_mcp.store(GetPrivateProfileIntW(L"MCP", L"Enabled", 1, path.c_str()) == 1);
+    enable_mcp_auto_discovery.store(GetPrivateProfileIntW(L"MCP", L"AutoDiscovery", 1, path.c_str()) == 1);
+    enable_mcp_property_access.store(GetPrivateProfileIntW(L"MCP", L"AllowProperties", 1, path.c_str()) == 1);
+    enable_mcp_writes.store(GetPrivateProfileIntW(L"MCP", L"AllowWrites", 1, path.c_str()) == 1);
+    enable_mcp_tracing.store(GetPrivateProfileIntW(L"MCP", L"AllowTracing", 1, path.c_str()) == 1);
+    enable_mcp_invocation.store(GetPrivateProfileIntW(L"MCP", L"AllowInvocation", 1, path.c_str()) == 1);
+    enable_mcp_destructive_operations.store(
+        GetPrivateProfileIntW(L"MCP", L"AllowDestructiveOperations", 1, path.c_str()) == 1);
     return true;
 }
 
@@ -87,6 +113,48 @@ bool save_toggle_key(int virtual_key) {
     WritePrivateProfileStringW(nullptr, nullptr, nullptr, path.c_str());
     menu_toggle_key = virtual_key;
     return true;
+}
+
+bool save_mcp_enabled(bool enabled) {
+    return save_mcp_value(L"Enabled", enabled, enable_mcp, "Writing MCP enabled state");
+}
+
+bool save_mcp_auto_discovery(bool enabled) {
+    return save_mcp_value(L"AutoDiscovery", enabled, enable_mcp_auto_discovery,
+                          "Writing MCP auto-discovery permission");
+}
+
+bool save_mcp_property_access(bool enabled) {
+    return save_mcp_value(L"AllowProperties", enabled, enable_mcp_property_access,
+                          "Writing MCP property access permission");
+}
+
+bool save_mcp_writes(bool enabled) {
+    return save_mcp_value(L"AllowWrites", enabled, enable_mcp_writes,
+                          "Writing MCP write permission");
+}
+
+bool save_mcp_tracing(bool enabled) {
+    return save_mcp_value(L"AllowTracing", enabled, enable_mcp_tracing,
+                          "Writing MCP tracing permission");
+}
+
+bool save_mcp_invocation(bool enabled) {
+    return save_mcp_value(L"AllowInvocation", enabled, enable_mcp_invocation,
+                          "Writing MCP invocation permission");
+}
+
+bool save_mcp_destructive_operations(bool enabled) {
+    return save_mcp_value(L"AllowDestructiveOperations", enabled,
+                          enable_mcp_destructive_operations,
+                          "Writing MCP destructive-operation permission");
+}
+
+bool save_mcp_full_access(bool enabled) {
+    return save_mcp_enabled(enabled) && save_mcp_auto_discovery(enabled) &&
+        save_mcp_property_access(enabled) && save_mcp_writes(enabled) &&
+        save_mcp_tracing(enabled) && save_mcp_invocation(enabled) &&
+        save_mcp_destructive_operations(enabled);
 }
 
 void begin_toggle_key_capture() {

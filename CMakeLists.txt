@@ -110,8 +110,12 @@ set(URK_COMMON_SOURCES
         mod/explorer/camera/camera_focus_controller.cpp
         mod/ui/highlight.cpp
         mod/mcp/mcp_bridge.cpp
+        mod/mcp/managed_method_invoker.cpp
+        mod/mcp/managed_object_reader.cpp
         mod/mcp/mcp_runtime_tools.cpp
         mcp/core/bridge_protocol.cpp
+        mcp/core/object_discovery.cpp
+        mcp/core/schema_validator.cpp
         mcp/core/tool_catalog.cpp
 )
 
@@ -167,9 +171,12 @@ set(URK_COMMON_HEADERS
         mod/config/mod_config.h
         mod/config/user_settings.h
         mod/mcp/mcp_bridge.h
+        mod/mcp/managed_method_invoker.h
+        mod/mcp/managed_object_reader.h
         mod/mcp/mcp_runtime_tools.h
         mcp/core/bridge_protocol.h
         mcp/core/tool_catalog.h
+        mcp/core/schema_validator.h
 )
 
 set(URK_IL2CPP_BACKEND_SOURCES
@@ -226,12 +233,22 @@ urk_add_explorer_target(
 
 add_executable(URK_UnityRuntimeExplorer_McpServer
     mcp/server/main.cpp
+    mcp/server/bounded_stdio_transport.cpp
+    mcp/server/bounded_stdio_transport.h
+    mcp/server/json_rpc_session.cpp
+    mcp/server/json_rpc_session.h
     mcp/server/mcp_stdio_server.cpp
     mcp/server/mcp_stdio_server.h
     mcp/server/pipe_client.cpp
     mcp/server/pipe_client.h
+    mcp/server/request_dispatcher.cpp
+    mcp/server/request_dispatcher.h
     mcp/core/bridge_protocol.cpp
     mcp/core/bridge_protocol.h
+    mcp/core/object_discovery.cpp
+    mcp/core/object_discovery.h
+    mcp/core/schema_validator.cpp
+    mcp/core/schema_validator.h
     mcp/core/tool_catalog.cpp
     mcp/core/tool_catalog.h
 )
@@ -336,6 +353,8 @@ if(URK_BUILD_TESTS)
     add_executable(urk_mcp_core_tests
         tests/mcp_core_tests.cpp
         mcp/core/bridge_protocol.cpp
+        mcp/core/object_discovery.cpp
+        mcp/core/schema_validator.cpp
         mcp/core/tool_catalog.cpp
     )
     target_include_directories(urk_mcp_core_tests PRIVATE .)
@@ -345,5 +364,25 @@ if(URK_BUILD_TESTS)
     urk_enable_project_warnings(urk_mcp_core_tests)
     urk_disable_vs_vcpkg_integration(urk_mcp_core_tests)
     add_test(NAME mcp_core_contract COMMAND urk_mcp_core_tests)
+
+    add_executable(urk_mcp_protocol_tests
+        tests/mcp_protocol_tests.cpp
+        mcp/server/bounded_stdio_transport.cpp
+        mcp/server/json_rpc_session.cpp
+        mcp/server/mcp_stdio_server.cpp
+        mcp/server/pipe_client.cpp
+        mcp/server/request_dispatcher.cpp
+        mcp/core/bridge_protocol.cpp
+        mcp/core/object_discovery.cpp
+        mcp/core/schema_validator.cpp
+        mcp/core/tool_catalog.cpp
+    )
+    target_include_directories(urk_mcp_protocol_tests PRIVATE .)
+    target_compile_features(urk_mcp_protocol_tests PRIVATE cxx_std_20)
+    target_compile_definitions(urk_mcp_protocol_tests PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_link_libraries(urk_mcp_protocol_tests PRIVATE nlohmann_json::nlohmann_json)
+    urk_enable_project_warnings(urk_mcp_protocol_tests)
+    urk_disable_vs_vcpkg_integration(urk_mcp_protocol_tests)
+    add_test(NAME mcp_stdio_protocol_contract COMMAND urk_mcp_protocol_tests)
 
 endif()
