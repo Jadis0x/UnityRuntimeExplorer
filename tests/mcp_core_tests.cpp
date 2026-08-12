@@ -18,11 +18,11 @@ void require(bool condition, const char* message) {
 
 int main() {
     using namespace Explorer::Mcp;
-    require(tool_catalog().size() == 23, "twenty-three base tools are exposed");
-    require(tool_catalog(true).size() == 26, "three tracing tools are exposed");
-    require(tool_catalog(false, true).size() == 24, "invocation can be classified independently");
-    require(tool_catalog(true, true).size() == 27, "tracing and invocation can be combined");
-    require(tool_catalog(true, true, true).size() == 31, "the complete Explorer-controlled catalog is exposed");
+    require(tool_catalog().size() == 24, "twenty-four base tools are exposed");
+    require(tool_catalog(true).size() == 27, "three tracing tools are exposed");
+    require(tool_catalog(false, true).size() == 25, "invocation can be classified independently");
+    require(tool_catalog(true, true).size() == 28, "tracing and invocation can be combined");
+    require(tool_catalog(true, true, true).size() == 32, "the complete Explorer-controlled catalog is exposed");
     require(is_read_only_tool("runtime_status"), "runtime_status is allowed");
     require(is_read_only_tool("search_types"), "managed type search is read-only");
     require(is_read_only_tool("get_method_trace"), "trace reads are read-only");
@@ -31,6 +31,7 @@ int main() {
     require(is_read_only_tool("read_array"), "array paging is read-only");
     require(is_read_only_tool("decode_byte_array"), "copied byte decoding is read-only");
     require(is_read_only_tool("start_instance_scan"), "bounded instance scanning is read-only");
+    require(is_read_only_tool("cancel_instance_scan"), "scan cancellation is read-only to the game");
     require(is_instrumentation_tool("start_method_trace"), "trace start is instrumentation");
     require(!is_available_tool("start_method_trace", false), "trace start is hidden by default");
     require(is_available_tool("start_method_trace", true), "trace start is available after helper opt-in");

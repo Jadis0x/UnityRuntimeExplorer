@@ -6,6 +6,7 @@
 #include <cstdio>
 #include <cstring>
 #include <string_view>
+#include <utility>
 
 namespace Explorer::MethodTraceFormat {
 namespace {
@@ -187,6 +188,26 @@ std::string seconds_json(double seconds) {
     return text;
 }
 
+bool same_repeat_payload(const MethodTracer::Record& left, const MethodTracer::Record& right) {
+    // Do not merge pending returns: identical inputs can still complete
+    // differently. Thread and caller are part of the identity as well.
+    return left.return_captured && right.return_captured &&
+        left.thread_id == right.thread_id &&
+        left.caller_address == right.caller_address && left.caller_display == right.caller_display &&
+        left.target_address == right.target_address && left.target_display == right.target_display &&
+        left.arguments == right.arguments &&
+        left.argument_xmm_low == right.argument_xmm_low && left.argument_xmm_high == right.argument_xmm_high &&
+        left.argument_byref_value_bytes == right.argument_byref_value_bytes &&
+        left.argument_value_bytes == right.argument_value_bytes &&
+        left.argument_displays == right.argument_displays &&
+        left.argument_readable == right.argument_readable &&
+        left.return_rax == right.return_rax && left.return_xmm_low == right.return_xmm_low &&
+        left.return_xmm_high == right.return_xmm_high &&
+        left.return_buffer_address == right.return_buffer_address &&
+        left.return_value_bytes == right.return_value_bytes &&
+        left.return_display == right.return_display && left.return_readable == right.return_readable;
+}
+
 } // namespace
 
 double elapsed_seconds(const MethodTracer::Snapshot& trace, const MethodTracer::Record& record) {
@@ -194,6 +215,28 @@ double elapsed_seconds(const MethodTracer::Snapshot& trace, const MethodTracer::
         return 0.0;
     return static_cast<double>(record.timestamp_ticks - trace.start_timestamp_ticks) /
            static_cast<double>(trace.timestamp_frequency);
+}
+
+void collapse_repeated_records(MethodTracer::Snapshot& trace) {
+    if (trace.records.empty())
+        return;
+    std::vector<MethodTracer::Record> grouped;
+    grouped.reserve(trace.records.size());
+    for (MethodTracer::Record& record : trace.records) {
+        if (record.sequence_start == 0)
+            record.sequence_start = record.sequence;
+        if (record.first_timestamp_ticks == 0)
+            record.first_timestamp_ticks = record.timestamp_ticks;
+        if (!grouped.empty() && same_repeat_payload(grouped.back(), record)) {
+            MethodTracer::Record& previous = grouped.back();
+            previous.sequence = record.sequence;
+            previous.timestamp_ticks = record.timestamp_ticks;
+            previous.repeat_count += record.repeat_count;
+            continue;
+        }
+        grouped.push_back(std::move(record));
+    }
+    trace.records = std::move(grouped);
 }
 
 std::string elapsed_text(double seconds) {
@@ -281,9 +324,12 @@ std::string raw_result(const MethodTracer::Snapshot& trace, const MethodTracer::
 
 std::string csv(const MethodTracer::Snapshot& trace) {
     std::string out =
-        "sequence,seconds,thread,caller,caller_address,target,target_address,arguments,result,raw_arguments,raw_abi,raw_result\n";
+        "sequence_start,sequence,repeat_count,seconds,thread,caller,caller_address,target,target_address,arguments,result,raw_arguments,raw_abi,raw_result\n";
     for (const MethodTracer::Record& record : trace.records) {
-        out += std::to_string(record.sequence) + "," + seconds_json(elapsed_seconds(trace, record)) + "," +
+        const std::uint64_t sequence_start = record.sequence_start == 0 ? record.sequence : record.sequence_start;
+        const std::uint64_t repeat_count = std::max<std::uint64_t>(1, record.repeat_count);
+        out += std::to_string(sequence_start) + "," + std::to_string(record.sequence) + "," +
+               std::to_string(repeat_count) + "," + seconds_json(elapsed_seconds(trace, record)) + "," +
                std::to_string(record.thread_id) + ",";
         append_csv_value(out, record.caller_display);
         out += ",";
@@ -328,7 +374,11 @@ std::string json(const MethodTracer::Snapshot& trace) {
     out += ",\n  \"captureFaults\": " + std::to_string(trace.native_faults) + ",\n  \"records\": [\n";
     for (std::size_t record_index = 0; record_index < trace.records.size(); ++record_index) {
         const MethodTracer::Record& record = trace.records[record_index];
-        out += "    {\n      \"sequence\": " + std::to_string(record.sequence);
+        const std::uint64_t sequence_start = record.sequence_start == 0 ? record.sequence : record.sequence_start;
+        const std::uint64_t repeat_count = std::max<std::uint64_t>(1, record.repeat_count);
+        out += "    {\n      \"sequenceStart\": " + std::to_string(sequence_start);
+        out += ",\n      \"sequence\": " + std::to_string(record.sequence);
+        out += ",\n      \"repeatCount\": " + std::to_string(repeat_count);
         out += ",\n      \"elapsedSeconds\": " + seconds_json(elapsed_seconds(trace, record));
         out += ",\n      \"threadId\": " + std::to_string(record.thread_id);
         out += ",\n      \"caller\": {\"display\": ";

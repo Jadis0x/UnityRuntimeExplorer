@@ -105,6 +105,7 @@ set(URK_COMMON_SOURCES
         mod/explorer/managed_reference_store.cpp
         mod/explorer/method_trace_value_decoder.cpp
         mod/explorer/method_trace_format.cpp
+        mod/explorer/method_trace_abi.h
         mod/explorer/method_tracer.cpp
         mod/explorer/watch_analysis.cpp
         mod/explorer/camera/camera_focus_controller.cpp
@@ -316,6 +317,22 @@ if(URK_BUILD_TESTS)
     endif()
     urk_disable_vs_vcpkg_integration(urk_method_trace_format_tests)
     add_test(NAME method_trace_format_contract COMMAND urk_method_trace_format_tests)
+
+    add_executable(urk_method_trace_abi_tests
+        tests/method_trace_abi_tests.cpp
+    )
+    target_include_directories(urk_method_trace_abi_tests PRIVATE .)
+    target_compile_features(urk_method_trace_abi_tests PRIVATE cxx_std_20)
+    target_compile_definitions(urk_method_trace_abi_tests PRIVATE
+        WIN32_LEAN_AND_MEAN
+        NOMINMAX
+        URK_BACKEND_IL2CPP
+    )
+    if(MSVC)
+        target_compile_options(urk_method_trace_abi_tests PRIVATE /W4 /permissive- /EHsc /utf-8)
+    endif()
+    urk_disable_vs_vcpkg_integration(urk_method_trace_abi_tests)
+    add_test(NAME method_trace_abi_contract COMMAND urk_method_trace_abi_tests)
 
     add_executable(urk_dx11_viewport_swap_chain_tests
         tests/dx11_viewport_swap_chain_tests.cpp

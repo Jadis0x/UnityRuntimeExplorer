@@ -175,9 +175,9 @@ themselves capabilities through tool arguments or helper flags.
 | `search_types` | Search loaded Mono/IL2CPP types and assemblies. |
 | `search_members` | Search fields, properties, and methods across bounded matching types. |
 | `inspect_type` | Inspect fields, properties, methods, and signatures. |
-| `list_method_traces` | List active and retained trace sessions. |
-| `get_method_trace` | Read decoded calls, callers, arguments, and results. |
-| `build_call_graph` | Aggregate caller-to-target relationships from captured calls. |
+| `list_method_traces` | List active and retained trace sessions. Consecutive identical calls are grouped. |
+| `get_method_trace` | Read decoded calls, callers, arguments, and results. Grouped calls include their range and repeat count. |
+| `build_call_graph` | Aggregate caller-to-target relationships from captured calls, including grouped repeats. |
 | `get_activity_log` | Read recent Explorer activity and MCP audit events. |
 | `build_reference_graph` | Build a bounded graph for the current selection. |
 | `get_watch_history` | Return watched values and recent changes. |

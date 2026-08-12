@@ -1889,7 +1889,7 @@ void trace_card_row(std::string_view label, std::string_view color_key,
 void render_method_trace(const MethodTracer::Snapshot &trace) {
     TraceViewState &state = trace_view_state(trace.id);
     if (trace.active) {
-        ImGui::TextDisabled("%llu calls | %zu retained", static_cast<unsigned long long>(trace.total_calls),
+        ImGui::TextDisabled("%llu calls | %zu groups", static_cast<unsigned long long>(trace.total_calls),
                             trace.records.size());
     } else {
         ImGui::TextDisabled("Trace stopped: %llu calls recorded", static_cast<unsigned long long>(trace.total_calls));
@@ -1940,18 +1940,25 @@ void render_method_trace(const MethodTracer::Snapshot &trace) {
 
     std::unordered_map<std::string, std::size_t> caller_counts;
     std::unordered_map<std::uint32_t, std::size_t> thread_counts;
+    std::uint64_t collapsed_calls = 0;
     double latest_elapsed = 0.0;
     for (const MethodTracer::Record &record : trace.records) {
-        ++caller_counts[record.caller_display.empty() ? "<unresolved native caller>" : record.caller_display];
-        ++thread_counts[record.thread_id];
+        const std::uint64_t repeat_count = std::max<std::uint64_t>(1, record.repeat_count);
+        caller_counts[record.caller_display.empty() ? "<unresolved native caller>" : record.caller_display] +=
+            static_cast<std::size_t>(repeat_count);
+        thread_counts[record.thread_id] += static_cast<std::size_t>(repeat_count);
+        collapsed_calls += repeat_count - 1;
         if (trace.timestamp_frequency && record.timestamp_ticks >= trace.start_timestamp_ticks)
             latest_elapsed = std::max(latest_elapsed, static_cast<double>(record.timestamp_ticks - trace.start_timestamp_ticks) /
                                                           static_cast<double>(trace.timestamp_frequency));
     }
     if (ImGui::CollapsingHeader("Trace statistics", ImGuiTreeNodeFlags_DefaultOpen)) {
-        ImGui::Text("Recorded calls: %llu  |  Shown here: %zu  |  Rate: %.2f/s  |  Callers: %zu  |  Threads: %zu",
+        ImGui::Text("Recorded calls: %llu  |  Shown groups: %zu  |  Rate: %.2f/s  |  Callers: %zu  |  Threads: %zu",
                     static_cast<unsigned long long>(trace.total_calls), trace.records.size(),
                     latest_elapsed > 0.0 ? trace.total_calls / latest_elapsed : 0.0, caller_counts.size(), thread_counts.size());
+        if (collapsed_calls != 0)
+            ImGui::TextDisabled("%llu consecutive duplicate calls collapsed; expand a group to see its range.",
+                                static_cast<unsigned long long>(collapsed_calls));
         std::vector<std::pair<std::string, std::size_t>> callers(caller_counts.begin(), caller_counts.end());
         std::sort(callers.begin(), callers.end(), [](const auto &left, const auto &right) { return left.second > right.second; });
         const std::size_t shown = std::min<std::size_t>(callers.size(), 6);
@@ -1980,11 +1987,16 @@ void render_method_trace(const MethodTracer::Snapshot &trace) {
                 continue;
             const double elapsed = MethodTraceFormat::elapsed_seconds(trace, record);
             const std::string elapsed_text = MethodTraceFormat::elapsed_text(elapsed);
+            const std::uint64_t repeat_count = std::max<std::uint64_t>(1, record.repeat_count);
+            const std::uint64_t sequence_start = record.sequence_start == 0 ? record.sequence : record.sequence_start;
+            std::string call_label = "#" + std::to_string(record.sequence);
+            if (repeat_count > 1)
+                call_label = "#" + std::to_string(sequence_start) + "-" + std::to_string(record.sequence) +
+                    " (" + std::to_string(repeat_count) + ")";
             ImGui::PushID(static_cast<int>(record.sequence));
             const bool open = ImGui::TreeNodeEx(
                 "##call", ImGuiTreeNodeFlags_SpanAvailWidth,
-                "#%llu   +%s   thread %u", static_cast<unsigned long long>(record.sequence),
-                elapsed_text.c_str(), record.thread_id);
+                "%s   +%s   thread %u", call_label.c_str(), elapsed_text.c_str(), record.thread_id);
 
             const bool readable_arguments = std::any_of(
                 record.argument_readable.begin(), record.argument_readable.end(),
@@ -1998,6 +2010,11 @@ void render_method_trace(const MethodTracer::Snapshot &trace) {
                 const std::string when = "+" + elapsed_text + " | thread " + std::to_string(record.thread_id);
                 const std::string what = trace.declaring_type + "." + trace.method_name;
                 trace_card_row("When", when, when, false);
+                if (repeat_count > 1) {
+                    const std::string repeats = std::to_string(repeat_count) + " identical calls (" +
+                        std::to_string(sequence_start) + "-" + std::to_string(record.sequence) + ")";
+                    trace_card_row("Repeated", repeats, repeats, false);
+                }
                 trace_card_row("Who", caller, caller, false);
                 trace_card_row("What", what, what, false);
                 if (!trace.is_static)
@@ -2127,6 +2144,12 @@ std::string short_trace_type_name(std::string_view type_name) {
     return separator == std::string_view::npos ? std::string(type_name) : std::string(type_name.substr(separator + 1));
 }
 
+std::string trace_list_display_name(const MethodTracer::Snapshot& trace) {
+    const std::string method = short_trace_type_name(trace.declaring_type) + "." + trace.method_name;
+    const char* const dispatch = trace.is_static ? "static" : "instance";
+    return method + " [" + dispatch + "; " + std::to_string(trace.parameter_types.size()) + " args]";
+}
+
 void render_method_traces(const Snapshot &snapshot) {
     if (snapshot.method_traces.empty()) {
         ImGui::TextDisabled("No traced methods. Use Trace next to a method to start one.");
@@ -2147,17 +2170,23 @@ void render_method_traces(const Snapshot &snapshot) {
                              trace_list_filter.size());
     ImGui::Separator();
     for (const MethodTracer::Snapshot &trace : snapshot.method_traces) {
-        const std::string display_name = short_trace_type_name(trace.declaring_type) + "." + trace.method_name;
+        const std::string display_name = trace_list_display_name(trace);
         if (trace_list_filter[0] != '\0' &&
             !contains_case_insensitive(display_name, trace_list_filter.data()))
             continue;
         const std::string label = std::string(trace.active ? "[REC] " : "[STOP] ") + display_name +
                                   "  (" + std::to_string(trace.total_calls) + ")";
+        // Method names are not unique: overloads share them. Scope every selectable
+        // to its stable trace id so ImGui never aliases controls for distinct hooks.
+        const std::string trace_id = "trace-" + std::to_string(trace.id);
+        ImGui::PushID(trace_id.c_str());
         if (ImGui::Selectable(label.c_str(), selected == trace.id))
             selected = trace.id;
         if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("%s.%s\n%s | %llu calls", trace.declaring_type.c_str(), trace.method_name.c_str(),
-                              trace.active ? "Recording" : "Stopped", static_cast<unsigned long long>(trace.total_calls));
+            ImGui::SetTooltip("%s.%s\n%s | %zu parameters | %llu calls", trace.declaring_type.c_str(), trace.method_name.c_str(),
+                              trace.active ? "Recording" : "Stopped", trace.parameter_types.size(),
+                              static_cast<unsigned long long>(trace.total_calls));
+        ImGui::PopID();
     }
     ImGui::EndChild();
     ImGui::SameLine();

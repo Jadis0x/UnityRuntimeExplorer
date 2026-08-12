@@ -17,7 +17,10 @@ using TraceId = std::uint64_t;
 
 struct Record {
     std::uint64_t sequence = 0;
+    std::uint64_t sequence_start = 0;
     std::uint64_t timestamp_ticks = 0;
+    std::uint64_t first_timestamp_ticks = 0;
+    std::uint64_t repeat_count = 1;
     std::uint32_t thread_id = 0;
     std::uintptr_t caller_address = 0;
     std::uintptr_t target_address = 0;

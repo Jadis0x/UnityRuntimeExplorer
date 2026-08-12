@@ -114,6 +114,24 @@ int main() {
     require(json.find("\"result\": {\"type\": \"System.Object\"") != std::string::npos,
             "structured result object");
 
+    MethodTracer::Record repeated = record;
+    repeated.sequence = 8;
+    repeated.timestamp_ticks += 100;
+    MethodTracer::Record repeated_again = repeated;
+    repeated_again.sequence = 9;
+    repeated_again.timestamp_ticks += 100;
+    trace.records = {record, repeated, repeated_again};
+    trace.total_calls = 3;
+    MethodTraceFormat::collapse_repeated_records(trace);
+    require(trace.records.size() == 1, "consecutive identical calls must collapse into one group");
+    require(trace.records[0].sequence_start == 7 && trace.records[0].sequence == 9,
+            "collapsed group must retain its first and last sequence");
+    require(trace.records[0].repeat_count == 3, "collapsed group must retain the raw repeat count");
+    const std::string csv = MethodTraceFormat::csv(trace);
+    require(csv.find("sequence_start,sequence,repeat_count") != std::string::npos,
+            "CSV must expose collapse metadata");
+    require(csv.find("7,9,3,") != std::string::npos, "CSV must expose the collapsed sequence range");
+
     std::cout << "method trace formatting contract passed\n";
     return 0;
 }

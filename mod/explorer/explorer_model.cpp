@@ -2,6 +2,7 @@
 #include "explorer_model.h"
 
 #include "method_trace_value_decoder.h"
+#include "method_trace_format.h"
 #include "diagnostic_bundle.h"
 #include "reference_graph_layout.h"
 #include "config/mod_config.h"
@@ -795,7 +796,7 @@ namespace Explorer {
 	};
 
 	struct RuntimeModel::ClassInstanceScan {
-		enum class Phase { StaticRoots, UnityRoots, ReachableGraph };
+		enum class Phase { StaticRoots, ReachableGraph };
 		struct PendingObject {
 			Inspect::ObjectHandle handle;
 			int depth = 0;
@@ -805,11 +806,15 @@ namespace Explorer {
 		Phase phase = Phase::StaticRoots;
 		const URK::managed::Class* target = nullptr;
 		const URK::managed::Class* unity_object_base = nullptr;
-		bool include_all_loaded = true;
 		std::size_t assembly_index = 0;
 		std::size_t class_index = 0;
+		const URK::managed::Class* static_owner = nullptr;
+		std::string static_owner_name;
+		std::vector<Inspect::FieldInfo> static_fields;
+		std::size_t static_field_index = 0;
 		std::deque<PendingObject> pending;
 		std::unordered_set<void*> seen;
+		Clock::time_point started{};
 	};
 
 	RuntimeModel::~RuntimeModel() = default;
@@ -2675,15 +2680,15 @@ namespace Explorer {
 
 		class_instance_scan_ = std::make_unique<ClassInstanceScan>();
 		class_instance_scan_->target = target;
-		class_instance_scan_->include_all_loaded = command.bool_value;
 		class_instance_scan_->unity_object_base =
 			URK::managed::find_class("UnityEngine.CoreModule.dll", "UnityEngine", "Object");
 		if (!class_instance_scan_->unity_object_base)
 			class_instance_scan_->unity_object_base =
 				URK::managed::find_class("UnityEngine.dll", "UnityEngine", "Object");
+		class_instance_scan_->started = Clock::now();
 		working_.class_browser_scan_active = true;
 		next_class_scan_publish_ = Clock::now();
-		set_status("Scanning managed roots for " + working_.class_browser_query.full_name + "...");
+		set_status("Scanning static managed roots for " + working_.class_browser_query.full_name + "...");
 	}
 
 	void RuntimeModel::clear_class_instance_scan() {
@@ -2703,6 +2708,17 @@ namespace Explorer {
 		constexpr std::size_t kMaxArrayElements = 256;
 		constexpr int kMaxGraphDepth = 5;
 		constexpr std::size_t kMaxInstanceResults = 512;
+		constexpr auto kMaxScanDuration = std::chrono::seconds(10);
+		if (Clock::now() - scan.started >= kMaxScanDuration) {
+			working_.class_browser_scan_truncated = true;
+			const std::size_t found = working_.class_browser_instances.size();
+			const std::size_t scanned = working_.class_browser_scanned_objects;
+			clear_class_instance_scan();
+			set_status("Instance scan stopped after 10 seconds; found " + std::to_string(found) +
+				" instance(s) after scanning " + std::to_string(scanned) + " reachable object(s)");
+			publish();
+			return;
+		}
 		const Clock::time_point deadline = Clock::now() + std::chrono::milliseconds(3);
 		const auto enqueue_object = [&](Object object, int depth, bool array, std::string source) {
 			if (!object.handle() || scan.seen.size() >= kMaxGraphNodes)
@@ -2723,20 +2739,27 @@ namespace Explorer {
 				std::min<std::size_t>(URK::managed::domain_get_assembly_count(), 4096);
 			while (scan.assembly_index < assembly_count && Clock::now() < deadline &&
 				scan.seen.size() < kMaxGraphNodes) {
-				const URK::managed::Assembly* assembly = URK::managed::domain_get_assembly(scan.assembly_index);
-				const URK::managed::Image* image = assembly ? URK::managed::assembly_get_image(assembly) : nullptr;
-				const std::size_t class_count = image
-					? std::min<std::size_t>(URK::managed::image_get_class_count(image), 1000000) : 0;
-				if (!image || scan.class_index >= class_count) {
-					++scan.assembly_index;
-					scan.class_index = 0;
-					continue;
+				if (!scan.static_owner) {
+					const URK::managed::Assembly* assembly = URK::managed::domain_get_assembly(scan.assembly_index);
+					const URK::managed::Image* image = assembly ? URK::managed::assembly_get_image(assembly) : nullptr;
+					const std::size_t class_count = image
+						? std::min<std::size_t>(URK::managed::image_get_class_count(image), 1000000) : 0;
+					if (!image || scan.class_index >= class_count) {
+						++scan.assembly_index;
+						scan.class_index = 0;
+						continue;
+					}
+					scan.static_owner = URK::managed::image_get_class(image, scan.class_index++);
+					if (!scan.static_owner)
+						continue;
+					const Inspect::TypeInfo owner = Inspect::DescribeClass(scan.static_owner);
+					scan.static_owner_name = owner.full_name;
+					scan.static_fields = Inspect::fields_from_class(scan.static_owner, false);
+					scan.static_field_index = 0;
 				}
-				const URK::managed::Class* klass = URK::managed::image_get_class(image, scan.class_index++);
-				if (!klass)
-					continue;
-				const Inspect::TypeInfo owner = Inspect::DescribeClass(klass);
-				for (const Inspect::FieldInfo& field : Inspect::fields_from_class(klass, false)) {
+				while (scan.static_field_index < scan.static_fields.size() && Clock::now() < deadline &&
+					scan.seen.size() < kMaxGraphNodes) {
+					const Inspect::FieldInfo& field = scan.static_fields[scan.static_field_index++];
 					if (!field.is_static || field.is_value_type)
 						continue;
 					const Inspect::ValueInfo value = Inspect::ReadField({}, field);
@@ -2745,22 +2768,17 @@ namespace Explorer {
 						continue;
 					if (enqueue_object(Object{value.object}, 0,
 						value.kind == Inspect::ValueKind::ArrayReference,
-						"static " + owner.full_name + "." + field.name))
+						"static " + scan.static_owner_name + "." + field.name))
 						++working_.class_browser_static_roots;
 				}
+				if (scan.static_field_index < scan.static_fields.size())
+					break;
+				scan.static_owner = nullptr;
+				scan.static_owner_name.clear();
+				scan.static_fields.clear();
+				scan.static_field_index = 0;
 			}
 			if (scan.assembly_index >= assembly_count || scan.seen.size() >= kMaxGraphNodes)
-				scan.phase = ClassInstanceScan::Phase::UnityRoots;
-		}
-
-		if (scan.phase == ClassInstanceScan::Phase::UnityRoots && Clock::now() < deadline) {
-			const auto unity_roots = scan.include_all_loaded ? Object::FindObjectsOfTypeAllRooted<Object>()
-				: Object::FindObjectsOfTypeRooted<Object>();
-			for (const Object& root : unity_roots) {
-				if (scan.seen.size() >= kMaxGraphNodes)
-					break;
-				enqueue_object(root, 0, false, "Unity root");
-			}
 			scan.phase = ClassInstanceScan::Phase::ReachableGraph;
 		}
 
@@ -5742,12 +5760,13 @@ namespace Explorer {
 			const Snapshot::FieldWatch& right) {
 				return left.id < right.id;
 			});
-		for (MethodTracer::Snapshot& trace : working_.method_traces) {
-			// Decode ABI captures on the Explorer thread, outside the detour.
-			MethodTraceValueDecoder::resolve_displays(trace);
-			for (MethodTracer::Record& record : trace.records)
-				record.caller_display = managed_caller_location(record.caller_address);
-		}
+        for (MethodTracer::Snapshot& trace : working_.method_traces) {
+            // Decode ABI captures on the Explorer thread, outside the detour.
+            MethodTraceValueDecoder::resolve_displays(trace);
+            for (MethodTracer::Record& record : trace.records)
+                record.caller_display = managed_caller_location(record.caller_address);
+            MethodTraceFormat::collapse_repeated_records(trace);
+        }
 		std::unordered_set<TraceReturnKey, TraceReturnKeyHash> live_trace_returns;
 		for (MethodTracer::Snapshot& trace : working_.method_traces) {
 			// Root only recent object results; older trace rows remain raw diagnostics.

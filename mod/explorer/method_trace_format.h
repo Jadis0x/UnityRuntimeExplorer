@@ -21,6 +21,7 @@ struct ArgumentView {
 };
 
 double elapsed_seconds(const MethodTracer::Snapshot& trace, const MethodTracer::Record& record);
+void collapse_repeated_records(MethodTracer::Snapshot& trace);
 std::string elapsed_text(double seconds);
 std::string address(std::uintptr_t value);
 std::vector<ArgumentView> arguments(const MethodTracer::Snapshot& trace,

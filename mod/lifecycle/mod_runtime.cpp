@@ -67,8 +67,8 @@ void update() {
   // Keep a malformed third-party managed metadata record isolated to this
   // update; RuntimeModel will discard stale reflection state next frame.
   __try {
-    Explorer::RuntimeModel::instance().tick();
     Explorer::Mcp::Bridge::tick(Explorer::RuntimeModel::instance());
+    Explorer::RuntimeModel::instance().tick();
   } __except (capture_runtime_fault(_exception_info())) {
     Explorer::RuntimeModel::instance().notify_native_fault(
         g_runtime_fault.code, g_runtime_fault.address, g_runtime_fault.instruction);
@@ -77,8 +77,8 @@ void update() {
                   reinterpret_cast<void*>(g_runtime_fault.instruction));
   }
 #else
-  Explorer::RuntimeModel::instance().tick();
   Explorer::Mcp::Bridge::tick(Explorer::RuntimeModel::instance());
+  Explorer::RuntimeModel::instance().tick();
 #endif
 }
 

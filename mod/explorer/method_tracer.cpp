@@ -1,5 +1,6 @@
 // Copyright (c) 2026 Jadis0x. All rights reserved.
 #include "method_tracer.h"
+#include "method_trace_abi.h"
 
 #include "sdk/hook_api.h"
 #include "sdk/runtime/managed_hooks.h"
@@ -26,14 +27,7 @@ namespace Explorer::MethodTracer {
 namespace {
 enum class ArgumentKind : std::uint8_t { Integer, Floating, Aggregate };
 
-struct TraceRegisterFrame {
-    std::array<std::array<std::uint8_t, 16>, 6> xmm;
-    std::uint64_t r11, r10, r9, r8, rdx, rcx, rax, return_address;
-    std::uint64_t stack_arguments[max_parameters];
-};
-static_assert(offsetof(TraceRegisterFrame, r11) == 96);
-static_assert(offsetof(TraceRegisterFrame, return_address) == 152);
-static_assert(offsetof(TraceRegisterFrame, stack_arguments) == 160);
+using MethodTraceAbi::RegisterFrame;
 
 struct RingRecord {
     std::atomic<std::uint64_t> published_sequence{0}, timestamp_ticks{0};
@@ -51,7 +45,12 @@ struct HookSession {
     void *stub = nullptr;
     bool visible = true;
     std::atomic<bool> active{false};
-    std::atomic<std::uint32_t> in_flight{0};
+    // The high bit closes the entry gate before a hook is detached. The
+    // remaining bits count calls that already entered the detour.
+    static constexpr std::uint64_t flight_accepting = 1ull << 63;
+    static constexpr std::uint64_t flight_count_mask = ~flight_accepting;
+    std::atomic<std::uint64_t> flight_state{flight_accepting};
+    std::atomic<bool> detach_pending{false};
     std::atomic<std::uint64_t> write_sequence{0};
     std::atomic<std::uint64_t> native_faults{0};
     std::array<RingRecord, max_records> records{};
@@ -201,14 +200,11 @@ RuntimeTypeTraits resolve_runtime_type_traits(const void* type_handle, std::stri
         traits.klass = klass;
         traits.is_value_type = URK::managed::class_is_valuetype(klass);
         traits.is_enum = URK::managed::class_is_enum(klass);
-        // Some generated/bridge signatures advertise a CLASS element kind even
-        // though their runtime class is an explicit-layout struct.  The class
-        // size API is the ABI authority here: a positive value size identifies
-        // a by-value payload even when the metadata kind is conservative.
-        std::uint32_t alignment = 0;
-        const std::int32_t value_size = URK::managed::class_value_size(klass, &alignment);
-        if (value_size > 0)
-            traits.is_value_type = true;
+        // class_value_size is an allocation/layout size and is positive for
+        // reference types such as System.String on IL2CPP.  Treating it as a
+        // value-type discriminator corrupts reference decoding by interpreting
+        // the managed pointer as inline struct bytes. class_is_valuetype is the
+        // runtime's authoritative ABI classification.
         if (!traits.is_enum && URK::managed::class_enum_basetype(klass) != nullptr)
             traits.is_enum = true;
 #if defined(_WIN32)
@@ -292,23 +288,17 @@ std::size_t resolve_value_size(const URK::Unity::Inspect::MethodParamInfo& param
 #endif
 }
 
-std::uint64_t register_value(const TraceRegisterFrame *frame, std::size_t slot, ArgumentKind kind) {
+std::uint64_t register_value(const RegisterFrame *frame, std::size_t slot, ArgumentKind kind) {
     if (slot >= 4)
-        return frame->stack_arguments[slot - 4];
+        return MethodTraceAbi::integer_argument(*frame, slot);
     if (kind == ArgumentKind::Floating) {
-        std::uint64_t value = 0;
-        std::memcpy(&value, frame->xmm[slot].data(), sizeof(value));
-        return value;
+        return MethodTraceAbi::xmm_argument(*frame, slot, 0);
     }
-    return slot == 0 ? frame->rcx : slot == 1 ? frame->rdx : slot == 2 ? frame->r8 : frame->r9;
+    return MethodTraceAbi::integer_argument(*frame, slot);
 }
 
-std::uint64_t xmm_lane_value(const TraceRegisterFrame *frame, std::size_t slot, std::size_t offset) {
-    if (slot >= 4 || offset > 8)
-        return 0;
-    std::uint64_t value = 0;
-    std::memcpy(&value, frame->xmm[slot].data() + offset, sizeof(value));
-    return value;
+std::uint64_t xmm_lane_value(const RegisterFrame *frame, std::size_t slot, std::size_t offset) {
+    return MethodTraceAbi::xmm_argument(*frame, slot, offset);
 }
 
 std::size_t argument_slot(const HookSession &session, std::uint64_t sequence, std::size_t argument_index) {
@@ -343,12 +333,16 @@ std::uintptr_t push_return_context(HookSession* session, std::uint64_t sequence,
     return original_return;
 }
 
-extern "C" std::uintptr_t trace_record_from_stub(const TraceRegisterFrame *frame, HookSession *session) {
+bool enter_flight(HookSession& session);
+void leave_flight(HookSession& session);
+
+extern "C" std::uintptr_t trace_record_from_stub(const RegisterFrame *frame, HookSession *session) {
     if (!frame || !session)
         return 0;
-    session->in_flight.fetch_add(1, std::memory_order_acq_rel);
+    if (!enter_flight(*session))
+        return 0;
     if (!session->active.load(std::memory_order_acquire)) {
-        session->in_flight.fetch_sub(1, std::memory_order_release);
+        leave_flight(*session);
         return 0;
     }
     std::uintptr_t original_return = 0;
@@ -405,7 +399,7 @@ extern "C" std::uintptr_t trace_record_from_stub(const TraceRegisterFrame *frame
     }
 #endif
     if (!original_return)
-        session->in_flight.fetch_sub(1, std::memory_order_release);
+        leave_flight(*session);
     return original_return;
 }
 
@@ -468,7 +462,7 @@ extern "C" std::uintptr_t trace_record_return_from_stub(HookSession* session, st
         session->native_faults.fetch_add(1, std::memory_order_relaxed);
     }
 #endif
-    session->in_flight.fetch_sub(1, std::memory_order_release);
+    leave_flight(*session);
     return context.original_return;
 }
 
@@ -528,10 +522,55 @@ bool create_stub(HookSession &session, std::string &error) {
 
 void tracer_diagnostic(const char *message) { if (message && message[0]) g_state.diagnostic = message; }
 
-void deactivate(HookSession &session) {
+bool enter_flight(HookSession& session) {
+    std::uint64_t state = session.flight_state.load(std::memory_order_acquire);
+    for (;;) {
+        if ((state & HookSession::flight_accepting) == 0 ||
+            (state & HookSession::flight_count_mask) == HookSession::flight_count_mask)
+            return false;
+        if (session.flight_state.compare_exchange_weak(
+                state, state + 1, std::memory_order_acq_rel, std::memory_order_acquire))
+            return true;
+    }
+}
+
+void leave_flight(HookSession& session) {
+    session.flight_state.fetch_sub(1, std::memory_order_release);
+}
+
+std::uint64_t flight_count(const HookSession& session) {
+    return session.flight_state.load(std::memory_order_acquire) & HookSession::flight_count_mask;
+}
+
+bool deactivate(HookSession &session) {
     session.active.store(false, std::memory_order_release);
-    while (session.in_flight.load(std::memory_order_acquire) != 0) SwitchToThread();
-    if (session.original && session.stub) URK::hooks::detach_ex(&session.original, session.stub);
+    session.flight_state.fetch_and(~HookSession::flight_accepting, std::memory_order_acq_rel);
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(50);
+    while (flight_count(session) != 0 && std::chrono::steady_clock::now() < deadline)
+        SwitchToThread();
+    if (flight_count(session) != 0) {
+        // Keep the stub mapped and attached while an already-entered call is
+        // unwinding. The detour is inactive, so new calls pass through safely.
+        session.detach_pending.store(true, std::memory_order_release);
+        return false;
+    }
+    if (session.original && session.stub &&
+        !URK::hooks::detach_ex(&session.original, session.stub)) {
+        session.detach_pending.store(true, std::memory_order_release);
+        return false;
+    }
+    session.detach_pending.store(false, std::memory_order_release);
+    return true;
+}
+
+bool retry_pending_detach(HookSession& session) {
+    if (!session.detach_pending.load(std::memory_order_acquire) || flight_count(session) != 0)
+        return false;
+    if (session.original && session.stub &&
+        !URK::hooks::detach_ex(&session.original, session.stub))
+        return false;
+    session.detach_pending.store(false, std::memory_order_release);
+    return true;
 }
 
 void reset_records(HookSession &session) {
@@ -593,7 +632,9 @@ Snapshot copy_snapshot(const HookSession &session) {
         if (source.published_sequence.load(std::memory_order_acquire) != sequence + 1) continue;
         Record record{};
         record.sequence = sequence + 1;
+        record.sequence_start = record.sequence;
         record.timestamp_ticks = source.timestamp_ticks.load(std::memory_order_relaxed);
+        record.first_timestamp_ticks = record.timestamp_ticks;
         record.thread_id = source.thread_id.load(std::memory_order_relaxed);
         record.caller_address = source.caller_address.load(std::memory_order_relaxed);
         record.target_address = source.target_address.load(std::memory_order_relaxed);
@@ -712,12 +753,12 @@ bool start(const URK::Unity::Inspect::MethodInfo &method, std::string &error) {
     session->return_is_value_type = return_traits.resolved ? return_traits.is_value_type : method.return_is_value_type;
     session->return_is_enum = return_traits.resolved ? return_traits.is_enum : method.return_is_enum;
     session->return_value_class = return_traits.klass;
-    if (method.return_is_enum)
+    if (session->return_is_enum)
         session->return_enum_underlying_type =
             URK::Unity::Inspect::enum_underlying_type_name(method.return_type_handle);
     session->return_is_opaque = method.return_type_is_opaque;
     resolve_value_return_layout(*session);
-    session->return_is_reference = !method.return_is_value_type && method.return_type != "System.Void" &&
+    session->return_is_reference = !session->return_is_value_type && method.return_type != "System.Void" &&
                                    method.return_type != "Void" && method.return_type != "void";
     if (session->argument_count > 0) {
         if (session->argument_count > std::numeric_limits<std::size_t>::max() / max_records) {
@@ -871,10 +912,23 @@ bool stop(TraceId id) {
 bool clear(TraceId id) {
     std::lock_guard lock(g_state.control_mutex);
     for (const auto &session : g_state.sessions) if (session->id == id) {
+        if (session->detach_pending.load(std::memory_order_acquire))
+            return false;
         const bool resume = session->active.exchange(false, std::memory_order_acq_rel);
-        while (session->in_flight.load(std::memory_order_acquire) != 0) SwitchToThread();
+        if (resume)
+            session->flight_state.fetch_and(~HookSession::flight_accepting, std::memory_order_acq_rel);
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(50);
+        while (flight_count(*session) != 0 && std::chrono::steady_clock::now() < deadline)
+            SwitchToThread();
+        if (flight_count(*session) != 0) {
+            session->detach_pending.store(true, std::memory_order_release);
+            return false;
+        }
         reset_records(*session);
-        if (resume) session->active.store(true, std::memory_order_release);
+        if (resume) {
+            session->flight_state.store(HookSession::flight_accepting, std::memory_order_release);
+            session->active.store(true, std::memory_order_release);
+        }
         return true;
     }
     return false;
@@ -883,7 +937,8 @@ bool clear(TraceId id) {
 bool close(TraceId id) {
     std::lock_guard lock(g_state.control_mutex);
     for (const auto &session : g_state.sessions)
-        if (session->id == id && !session->active.load(std::memory_order_acquire)) {
+        if (session->id == id && !session->active.load(std::memory_order_acquire) &&
+            !session->detach_pending.load(std::memory_order_acquire)) {
             session->visible = false;
             return true;
         }
@@ -898,6 +953,24 @@ void stop_all() {
 void shutdown() {
     stop_all();
     std::lock_guard lock(g_state.control_mutex);
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    bool pending = true;
+    while (pending && std::chrono::steady_clock::now() < deadline) {
+        pending = false;
+        for (const auto &session : g_state.sessions) {
+            retry_pending_detach(*session);
+            pending = pending || session->detach_pending.load(std::memory_order_acquire);
+        }
+        if (pending)
+            SwitchToThread();
+    }
+    if (pending) {
+        // Never free a stub that an in-flight call can still return through.
+        // The process is shutting down, so retaining this small allocation is
+        // safer than turning an incomplete detach into an execute-after-free.
+        g_state.diagnostic = "Method tracer shutdown deferred a native stub detach because a call remained in flight";
+        return;
+    }
     for (const auto &session : g_state.sessions) if (session->stub) VirtualFree(session->stub, 0, MEM_RELEASE);
     g_state.sessions.clear();
 }
@@ -910,6 +983,8 @@ bool any_active() {
 
 std::vector<Snapshot> snapshots() {
     std::lock_guard lock(g_state.control_mutex);
+    for (const auto &session : g_state.sessions)
+        retry_pending_detach(*session);
     std::vector<Snapshot> out;
     out.reserve(g_state.sessions.size());
     for (const auto &session : g_state.sessions)

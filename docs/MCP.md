@@ -54,9 +54,9 @@ managed object itself.
 | `search_types` | Searches loaded Mono/IL2CPP assemblies and returns opaque type references. |
 | `search_members` | Searches fields, properties, and methods across bounded matching types. |
 | `inspect_type` | Returns bounded field, property, method, and signature metadata. |
-| `list_method_traces` | Lists active and retained trace sessions. |
-| `get_method_trace` | Returns decoded callers, arguments, results, threads, and timing for bounded captured calls. |
-| `build_call_graph` | Aggregates captured caller-to-target edges without returning addresses. |
+| `list_method_traces` | Lists active and retained trace sessions. Consecutive identical calls are grouped. |
+| `get_method_trace` | Returns decoded callers, arguments, results, threads, and timing. Groups include their sequence range and repeat count. |
+| `build_call_graph` | Aggregates captured caller-to-target edges, including calls folded into each group. |
 | `get_activity_log` | Returns bounded Explorer activity and MCP audit events. |
 | `build_reference_graph` | Bounded graph for the current Explorer selection. |
 | `get_watch_history` | Current watches and bounded recent change events. |

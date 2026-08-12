@@ -35,6 +35,18 @@ std::string lowercase(std::string value) {
     return value;
 }
 
+std::uint64_t retained_method_trace_calls(const MethodTracer::Snapshot& trace) {
+    std::uint64_t count = 0;
+    for (const MethodTracer::Record& record : trace.records)
+        count += std::max<std::uint64_t>(1, record.repeat_count);
+    return count;
+}
+
+std::uint64_t collapsed_method_trace_calls(const MethodTracer::Snapshot& trace) {
+    const std::uint64_t retained = retained_method_trace_calls(trace);
+    return retained >= trace.records.size() ? retained - trace.records.size() : 0;
+}
+
 Json vector_json(const Vector3& value) {
     return {{"x", value.x}, {"y", value.y}, {"z", value.z}};
 }
@@ -1048,7 +1060,10 @@ Response RuntimeTools::execute(RuntimeModel& model, const Request& request) {
         if (token.empty())
             return fail("reference_unavailable", "A secure instance-scan reference could not be generated.");
         return succeed({{"scan_reference", token}, {"type", type->full_name},
-                        {"strategy", type->is_unity_object ? "unity_object_query" : "reachable_managed_graph"},
+                        {"strategy", type->is_unity_object ? "unity_object_query" : "bounded_static_root_graph"},
+                        {"scope", type->is_unity_object
+                            ? (command.bool_value ? "all_loaded_unity_objects" : "active_unity_objects")
+                            : "static_managed_roots"},
                         {"active", model.working_.class_browser_scan_active},
                         {"found", model.working_.class_browser_instances.size()},
                         {"scanned_objects", model.working_.class_browser_scanned_objects},
@@ -1118,6 +1133,29 @@ Response RuntimeTools::execute(RuntimeModel& model, const Request& request) {
                         {"found", model.working_.class_browser_instances.size()},
                         {"offset", first}, {"instances", std::move(instances)},
                         {"has_more", last < model.working_.class_browser_instances.size()},
+                        {"status", model.working_.status}});
+    }
+
+    if (request.tool == "cancel_instance_scan") {
+        if (!request.arguments.contains("scan_reference") ||
+            !request.arguments["scan_reference"].is_string())
+            return fail("invalid_arguments", "scan_reference is required.");
+        const Reference* scan = find_reference(request.arguments["scan_reference"].get<std::string>(),
+                                               ReferenceKind::InstanceScan, model);
+        if (!scan)
+            return fail("invalid_reference", "The instance-scan reference is invalid or expired.");
+        if (scan->trace_id != active_instance_scan_id_ ||
+            model.working_.class_browser_query.image != scan->image ||
+            model.working_.class_browser_query.namespc != scan->namespc ||
+            model.working_.class_browser_query.class_name != scan->class_name)
+            return fail("scan_superseded", "A newer instance scan replaced this scan.");
+        const bool was_active = model.working_.class_browser_scan_active;
+        model.clear_class_instance_scan();
+        active_instance_scan_id_ = 0;
+        model.set_status(was_active ? "Instance scan cancelled by MCP." : "Instance scan was already complete.");
+        return succeed({{"cancelled", was_active}, {"active", false},
+                        {"found", model.working_.class_browser_instances.size()},
+                        {"scanned_objects", model.working_.class_browser_scanned_objects},
                         {"status", model.working_.status}});
     }
 
@@ -1418,7 +1456,9 @@ Response RuntimeTools::execute(RuntimeModel& model, const Request& request) {
             traces.push_back({{"trace_reference", token}, {"method", trace.declaring_type + "." + trace.method_name},
                               {"return_type", trace.return_type}, {"parameter_types", trace.parameter_types},
                               {"active", trace.active}, {"total_calls", trace.total_calls},
-                              {"retained_calls", trace.records.size()},
+                              {"retained_calls", retained_method_trace_calls(trace)},
+                              {"displayed_groups", trace.records.size()},
+                              {"collapsed_calls", collapsed_method_trace_calls(trace)},
                               {"overwritten_calls", trace.overwritten_records}, {"native_faults", trace.native_faults},
                               {"error", trace.error}});
         }
@@ -1448,12 +1488,15 @@ Response RuntimeTools::execute(RuntimeModel& model, const Request& request) {
             if (record.sequence <= *after)
                 continue;
             if (calls.size() >= static_cast<std::size_t>(*limit)) { has_more = true; break; }
+            const std::uint64_t repeat_count = std::max<std::uint64_t>(1, record.repeat_count);
+            const std::uint64_t sequence_start = record.sequence_start == 0 ? record.sequence : record.sequence_start;
             Json arguments = Json::array();
             for (const MethodTraceFormat::ArgumentView& argument : MethodTraceFormat::arguments(*trace, record))
                 arguments.push_back({{"index", argument.index}, {"name", argument.name}, {"type", argument.type},
                                      {"value", argument.value}, {"readable", argument.readable},
                                      {"inspectable_reference", argument.inspectable_reference}});
-            calls.push_back({{"sequence", record.sequence},
+            calls.push_back({{"sequence_start", sequence_start}, {"sequence", record.sequence},
+                             {"repeat_count", repeat_count},
                              {"seconds", MethodTraceFormat::elapsed_seconds(*trace, record)},
                              {"thread_id", record.thread_id}, {"caller", record.caller_display},
                              {"target", trace->declaring_type + "." + trace->method_name},
@@ -1462,7 +1505,11 @@ Response RuntimeTools::execute(RuntimeModel& model, const Request& request) {
                              {"return_captured", record.return_captured}});
         }
         return succeed({{"method", trace->declaring_type + "." + trace->method_name}, {"active", trace->active},
-                        {"total_calls", trace->total_calls}, {"overwritten_calls", trace->overwritten_records},
+                        {"total_calls", trace->total_calls},
+                        {"retained_calls", retained_method_trace_calls(*trace)},
+                        {"displayed_groups", trace->records.size()},
+                        {"collapsed_calls", collapsed_method_trace_calls(*trace)},
+                        {"overwritten_calls", trace->overwritten_records},
                         {"native_faults", trace->native_faults}, {"calls", std::move(calls)}, {"has_more", has_more}});
     }
 
@@ -1495,7 +1542,7 @@ Response RuntimeTools::execute(RuntimeModel& model, const Request& request) {
                 if (edge.calls == 0)
                     edge.first = seconds;
                 edge.last = seconds;
-                ++edge.calls;
+                edge.calls += std::max<std::uint64_t>(1, record.repeat_count);
                 edge.threads.insert(record.thread_id);
             }
         }
@@ -1597,7 +1644,10 @@ Response RuntimeTools::execute(RuntimeModel& model, const Request& request) {
         if (!trace)
             return fail("trace_not_found", "The method trace is no longer retained.");
         return succeed({{"trace_reference", request.arguments["trace_reference"]}, {"active", trace->active},
-                        {"retained_calls", trace->records.size()}, {"status", fresh->status}});
+                        {"retained_calls", retained_method_trace_calls(*trace)},
+                        {"displayed_groups", trace->records.size()},
+                        {"collapsed_calls", collapsed_method_trace_calls(*trace)},
+                        {"status", fresh->status}});
     }
 
     if (request.tool == "build_reference_graph") {
