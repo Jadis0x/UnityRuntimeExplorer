@@ -1,5 +1,9 @@
-[![Views](https://hits.sh/github.com/Jadis0x/UnityRuntimeExplorer.svg?style=flat-square&label=views&color=blue)](https://hits.sh/github.com/Jadis0x/UnityRuntimeExplorer/)
-[![Downloads](https://img.shields.io/github/downloads/Jadis0x/UnityRuntimeExplorer/total?style=flat-square&label=downloads&color=blue)](https://github.com/Jadis0x/UnityRuntimeExplorer/releases)
+[![Release](https://img.shields.io/github/v/release/Jadis0x/UnityRuntimeExplorer?label=Release)](https://github.com/Jadis0x/UnityRuntimeExplorer/releases/latest)
+[![Downloads](https://img.shields.io/github/downloads/Jadis0x/UnityRuntimeExplorer/total?label=Downloads)](https://github.com/Jadis0x/UnityRuntimeExplorer/releases)
+[![Stars](https://img.shields.io/github/stars/Jadis0x/UnityRuntimeExplorer?style=flat&label=Stars)](https://github.com/Jadis0x/UnityRuntimeExplorer/stargazers)
+[![Discord](https://img.shields.io/badge/Discord-Join%20Server-5865F2?logo=discord&logoColor=white)](https://discord.com/invite/XC7RUpGp6e)
+[![Support](https://img.shields.io/badge/Support-GitHub%20Issues-blue?logo=github)](https://github.com/Jadis0x/UnityRuntimeExplorer/issues)
+[![License](https://img.shields.io/github/license/Jadis0x/UnityRuntimeExplorer)](https://github.com/Jadis0x/UnityRuntimeExplorer/blob/main/LICENSE)
 
 # UnityRuntimeExplorer
 
