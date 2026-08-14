@@ -1,0 +1,5 @@
+[mcp_servers.unity-runtime-explorer]
+command = "C:\\Users\\cnrkk\\Documents\\GitHub\\UnityRuntimeExplorer\\out\\build\\clang-release\\URK_UnityRuntimeExplorer_McpServer.exe"
+args = ["--allow-tracing"]
+startup_timeout_sec = 10
+tool_timeout_sec = 10

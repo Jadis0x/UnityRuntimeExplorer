@@ -215,6 +215,16 @@ runtime_status
   -> stop_method_trace
 ```
 
+Ready-to-copy MCP client configuration examples are included for:
+
+- [Claude Desktop](docs/examples/claude-desktop-config.json)
+- [Codex](docs/examples/codex-config.toml)
+- [Other stdio MCP clients](docs/examples/generic-mcp-config.json)
+
+Replace the placeholder executable path in the selected example with the full
+path to `URK_UnityRuntimeExplorer_McpServer.exe`. If multiple compatible games
+are running, add `"--game-pid", "<pid>"` to the example's `args` list.
+
 Client-specific setup instructions, security properties, troubleshooting, and
 remote HTTPS/tunnel guidance are in [docs/MCP.md](docs/MCP.md).
 
