@@ -63,34 +63,42 @@ on the embedding exports shipped by the game.
 
 ## Installation
 
-Install [URKit](https://github.com/Jadis0x/URKit) first. Its repository contains
-the current proxy, `Mods` folder, injector, and compatibility instructions.
+Download URKit from the [URKit v0.3.0 release](https://github.com/Jadis0x/URKit/releases/tag/v0.3.0).
 
-### Proxy and `Mods` folder
+`urk-sdk.exe` is not required to use UnityRuntimeExplorer. It is only needed
+for creating new URKit mod projects.
 
-1. Create a `Mods` folder beside the game executable.
-2. Place the correct URKit proxy beside the executable. Preserve the original
-   proxy filename and do not copy every proxy variant.
-3. Place exactly one Explorer DLL in `Mods`:
+Download the Explorer DLL matching the target game's runtime:
 
-   ```text
-   URK_Il2cpp_UnityRuntimeExplorer.dll   # IL2CPP game
-   URK_Mono_UnityRuntimeExplorer.dll     # Mono game
-   ```
+```text
+URK_Il2cpp_UnityRuntimeExplorer.dll   # IL2CPP games
+URK_Mono_UnityRuntimeExplorer.dll     # Mono games
+```
 
-4. Start the game using the normal URKit launch path.
-5. Press **F7** to open or close the Explorer.
+Use only one of these DLLs. Do not use the IL2CPP plugin for a Mono game, or
+the Mono plugin for an IL2CPP game.
 
-### URKit injector
+### Standard proxy workflow
 
-The optional `URKitInjector.dll` workflow loads the generated mod without a
-proxy or a `Mods` folder:
+1. From `version.dll`, `winhttp.dll`, and `winmm.dll`, choose only the proxy
+   matching a DLL imported by the game executable.
+2. Place that single proxy DLL next to the game executable. Do not place all
+   three.
+3. Create a `Mods` folder beside the game executable.
+4. Copy the Explorer DLL matching the game's runtime into the `Mods` folder.
+5. Start the game normally.
+6. Press **F7** to open or close the Explorer.
 
-1. Inject `URKitInjector.dll` into the supported Windows x64 game.
-2. Select the URKit `.ini` file when prompted.
-3. Select the Explorer DLL that matches the game's runtime.
+### Proxy-free injector workflow
 
-Do not inject the Explorer DLL directly. It must be loaded by URKit.
+1. Use `URKitInjector.dll` from the URKit release.
+2. No proxy DLL or `Mods` folder is required.
+3. Inject `URKitInjector.dll` into the supported Windows x64 game.
+4. Select the URKit configuration `.ini` when prompted.
+5. Select the Explorer DLL matching the game's runtime.
+
+Do not inject either Explorer DLL directly. It must be loaded by URKit or
+`URKitInjector.dll` as a URKit plugin.
 
 If the Explorer does not appear, inspect `URKit_logs.log` beside the game
 executable. The log usually identifies a wrong proxy name, an incompatible
