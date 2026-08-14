@@ -4,6 +4,7 @@
 #include "bounded_stdio_transport.h"
 #include "mcp/core/tool_catalog.h"
 #include "mcp/core/schema_validator.h"
+#include "project_version.h"
 #include "request_dispatcher.h"
 
 #include <nlohmann/json.hpp>
@@ -106,7 +107,7 @@ int StdioServer::run(std::istream& input, std::ostream& output) {
                 {"capabilities", {{"tools", {{"listChanged", false}}},
                                   {"tasks", {{"list", Json::object()}, {"cancel", Json::object()},
                                    {"requests", {{"tools", {{"call", Json::object()}}}}}}}}},
-                {"serverInfo", {{"name", "unity-runtime-explorer"}, {"version", "0.4.0"}}}}));
+                {"serverInfo", {{"name", "unity-runtime-explorer"}, {"version", URK::project_version}}}}));
             continue;
         }
         if (message.method == "initialize") {

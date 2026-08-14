@@ -7,7 +7,7 @@ endif()
 
 set(VCPKG_APPLOCAL_DEPS OFF CACHE BOOL "Generated mods keep dependencies linked into the mod DLL when possible" FORCE)
 
-project(URK_UnityRuntimeExplorer LANGUAGES CXX)
+project(URK_UnityRuntimeExplorer VERSION 0.1.5 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -121,6 +121,7 @@ set(URK_COMMON_SOURCES
 )
 
 set(URK_COMMON_HEADERS
+        project_version.h
         sdk/runtime_api.h
         sdk/runtime_bootstrap.h
         sdk/runtime/managed_runtime.h

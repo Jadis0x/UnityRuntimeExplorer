@@ -1,6 +1,8 @@
 // Copyright (c) 2026 Jadis0x. All rights reserved.
 #pragma once
 
+#include "project_version.h"
+
 #include <atomic>
 
 namespace ModConfig {
@@ -19,7 +21,7 @@ inline constexpr const char *mod_id = "URK_Il2cpp_UnityRuntimeExplorer_24859613"
 #endif
 // Stable namespace for this mod's deployed resources. Do not change it after release.
 inline constexpr const char *author = "Jadis0x";
-inline constexpr const char *version = "0.4.0";
+inline constexpr const char *version = URK::project_version;
 inline constexpr const char *url = "https://github.com/Jadis0x/UnityRuntimeExplorer";
 inline constexpr const char *social = "https://buymeacoffee.com/jadis0x";
 inline constexpr const char *description = "A live IL2CPP and Mono Unity inspector with secure MCP research and method tracing, built on URKit";

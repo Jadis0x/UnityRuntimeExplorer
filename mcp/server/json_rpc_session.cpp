@@ -1,5 +1,6 @@
 // Copyright (c) 2026 Jadis0x. All rights reserved.
 #include "json_rpc_session.h"
+#include "project_version.h"
 
 #include <array>
 
@@ -123,7 +124,7 @@ Json JsonRpcSession::initialize(const RpcMessage& message) {
     return result(message.id, {{"protocolVersion", protocol_version_},
         {"capabilities", std::move(capabilities)},
         {"serverInfo", {{"name", "unity-runtime-explorer"},
-                        {"title", "Unity Runtime Explorer"}, {"version", "0.4.0"}}},
+                        {"title", "Unity Runtime Explorer"}, {"version", URK::project_version}}},
         {"instructions", "Discover and inspect the live Unity runtime through opaque references. Explorer Config is the authoritative permission boundary. Prefer discover_runtime before targeted tools; property getters, writes, tracing, invocation, and destructive operations are independently audited."}});
 }
 
