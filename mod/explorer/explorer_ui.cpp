@@ -681,7 +681,8 @@ std::string method_call_code(const ComponentInfo::Method &method, const CodeCont
               cpp_string_literal(method.name) + (arguments.empty() ? ");" : ", " + arguments + ");")
         : "target.CallExact<" + return_type + ">(" + cpp_string_literal(method.name) + ", {" + signature + "}" +
               (arguments.empty() ? ");" : ", " + arguments + ");");
-    const std::string prelude = method.is_static ? std::string{} : target_prelude(owner);
+    const std::string call = return_type == "void" ? invocation : "const " + return_type + " result = " + invocation;
+    const std::string method_label = cpp_string_literal(context_managed_name(context) + "." + method.name);
     std::string notes = managed_type_note("Managed return type", method.return_type);
     for (std::size_t index = 0; index < method.parameter_types.size(); ++index) {
         const std::string_view name = index < method.parameter_names.size() && !method.parameter_names[index].empty()
@@ -689,8 +690,29 @@ std::string method_call_code(const ComponentInfo::Method &method, const CodeCont
         notes += "// Managed parameter " + std::to_string(index + 1) + (name.empty() ? "" : " (" + std::string(name) + ")") +
                  ": " + method.parameter_types[index] + "\n";
     }
-    return notes + member_type_aliases(method) + prelude +
-           (return_type == "void" ? invocation : "const " + return_type + " result = " + invocation);
+
+    // A void call cannot communicate failure through a return value.  Generated code must
+    // therefore preserve and report the SDK error instead of encouraging callers to log
+    // success unconditionally after a no-op lookup or failed invocation.
+    const std::string error_check =
+        "if (const char *error = URK::Unity::last_error(); error && error[0])\n"
+        "    ModLog::error(\"URKit method call failed (%s): %s\", " + method_label + ", error);";
+    if (method.is_static) {
+        return notes + member_type_aliases(method) +
+               "// Requires mod/support/mod_log.h for failure diagnostics.\n"
+               "URK::Unity::clear_error();\n" + call + "\n" + error_check;
+    }
+    return notes + member_type_aliases(method) + target_prelude(owner) +
+           "// Requires mod/support/mod_log.h for failure diagnostics.\n"
+           "if (!target) {\n"
+           "    const char *error = URK::Unity::last_error();\n"
+           "    ModLog::error(\"URKit method target was not found (%s): %s\", " + method_label +
+           ", error && error[0] ? error : \"no matching object or component\");\n"
+           "} else {\n"
+           "    URK::Unity::clear_error();\n"
+           "    " + call + "\n"
+           "    " + error_check + "\n"
+           "}";
 }
 
 std::uint32_t signature_hash(std::string_view text) {
