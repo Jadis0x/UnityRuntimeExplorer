@@ -117,7 +117,7 @@ Json JsonRpcSession::initialize(const RpcMessage& message) {
             break;
         }
     state_ = State::AwaitingInitialized;
-    Json capabilities{{"tools", {{"listChanged", false}}}};
+    Json capabilities{{"tools", {{"listChanged", true}}}};
     if (protocol_version_ == "2025-11-25")
         capabilities["tasks"] = {{"list", Json::object()}, {"cancel", Json::object()},
             {"requests", {{"tools", {{"call", Json::object()}}}}}};

@@ -76,7 +76,10 @@ class RuntimeModel {
     void clear_field_watch(std::uint64_t id);
     void close_field_watch(std::uint64_t id);
     void release_all_field_watches();
-    void refresh_field_watches();
+    // Sampling runs every frame so short-lived writes and alarm crossings are
+    // not missed; record_sample gates only the graph points, which stay at the
+    // publish cadence so a watch still spans a useful stretch of time.
+    void refresh_field_watches(bool record_sample);
     bool has_active_field_watches() const;
     ComponentInfo::LiveValues::Reference watch_reference_for(const URK::Unity::Inspect::ValueInfo &value);
     void release_field_watch_references(Snapshot::FieldWatch &watch);

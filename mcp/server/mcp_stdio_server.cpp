@@ -33,6 +33,29 @@ bool StdioServer::ensure_connected(std::string& error) {
     return true;
 }
 
+StdioServer::ToolPermissions StdioServer::permissions() {
+    // Explorer Config is the only permission authority; --allow-tracing and
+    // --allow-invocation stay deprecated no-ops. Without a bridge the granted
+    // set is unknown, so tools/list still answers with the whole catalog.
+    if (bridge_.game_pid() == 0)
+        return ToolPermissions{};
+    const CapabilityMask mask = bridge_.capabilities();
+    return ToolPermissions{has_capability(mask, Capability::Trace),
+                           has_capability(mask, Capability::Invoke),
+                           has_capability(mask, Capability::Write) ||
+                               has_capability(mask, Capability::Destructive)};
+}
+
+bool StdioServer::catalog_changed() {
+    if (bridge_.game_pid() == 0)
+        return false;
+    const CapabilityMask mask = bridge_.capabilities();
+    const bool changed = announced_capabilities_valid_ && mask != announced_capabilities_;
+    announced_capabilities_ = mask;
+    announced_capabilities_valid_ = true;
+    return changed;
+}
+
 nlohmann::json StdioServer::call_tool(std::string tool_name, Json arguments) {
     if (!is_available_tool(tool_name, true, true, true))
         return {{"content", {{{"type", "text"}, {"text", "Unknown MCP tool: " + tool_name}}}},
@@ -40,6 +63,13 @@ nlohmann::json StdioServer::call_tool(std::string tool_name, Json arguments) {
     std::string connection_error;
     if (!ensure_connected(connection_error))
         return {{"content", {{{"type", "text"}, {"text", connection_error}}}}, {"isError", true}};
+    // Explorer Config is the permission authority, so the check belongs after
+    // the bridge is known rather than against the helper's switches alone.
+    const ToolPermissions granted = permissions();
+    if (!is_available_tool(tool_name, granted.tracing, granted.invocation, granted.mutation))
+        return {{"content", {{{"type", "text"},
+            {"text", "permission_denied: Explorer Config does not grant " + tool_name}}}},
+                {"isError", true}};
     Request request{std::to_string(next_bridge_id_++), std::move(tool_name), std::move(arguments)};
     Response response;
     std::string bridge_error;
@@ -104,7 +134,7 @@ int StdioServer::run(std::istream& input, std::ostream& output) {
             if (!message.notification)
                 transport.emit(JsonRpcSession::result(message.id, {{"resultType", "complete"},
                 {"supportedVersions", {"2025-11-25", "2025-06-18", "2025-03-26"}},
-                {"capabilities", {{"tools", {{"listChanged", false}}},
+                {"capabilities", {{"tools", {{"listChanged", true}}},
                                   {"tasks", {{"list", Json::object()}, {"cancel", Json::object()},
                                    {"requests", {{"tools", {{"call", Json::object()}}}}}}}}},
                 {"serverInfo", {{"name", "unity-runtime-explorer"}, {"version", URK::project_version}}}}));
@@ -120,8 +150,16 @@ int StdioServer::run(std::istream& input, std::ostream& output) {
             continue;
         }
         if (message.method == "tools/list") {
-            if (!message.notification)
-                transport.emit(JsonRpcSession::result(message.id, {{"tools", tool_catalog(true, true, true)}}));
+            if (!message.notification) {
+                // Connect opportunistically so the catalog reflects what
+                // Explorer Config actually grants instead of everything.
+                std::string ignored;
+                ensure_connected(ignored);
+                catalog_changed();
+                const ToolPermissions granted = permissions();
+                transport.emit(JsonRpcSession::result(message.id,
+                    {{"tools", tool_catalog(granted.tracing, granted.invocation, granted.mutation)}}));
+            }
             continue;
         }
         if (dispatcher.handle_task_request(message.method, message.id, message.params))
@@ -184,6 +222,10 @@ int StdioServer::run(std::istream& input, std::ostream& output) {
                 }
             }
             dispatcher.submit(message.id, tool_name, arguments, std::move(progress_token), task_ttl);
+            // A Config toggle in game changes the permitted catalog mid-session.
+            if (catalog_changed())
+                transport.emit({{"jsonrpc", "2.0"}, {"method", "notifications/tools/list_changed"},
+                                {"params", Json::object()}});
             continue;
         }
         if (!message.notification)

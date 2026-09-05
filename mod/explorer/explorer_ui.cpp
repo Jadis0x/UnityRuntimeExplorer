@@ -28,7 +28,9 @@
 #include <cstring>
 #include <functional>
 #include <initializer_list>
+#include <list>
 #include <string>
+#include <utility>
 #include <string_view>
 #include <unordered_map>
 #include <unordered_set>
@@ -1019,55 +1021,74 @@ struct MemberBuffer {
     bool sample_requested = false;
 };
 
-std::unordered_map<std::uint64_t, MemberBuffer> &member_buffers() {
-    static std::unordered_map<std::uint64_t, MemberBuffer> buffers;
+// Bounded per-widget state. Evicting only the least recently touched entry
+// keeps the editor the user is working in alive; the previous wholesale clear()
+// reset every remembered filter, draft and expansion at once the moment the cap
+// was crossed.
+template <class Key, class Value>
+class UiStateCache {
+  public:
+    explicit UiStateCache(std::size_t capacity) : capacity_(capacity) {}
+
+    template <class... Args>
+    Value &touch(const Key &key, Args &&...args) {
+        if (const auto found = entries_.find(key); found != entries_.end()) {
+            order_.splice(order_.end(), order_, found->second.position);
+            return found->second.value;
+        }
+        while (entries_.size() >= capacity_ && !order_.empty()) {
+            entries_.erase(order_.front());
+            order_.pop_front();
+        }
+        const auto position = order_.insert(order_.end(), key);
+        return entries_.try_emplace(key, Entry{Value(std::forward<Args>(args)...), position}).first->second.value;
+    }
+
+    void clear() {
+        entries_.clear();
+        order_.clear();
+    }
+
+  private:
+    struct Entry {
+        Value value;
+        typename std::list<Key>::iterator position;
+    };
+    std::size_t capacity_;
+    std::list<Key> order_;
+    std::unordered_map<Key, Entry> entries_;
+};
+
+UiStateCache<std::uint64_t, MemberBuffer> &member_buffers() {
+    static UiStateCache<std::uint64_t, MemberBuffer> buffers(kMaxRememberedMemberEditors);
     return buffers;
 }
 
 MemberBuffer &member_buffer(std::uint64_t key) {
-    auto &buffers = member_buffers();
-    if (const auto found = buffers.find(key); found != buffers.end())
-        return found->second;
-    if (buffers.size() >= kMaxRememberedMemberEditors)
-        buffers.clear();
-    return buffers[key];
+    return member_buffers().touch(key);
 }
 
-std::unordered_map<int, std::array<char, 128>> &component_filters() {
-    static std::unordered_map<int, std::array<char, 128>> filters;
+UiStateCache<int, std::array<char, 128>> &component_filters() {
+    static UiStateCache<int, std::array<char, 128>> filters(1024);
     return filters;
 }
 
 std::array<char, 128> &component_filter(int component_id) {
-    auto &filters = component_filters();
-    if (const auto found = filters.find(component_id); found != filters.end())
-        return found->second;
-    if (filters.size() >= 1024)
-        filters.clear();
-    return filters[component_id];
+    return component_filters().touch(component_id);
 }
 
-std::unordered_map<int, bool> &component_inheritance_filters() {
-    static std::unordered_map<int, bool> filters;
+UiStateCache<int, bool> &component_inheritance_filters() {
+    static UiStateCache<int, bool> filters(1024);
     return filters;
 }
 
 bool &component_show_inherited(int component_id) {
-    auto &filters = component_inheritance_filters();
-    if (const auto found = filters.find(component_id); found != filters.end())
-        return found->second;
-    if (filters.size() >= 1024)
-        filters.clear();
-    return filters.try_emplace(component_id, true).first->second;
+    return component_inheritance_filters().touch(component_id, true);
 }
 
 std::array<char, 128>& object_member_filter(std::uint64_t token) {
-    static std::unordered_map<std::uint64_t, std::array<char, 128>> filters;
-    if (const auto found = filters.find(token); found != filters.end())
-        return found->second;
-    if (filters.size() >= 256)
-        filters.clear();
-    return filters[token];
+    static UiStateCache<std::uint64_t, std::array<char, 128>> filters(256);
+    return filters.touch(token);
 }
 
 bool query_matches_member(std::string_view filter, std::initializer_list<std::string_view> searchable) {
@@ -1360,7 +1381,7 @@ void render_live_value(CommandKind kind, int component_id, int member_index,
         ImGui::TextDisabled("Sampling...");
         return;
     }
-    MemberBuffer &buffer = member_buffers()[buffer_key];
+    MemberBuffer &buffer = member_buffer(buffer_key);
     if (!value->readable) {
         if (value->display == "Not sampled") {
             if (live_data && !buffer.sample_requested) {
@@ -1512,18 +1533,13 @@ bool invokable_method(const ComponentInfo::Method &method) {
     return !method.name.empty() && method.runtime_callable;
 }
 
-std::unordered_map<std::uint64_t, bool> &method_boolean_arguments() {
-    static std::unordered_map<std::uint64_t, bool> arguments;
+UiStateCache<std::uint64_t, bool> &method_boolean_arguments() {
+    static UiStateCache<std::uint64_t, bool> arguments(kMaxRememberedMemberEditors);
     return arguments;
 }
 
 bool &method_boolean_argument(std::uint64_t key) {
-    auto &arguments = method_boolean_arguments();
-    if (const auto found = arguments.find(key); found != arguments.end())
-        return found->second;
-    if (arguments.size() >= kMaxRememberedMemberEditors)
-        arguments.clear();
-    return arguments[key];
+    return method_boolean_arguments().touch(key);
 }
 
 std::uint64_t scoped_ui_key(std::uint64_t scope, std::uint64_t domain, std::size_t first, std::size_t second = 0) {
@@ -2326,7 +2342,7 @@ void render_field_watches(const Snapshot &snapshot) {
     }
     ImGui::TextDisabled(watch->property
         ? "Property values are read through the getter. Source is exact only for Explorer writes; other rows are sampled runtime activity."
-        : "Direct field writes have no managed setter hook. Runtime source therefore means the change occurred inside the 250 ms sample window.");
+        : "Direct field writes have no managed setter hook. Values are sampled every frame, so a write that lands and reverts within one frame is still missed.");
 
     ImGui::SeparatorText("Chart and threshold alarm");
     static std::unordered_map<std::uint64_t, float> threshold_drafts;

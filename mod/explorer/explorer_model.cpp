@@ -942,11 +942,17 @@ namespace Explorer {
 			update_highlight();
 			next_highlight_refresh_ = now + kHighlightInterval;
 		}
-		// Watches continue sampling while Live Data is paused.
-		if (has_active_field_watches() && !event_refresh_pending_ && now >= next_field_watch_refresh_) {
-			refresh_field_watches();
-			next_field_watch_refresh_ = now + kFieldWatchInterval;
-			publish();
+		// Watches continue sampling while Live Data is paused. Sampling runs
+		// every frame so a write that lands and reverts between two publishes
+		// still registers as a change; only graph points and the snapshot
+		// publish stay on the slower cadence.
+		if (has_active_field_watches() && !event_refresh_pending_) {
+			const bool due = now >= next_field_watch_refresh_;
+			refresh_field_watches(due);
+			if (due) {
+				next_field_watch_refresh_ = now + kFieldWatchInterval;
+				publish();
+			}
 		}
 		if (MethodTracer::any_active() && now >= next_trace_publish_) {
 			next_trace_publish_ = now + kTracePublishInterval;
@@ -4501,7 +4507,7 @@ namespace Explorer {
 		working_.field_watches.clear();
 	}
 
-	void RuntimeModel::refresh_field_watches() {
+	void RuntimeModel::refresh_field_watches(bool record_sample) {
 		constexpr std::size_t kMaxFieldWatchEvents = 256;
 		constexpr std::size_t kMaxFieldWatchSamples = 512;
 		const Clock::time_point now = Clock::now();
@@ -4529,9 +4535,11 @@ namespace Explorer {
 			}
 			const double elapsed = std::chrono::duration<double>(now - state.started).count();
 			if (const std::optional<double> numeric = WatchAnalysis::numeric_value(value)) {
-				if (watch.samples.size() == kMaxFieldWatchSamples)
-					watch.samples.erase(watch.samples.begin());
-				watch.samples.push_back({elapsed, static_cast<float>(*numeric)});
+				if (record_sample) {
+					if (watch.samples.size() == kMaxFieldWatchSamples)
+						watch.samples.erase(watch.samples.begin());
+					watch.samples.push_back({elapsed, static_cast<float>(*numeric)});
+				}
 				const bool alarm_now = WatchAnalysis::evaluate(watch.alarm_condition, *numeric, watch.alarm_threshold);
 				if (alarm_now && !state.alarm_latched)
 					++watch.alarm_count;

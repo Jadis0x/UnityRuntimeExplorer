@@ -18,11 +18,23 @@ class StdioServer {
     int run(std::istream& input, std::ostream& output);
 
   private:
+    // What the catalog may expose right now, as granted by Explorer Config.
+    struct ToolPermissions {
+        bool tracing = true;
+        bool invocation = true;
+        bool mutation = true;
+    };
+
     bool ensure_connected(std::string& error);
     nlohmann::json call_tool(std::string tool_name, nlohmann::json arguments);
+    ToolPermissions permissions();
+    // True when the granted permissions changed since the last catalog answer.
+    bool catalog_changed();
 
     std::optional<std::uint32_t> game_pid_;
     bool connection_announced_ = false;
+    CapabilityMask announced_capabilities_ = 0;
+    bool announced_capabilities_valid_ = false;
     PipeClient bridge_;
     std::uint64_t next_bridge_id_ = 1;
 };
