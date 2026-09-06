@@ -23,6 +23,9 @@ bool &object_inspector_window_requested();
 void enqueue_reference_inspection(std::uint64_t token, bool request_object_tab = true);
 void enqueue_raw_reference_inspection(std::uint64_t address);
 bool render_reference_context_menu(const ComponentInfo::LiveValues::Reference *reference, bool allow_assign = false);
+// Attaches a right-click "Copy value" menu (with a matching hover tooltip) to
+// the item rendered immediately before this call.
+void render_copy_context_menu(const char *popup_id, std::string_view text);
 
 void enqueue_method_trace_clear(MethodTracer::TraceId id);
 void enqueue_field_watch(int component_id, int field_index, bool enabled,

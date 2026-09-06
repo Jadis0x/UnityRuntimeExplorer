@@ -196,12 +196,7 @@ void trace_card_row(std::string_view label, std::string_view color_key,
     ImGui::TextDisabled("%.*s", static_cast<int>(label.size()), label.data());
     ImGui::TableSetColumnIndex(1);
     trace_value_text(color_key, value, readable);
-    const std::string copy_popup = "##copy-" + std::string(label);
-    if (ImGui::BeginPopupContextItem(copy_popup.c_str())) {
-        if (ImGui::MenuItem("Copy value"))
-            ImGui::SetClipboardText(std::string(value).c_str());
-        ImGui::EndPopup();
-    }
+    render_copy_context_menu(("##copy-" + std::string(label)).c_str(), value);
     if (inspect_address != 0) {
         ImGui::SameLine();
         ImGui::PushID(static_cast<int>(inspect_address ^ (inspect_address >> 32)));
