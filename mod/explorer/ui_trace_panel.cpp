@@ -57,8 +57,7 @@ bool caller_is_unnamed(std::string_view caller) {
 std::string friendly_trace_caller(std::string_view caller) {
     if (caller.empty())
         return "caller address was not captured";
-    // The long-form explanation belongs in a tooltip; the cell just needs the
-    // site, or the row turns into a paragraph.
+    // Keep the cell terse; the full explanation goes in a tooltip.
     if (caller.find("GameAssembly.dll+") != std::string_view::npos)
         return std::string(caller) + " (unnamed - build the caller index)";
     if (caller == "<shared managed generic code>")
@@ -77,10 +76,7 @@ void enqueue_caller_index_build() {
     RuntimeModel::instance().enqueue(Command{.kind = CommandKind::BuildManagedCallerIndex});
 }
 
-// A trace's caller is a raw return address. Naming it needs an index of every
-// managed method's native entry point, which is expensive enough to build only
-// when the user actually wants names - so offer it exactly where the unnamed
-// callers are on screen.
+// Naming a raw caller address needs the method index; offer building it here.
 void render_caller_index_notice(const Snapshot &snapshot, const MethodTracer::Snapshot &trace) {
     const bool unnamed = std::any_of(trace.records.begin(), trace.records.end(),
                                      [](const MethodTracer::Record &record) {
@@ -116,8 +112,7 @@ void render_caller_index_notice(const Snapshot &snapshot, const MethodTracer::Sn
     }
 }
 
-// One explanation of "why is Returns empty", offered wherever the user is
-// looking when they ask it.
+// Explains why Returns is empty and offers the fix.
 void render_return_capture_notice(const MethodTracer::Snapshot &trace) {
     ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.80f, 0.71f, 0.45f, 1.0f));
     ImGui::TextWrapped("Return values are not recorded. This trace hooks the method's entry, so it sees the "
@@ -130,7 +125,7 @@ void render_return_capture_notice(const MethodTracer::Snapshot &trace) {
                           "Clears the calls recorded so far, and is unsafe on methods that throw.");
 }
 
-// Derive hue from stable value/type text to prevent live-trace flicker.
+// Hue derived from the value/type text so it stays stable across frames.
 ImVec4 trace_value_color(std::string_view key) {
     std::uint32_t hash = 2166136261u;
     for (const unsigned char character : key) {
@@ -154,13 +149,66 @@ void trace_value_text(std::string_view key, std::string_view text, bool readable
     ImGui::PopStyleColor();
 }
 
+// Renders a decoded value as a tree so nested fields/elements are reachable.
+void render_trace_value_node(const MethodTracer::ValueNode &node, std::string_view fallback_name, int id);
+
+void render_trace_value_children(const MethodTracer::ValueNode &node) {
+    for (std::size_t index = 0; index < node.children.size(); ++index)
+        render_trace_value_node(node.children[index], "value", static_cast<int>(index));
+    if (node.truncated)
+        ImGui::TextDisabled("... more members than the decoder walks in one pass");
+}
+
+void render_trace_value_node(const MethodTracer::ValueNode &node, std::string_view fallback_name, int id) {
+    ImGui::PushID(id);
+    std::string label(node.name.empty() ? fallback_name : std::string_view(node.name));
+    if (!node.type.empty())
+        label += "  (" + short_trace_type_name(node.type) + ")";
+    label += "  =  " + (node.display.empty() ? std::string("<unavailable>") : node.display);
+
+    const bool expandable = !node.children.empty();
+    ImGuiTreeNodeFlags flags = ImGuiTreeNodeFlags_SpanAvailWidth;
+    if (!expandable)
+        flags |= ImGuiTreeNodeFlags_Leaf | ImGuiTreeNodeFlags_NoTreePushOnOpen | ImGuiTreeNodeFlags_Bullet;
+    if (node.readable)
+        ImGui::PushStyleColor(ImGuiCol_Text, trace_value_color(node.type + node.display));
+    const bool open = ImGui::TreeNodeEx("##value", flags, "%s", label.c_str());
+    if (node.readable)
+        ImGui::PopStyleColor();
+    if (node.inspect_address != 0) {
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Inspect"))
+            enqueue_raw_reference_inspection(node.inspect_address);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Opens this reference in the Object Inspector.");
+    }
+    if (expandable && open) {
+        render_trace_value_children(node);
+        ImGui::TreePop();
+    }
+    ImGui::PopID();
+}
+
 void trace_card_row(std::string_view label, std::string_view color_key,
-                    std::string_view value, bool readable) {
+                    std::string_view value, bool readable, std::uint64_t inspect_address = 0) {
     ImGui::TableNextRow();
     ImGui::TableSetColumnIndex(0);
     ImGui::TextDisabled("%.*s", static_cast<int>(label.size()), label.data());
     ImGui::TableSetColumnIndex(1);
     trace_value_text(color_key, value, readable);
+    const std::string copy_popup = "##copy-" + std::string(label);
+    if (ImGui::BeginPopupContextItem(copy_popup.c_str())) {
+        if (ImGui::MenuItem("Copy value"))
+            ImGui::SetClipboardText(std::string(value).c_str());
+        ImGui::EndPopup();
+    }
+    if (inspect_address != 0) {
+        ImGui::SameLine();
+        ImGui::PushID(static_cast<int>(inspect_address ^ (inspect_address >> 32)));
+        if (ImGui::SmallButton("Inspect"))
+            enqueue_raw_reference_inspection(inspect_address);
+        ImGui::PopID();
+    }
 }
 
 void render_method_trace(const Snapshot &snapshot, const MethodTracer::Snapshot &trace) {
@@ -252,7 +300,7 @@ void render_method_trace(const Snapshot &snapshot, const MethodTracer::Snapshot 
         ImGui::TextDisabled("Waiting for a call...");
         return;
     }
-    ImGui::TextDisabled("CALLS");
+    ImGui::TextDisabled("CALLS  (right-click a value to copy)");
     ImGui::BeginChild("##method-trace-calls", ImVec2(0.0f, std::max(180.0f, ImGui::GetContentRegionAvail().y)),
                       true);
     {
@@ -278,6 +326,12 @@ void render_method_trace(const Snapshot &snapshot, const MethodTracer::Snapshot 
             const bool open = ImGui::TreeNodeEx(
                 "##call", ImGuiTreeNodeFlags_SpanAvailWidth,
                 "%s   +%s   thread %u", call_label.c_str(), elapsed_text.c_str(), record.thread_id);
+            if (ImGui::BeginPopupContextItem("##copy-call-header")) {
+                if (ImGui::MenuItem("Copy call summary"))
+                    ImGui::SetClipboardText(
+                        (call_label + "   +" + elapsed_text + "   thread " + std::to_string(record.thread_id)).c_str());
+                ImGui::EndPopup();
+            }
 
             const bool readable_arguments = std::any_of(
                 record.argument_readable.begin(), record.argument_readable.end(),
@@ -301,7 +355,7 @@ void render_method_trace(const Snapshot &snapshot, const MethodTracer::Snapshot 
                 if (!trace.is_static)
                     trace_card_row("Target", record.target_display, record.target_display.empty()
                         ? std::string_view("<unavailable>") : std::string_view(record.target_display),
-                        !record.target_display.empty());
+                        !record.target_display.empty(), record.target_address);
                 trace_card_row("Arguments", argument_summary,
                                argument_summary.empty() ? std::string_view("none") : std::string_view(argument_summary),
                                readable_arguments);
@@ -309,7 +363,8 @@ void render_method_trace(const Snapshot &snapshot, const MethodTracer::Snapshot 
                     trace.return_type.empty() || trace.return_type == "System.Void" || trace.return_type == "Void"
                         ? result
                         : result + "   (" + short_trace_type_name(trace.return_type) + ")";
-                trace_card_row("Returns", trace.return_type + result, return_line, record.return_readable);
+                trace_card_row("Returns", trace.return_type + result, return_line, record.return_readable,
+                               record.return_node.inspect_address);
                 ImGui::EndTable();
             }
 
@@ -339,7 +394,12 @@ void render_method_trace(const Snapshot &snapshot, const MethodTracer::Snapshot 
                         ImGui::SameLine();
                         ImGui::TextDisabled("(%s)", argument.type.c_str());
                         ImGui::Indent();
-                        trace_value_text(argument.type + argument.value, argument.value, argument.readable);
+                        const MethodTracer::ValueNode *node = argument.index < record.argument_nodes.size()
+                            ? &record.argument_nodes[argument.index] : nullptr;
+                        if (node && !node->children.empty())
+                            render_trace_value_children(*node);
+                        else
+                            trace_value_text(argument.type + argument.value, argument.value, argument.readable);
                         if (argument.inspectable_reference && ImGui::SmallButton("Inspect reference")) {
                             std::uint64_t address = record.arguments[argument.index];
                             const bool by_ref = argument.index < trace.parameter_is_by_ref.size() &&
@@ -370,6 +430,8 @@ void render_method_trace(const Snapshot &snapshot, const MethodTracer::Snapshot 
                 } else {
                 ImGui::TextDisabled("Type: %s", trace.return_type.empty() ? "<unknown>" : trace.return_type.c_str());
                 trace_value_text(trace.return_type + result, result, record.return_readable);
+                if (!record.return_node.children.empty())
+                    render_trace_value_children(record.return_node);
                 if (record.return_reference_token != 0) {
                     if (ImGui::SmallButton("Open in Object Inspector"))
                         enqueue_reference_inspection(record.return_reference_token);
@@ -463,8 +525,7 @@ void render_method_traces(const Snapshot &snapshot) {
             continue;
         const std::string label = std::string(trace.active ? "[REC] " : "[STOP] ") + display_name +
                                   "  (" + std::to_string(trace.total_calls) + ")";
-        // Method names are not unique: overloads share them. Scope every selectable
-        // to its stable trace id so ImGui never aliases controls for distinct hooks.
+        // Scope by trace id, not name: overloads share a method name.
         const std::string trace_id = "trace-" + std::to_string(trace.id);
         ImGui::PushID(trace_id.c_str());
         if (ImGui::Selectable(label.c_str(), selected == trace.id))

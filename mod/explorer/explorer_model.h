@@ -82,9 +82,7 @@ class RuntimeModel {
     void clear_field_watch(std::uint64_t id);
     void close_field_watch(std::uint64_t id);
     void release_all_field_watches();
-    // Sampling runs every frame so short-lived writes and alarm crossings are
-    // not missed; record_sample gates only the graph points, which stay at the
-    // publish cadence so a watch still spans a useful stretch of time.
+    // Sampling runs every frame to catch short-lived writes; record_sample only gates graph points.
     void refresh_field_watches(bool record_sample);
     bool has_active_field_watches() const;
     ComponentInfo::LiveValues::Reference watch_reference_for(const URK::Unity::Inspect::ValueInfo &value);
@@ -106,17 +104,14 @@ class RuntimeModel {
     void restore_focused_camera();
     void clear_highlight_renderer_cache();
     void clear_highlight_camera_cache();
-    // The hierarchy stores non-owning Unity object wrappers. Resolve a fresh
-    // object at selection time so a scene transition cannot turn a stale
-    // hierarchy entry into an inspector target.
+    // Resolve fresh at selection time; the hierarchy only holds non-owning wrappers.
     URK::Unity::GameObject resolve_live_game_object(
         int instance_id, URK::Unity::Inspect::ObjectHandle &root) const;
     URK::Unity::GameObject resolve_selected_object() const;
     URK::Unity::Object resolve_component(int instance_id) const;
     void select_object(URK::Unity::GameObject object, URK::Unity::Inspect::ObjectHandle root);
     void clear_selection();
-    // After an SEH fault, do not call back into the managed runtime to release handles:
-    // one of those handles may be the invalid pointer that raised the fault.
+    // After an SEH fault, skip releasing managed handles - one may be the invalid pointer that faulted.
     void discard_managed_state_after_native_fault();
     void set_status(std::string message);
     void record_flight(std::string stage, std::string operation, std::string detail = {});
@@ -153,8 +148,7 @@ class RuntimeModel {
         }
     };
     std::unordered_map<TraceReturnKey, std::uint64_t, TraceReturnKeyHash> traced_return_references_;
-    // Only traces installed through MCP are revoked when the MCP permission is
-    // disabled; traces started from the in-game UI remain under UI control.
+    // Only MCP-installed traces are revoked when MCP permission is disabled.
     std::unordered_set<MethodTracer::TraceId> mcp_method_trace_ids_;
     ManagedReferenceStore managed_references_;
     // Object Inspector tabs retain their own managed handles.
@@ -179,6 +173,8 @@ class RuntimeModel {
     std::shared_ptr<const ClassBrowserCatalog> class_browser_catalog_;
     std::unique_ptr<ClassInstanceScan> class_instance_scan_;
     std::unique_ptr<CallerIndexScan> caller_index_scan_;
+    // Prevents an unnamed-caller trace from restarting the index scan every frame.
+    bool caller_index_auto_requested_ = false;
     ComponentReflection class_browser_reflection_;
     std::unordered_map<std::uint64_t, URK::Unity::Inspect::ObjectHandle> class_browser_handles_;
     std::unordered_map<std::uint64_t, URK::Unity::Inspect::ObjectHandle> class_browser_static_handles_;
@@ -193,19 +189,15 @@ class RuntimeModel {
         bool has_baseline = false;
         bool alarm_latched = false;
         bool explorer_write_pending = false;
-        // A property whose setter could be hooked reports exact writes instead
-        // of sampled differences. Zero when the watch is polling.
+        // Non-zero when a hooked setter reports exact writes instead of sampled diffs.
         MethodTracer::TraceId setter_trace = 0;
         std::uint64_t setter_calls_seen = 0;
-        // The hook filters on a raw `this` pointer, so the address has to stay
-        // put. target_handle is weak and a moving collector would silently
-        // strand the filter on the object's old location.
+        // Pins the target: the hook filters on a raw `this` pointer, which a moving GC would invalidate.
         URK::Unity::Inspect::ObjectHandle setter_target_pin;
         Clock::time_point started{};
     };
     std::unordered_map<std::uint64_t, FieldWatchState> field_watches_;
-    // Hooks a watched property's setter so writes are reported exactly. Returns
-    // false when the property has no hookable setter, leaving the watch polling.
+    // Returns false when the property has no hookable setter, leaving the watch polling.
     bool attach_setter_hook(FieldWatchState &state, URK::Unity::Object target);
     void detach_setter_hook(FieldWatchState &state);
     std::unordered_set<std::size_t> sampled_object_fields_;
@@ -218,8 +210,7 @@ class RuntimeModel {
     };
     std::unordered_map<std::uint64_t, LockedMember> locked_members_;
     ComponentReflection object_inspector_reflection_;
-    // A hierarchy snapshot only contains non-owning pointers. Keep the active
-    // managed GameObject wrapper rooted independently from that snapshot.
+    // Rooted independently: hierarchy snapshots only hold non-owning pointers.
     URK::Unity::Inspect::ObjectHandle selected_handle_{};
     URK::Unity::GameObject selected_{};
     std::vector<URK::Unity::Inspect::ObjectHandle> highlight_renderers_;

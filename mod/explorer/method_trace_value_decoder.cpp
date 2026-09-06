@@ -8,6 +8,8 @@
 #include <Windows.h>
 
 #include <algorithm>
+#include <chrono>
+#include <cstdio>
 #include <cstring>
 #include <string_view>
 #include <unordered_map>
@@ -21,6 +23,13 @@ constexpr std::size_t kNewestDecodeReserve = 64;
 constexpr std::size_t kMaxStructuredFields = 6;
 constexpr std::size_t kMaxStructuredDepth = 2;
 constexpr std::size_t kMaxCachedRecords = 16384;
+// The tree view can go wider than the one-line summary; it's decoded once and cached.
+constexpr std::size_t kMaxNodeFields = 48;
+constexpr std::size_t kMaxNodeElements = 32;
+constexpr std::size_t kMaxNodeConstants = 64;
+constexpr std::size_t kMaxNodeDepth = 3;
+
+using ValueNode = MethodTracer::ValueNode;
 
 struct DecodedRecord {
     std::string target;
@@ -28,6 +37,8 @@ struct DecodedRecord {
     std::vector<std::string> arguments;
     std::vector<bool> argument_readable;
     bool return_readable = false;
+    std::vector<ValueNode> argument_nodes;
+    ValueNode return_node;
 };
 
 struct DecodeCursor {
@@ -103,9 +114,13 @@ std::uint64_t scalar_bits(const void* source, std::size_t byte_count) {
     return value;
 }
 
+using EnumConstants = std::vector<std::pair<std::string, std::uint64_t>>;
+
+// out_constants/out_raw let the tree builder reuse this walk instead of redoing it.
 std::string decode_enum(std::string_view type_name, const void* type_handle,
                         const void* value_class, std::string_view underlying_type,
-                        const void* data, bool& readable) {
+                        const void* data, bool& readable, EnumConstants* out_constants = nullptr,
+                        std::uint64_t* out_raw = nullptr) {
     readable = false;
     const URK::Unity::Inspect::ValueInfo raw = URK::Unity::Inspect::enum_from_pointer(
         std::string(type_name), std::string(underlying_type), const_cast<void*>(data));
@@ -114,13 +129,15 @@ std::string decode_enum(std::string_view type_name, const void* type_handle,
 
     const std::size_t bytes = scalar_storage_size(underlying_type);
     const std::uint64_t expected = scalar_bits(data, bytes);
+    if (out_raw)
+        *out_raw = expected;
     const auto* klass = value_class ? static_cast<const URK::managed::Class*>(value_class)
         : type_handle ? URK::managed::type_get_class_or_element_class(
               static_cast<const URK::managed::Type*>(type_handle)) : nullptr;
     if (!klass)
         return raw.display + " (" + std::string(type_name) + ")";
 
-    std::vector<std::pair<std::string, std::uint64_t>> constants;
+    EnumConstants constants;
     void* iterator = nullptr;
     while (const auto* field = URK::managed::class_get_fields(klass, &iterator)) {
         const std::uint32_t flags = URK::managed::field_get_flags(field);
@@ -132,8 +149,7 @@ std::string decode_enum(std::string_view type_name, const void* type_handle,
         std::uint64_t candidate = 0;
         if (URK::managed::field_static_get_value(field, &candidate))
             constants.emplace_back(name, candidate);
-        // Literal enum constants are not required to have normal static
-        // storage. The boxed accessor is the authoritative fallback.
+        // Literal constants lack normal static storage; fall back to the boxed accessor.
         void* boxed = URK::managed::field_get_value_object(field, nullptr);
         void* unboxed = boxed ? URK::managed::object_unbox(static_cast<URK::managed::Object*>(boxed)) : nullptr;
         if (unboxed) {
@@ -141,6 +157,8 @@ std::string decode_enum(std::string_view type_name, const void* type_handle,
             constants.emplace_back(name, candidate);
         }
     }
+    if (out_constants)
+        *out_constants = constants;
     for (const auto& [name, value] : constants) {
         if (value == expected) {
             readable = true;
@@ -280,6 +298,199 @@ std::string decode_value_type(std::string_view type_name, const void* type_handl
     return result.empty() ? std::string(type_name) + " {" + std::to_string(bytes.size()) + " bytes}" : result;
 }
 
+std::string hex_text(std::uint64_t value) {
+    char text[32]{};
+    std::snprintf(text, sizeof(text), "0x%llX", static_cast<unsigned long long>(value));
+    return text;
+}
+
+ValueNode build_reference_node(std::uint64_t raw, std::string_view declared_type, std::size_t depth);
+
+// Hangs one child per instance field (including inherited) off `node`.
+void fill_object_children(const URK::Unity::Object& object, std::size_t depth, ValueNode& node) {
+    std::vector<URK::Unity::Inspect::FieldInfo> fields = URK::Unity::Inspect::Fields(object, true);
+    fields.erase(std::remove_if(fields.begin(), fields.end(), [](const auto& field) {
+        return field.is_static;
+    }), fields.end());
+
+    const std::size_t count = std::min(fields.size(), kMaxNodeFields);
+    node.truncated = node.truncated || fields.size() > count;
+    node.children.reserve(node.children.size() + count);
+    for (std::size_t index = 0; index < count; ++index) {
+        const URK::Unity::Inspect::FieldInfo& field_info = fields[index];
+        const URK::Unity::Inspect::ValueInfo field = URK::Unity::Inspect::ReadField(object, field_info);
+        ValueNode child{};
+        child.name = field_info.name;
+        child.type = field_info.type_name;
+        child.display = field.display.empty() ? "<unavailable>" : field.display;
+        child.readable = field.readable;
+
+        const auto address = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(field.object));
+        if (!field_info.is_value_type && field.object) {
+            // Expand inline so a wrapper's real data is visible without opening the Inspector.
+            if (depth + 1 < kMaxNodeDepth) {
+                ValueNode expanded = build_reference_node(address, field_info.type_name, depth + 1);
+                if (!expanded.display.empty())
+                    child.display = expanded.display;
+                child.type = expanded.type;
+                child.readable = expanded.readable;
+                child.children = std::move(expanded.children);
+                child.truncated = expanded.truncated;
+            }
+            child.inspect_address = address;
+        } else if (field_info.is_value_type && !field_info.is_enum && field.object &&
+                   depth + 1 < kMaxNodeDepth) {
+            URK::Unity::Inspect::ObjectHandle root =
+                URK::Unity::Inspect::PinObject(URK::Unity::Object{field.object});
+            const URK::Unity::Object nested = URK::Unity::Inspect::ResolveObjectHandle(root);
+            if (root.handle && nested)
+                fill_object_children(nested, depth + 1, child);
+            URK::Unity::Inspect::FreeObjectHandle(root);
+        }
+        node.children.push_back(std::move(child));
+    }
+}
+
+void fill_array_children(const URK::Unity::Object& object, std::string_view type_name, std::size_t depth,
+                         ValueNode& node) {
+    const URK::Unity::Inspect::ValueInfo array =
+        URK::Unity::Inspect::array_reference_value(std::string(type_name), object.handle());
+    const std::size_t length = URK::Unity::Inspect::ArrayLength(array);
+    const std::size_t count = std::min(length, kMaxNodeElements);
+    node.truncated = node.truncated || length > count;
+    for (std::size_t index = 0; index < count; ++index) {
+        const URK::Unity::Inspect::ValueInfo element = URK::Unity::Inspect::ReadArrayElement(array, index);
+        ValueNode child{};
+        child.name = "[" + std::to_string(index) + "]";
+        child.type = element.type_name;
+        child.display = element.display.empty() ? "<unavailable>" : element.display;
+        child.readable = element.readable;
+        if (element.object && (element.kind == URK::Unity::Inspect::ValueKind::ObjectReference ||
+                               element.kind == URK::Unity::Inspect::ValueKind::ArrayReference ||
+                               element.kind == URK::Unity::Inspect::ValueKind::String)) {
+            child.inspect_address = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(element.object));
+            if (depth + 1 < kMaxNodeDepth) {
+                ValueNode expanded = build_reference_node(child.inspect_address, element.type_name, depth + 1);
+                child.children = std::move(expanded.children);
+                child.truncated = expanded.truncated;
+            }
+        }
+        node.children.push_back(std::move(child));
+    }
+}
+
+ValueNode build_reference_node(std::uint64_t raw, std::string_view declared_type, std::size_t depth) {
+    ValueNode node{};
+    node.type = std::string(declared_type);
+    bool readable = false;
+    node.display = decode_reference(raw, declared_type, readable);
+    node.readable = readable;
+    if (raw == 0)
+        return node;
+    node.inspect_address = raw;
+    if (depth >= kMaxNodeDepth)
+        return node;
+
+    safely([&] {
+        const URK::Unity::Object object{reinterpret_cast<void*>(static_cast<std::uintptr_t>(raw))};
+        const URK::Unity::Inspect::ObjectRefInfo info = URK::Unity::Inspect::DescribeObject(object);
+        if (!info.handle)
+            return;
+        if (!info.type.full_name.empty())
+            node.type = info.type.full_name;
+        // A string's display already shows its value; skip its private fields.
+        if (is_string(info.type.full_name) || is_string(declared_type))
+            return;
+        if (URK::Unity::Inspect::type_name_looks_array(info.type.full_name)) {
+            fill_array_children(object, info.type.full_name, depth, node);
+            return;
+        }
+        fill_object_children(object, depth, node);
+    });
+    return node;
+}
+
+ValueNode build_enum_node(std::string_view type_name, const void* type_handle, const void* value_class,
+                          std::string_view underlying_type, const void* data) {
+    ValueNode node{};
+    node.type = std::string(type_name);
+    EnumConstants constants;
+    std::uint64_t raw = 0;
+    bool readable = false;
+    node.display = decode_enum(type_name, type_handle, value_class, underlying_type, data, readable,
+                               &constants, &raw);
+    node.readable = readable;
+
+    ValueNode underlying{};
+    underlying.name = "underlying type";
+    underlying.display = underlying_type.empty() ? "<unavailable>" : std::string(underlying_type);
+    underlying.readable = !underlying_type.empty();
+    node.children.push_back(std::move(underlying));
+
+    ValueNode numeric{};
+    numeric.name = "raw value";
+    numeric.type = std::string(underlying_type);
+    numeric.display = std::to_string(raw) + "  (" + hex_text(raw) + ")";
+    numeric.readable = true;
+    node.children.push_back(std::move(numeric));
+
+    // Lists the enum's other defined values, so e.g. "MessagePack (1)" is legible.
+    const std::size_t count = std::min(constants.size(), kMaxNodeConstants);
+    node.truncated = constants.size() > count;
+    for (std::size_t index = 0; index < count; ++index) {
+        const auto& constant_entry = constants[index];
+        ValueNode constant{};
+        constant.name = constant_entry.first;
+        constant.display = std::to_string(constant_entry.second) + "  (" + hex_text(constant_entry.second) + ")";
+        if (constant_entry.second == raw)
+            constant.display += "   <- this value";
+        else if (constant_entry.second != 0 && (raw & constant_entry.second) == constant_entry.second)
+            constant.display += "   <- set";
+        constant.readable = true;
+        node.children.push_back(std::move(constant));
+    }
+    return node;
+}
+
+ValueNode build_value_node(std::string_view type_name, const void* type_handle, const void* value_class,
+                           const std::vector<std::uint8_t>& bytes, bool is_enum,
+                           std::string_view enum_underlying_type) {
+    if (is_enum && !bytes.empty()) {
+        ValueNode node{};
+        const bool complete = safely([&] {
+            node = build_enum_node(type_name, type_handle, value_class, enum_underlying_type, bytes.data());
+        });
+        if (complete)
+            return node;
+    }
+
+    ValueNode node{};
+    node.type = std::string(type_name);
+    bool readable = false;
+    node.display = decode_value_type(type_name, type_handle, value_class, bytes, is_enum,
+                                     enum_underlying_type, readable);
+    node.readable = readable;
+    if (is_enum || bytes.empty())
+        return node;
+
+    safely([&] {
+        const auto* klass = value_class ? static_cast<const URK::managed::Class*>(value_class)
+            : type_handle ? URK::managed::type_get_class_or_element_class(
+                  static_cast<const URK::managed::Type*>(type_handle)) : nullptr;
+        if (!klass)
+            return;
+        void* boxed = URK::managed::value_box(klass, const_cast<std::uint8_t*>(bytes.data()));
+        if (!boxed)
+            return;
+        URK::Unity::Inspect::ObjectHandle root = URK::Unity::Inspect::PinObject(URK::Unity::Object{boxed});
+        const URK::Unity::Object stable = URK::Unity::Inspect::ResolveObjectHandle(root);
+        if (root.handle && stable)
+            fill_object_children(stable, 0, node);
+        URK::Unity::Inspect::FreeObjectHandle(root);
+    });
+    return node;
+}
+
 std::vector<std::uint8_t> scalar_bytes(std::uint64_t value, std::size_t size) {
     std::vector<std::uint8_t> bytes(size);
     if (!bytes.empty())
@@ -296,6 +507,7 @@ DecodedRecord decode_record(const MethodTracer::Snapshot& trace, const MethodTra
 
     decoded.arguments.resize(record.arguments.size());
     decoded.argument_readable.resize(record.arguments.size(), false);
+    decoded.argument_nodes.resize(record.arguments.size());
     for (std::size_t index = 0; index < record.arguments.size(); ++index) {
         std::string_view type = "<unknown>";
         if (index < trace.parameter_types.size())
@@ -309,9 +521,10 @@ DecodedRecord decode_record(const MethodTracer::Snapshot& trace, const MethodTra
                 !record.argument_byref_value_bytes[index].empty())
                 std::memcpy(&value, record.argument_byref_value_bytes[index].data(),
                             std::min(sizeof(value), record.argument_byref_value_bytes[index].size()));
-            bool readable = false;
-            decoded.arguments[index] = decode_reference(value, type, readable);
-            decoded.argument_readable[index] = readable;
+            ValueNode node = build_reference_node(value, type, 0);
+            decoded.arguments[index] = node.display;
+            decoded.argument_readable[index] = node.readable;
+            decoded.argument_nodes[index] = std::move(node);
             continue;
         }
         const std::vector<std::uint8_t>* bytes = nullptr;
@@ -325,8 +538,7 @@ DecodedRecord decode_record(const MethodTracer::Snapshot& trace, const MethodTra
         }
         const std::size_t value_size = index < trace.parameter_value_sizes.size()
             ? trace.parameter_value_sizes[index] : 0;
-        // Win64 passes value types larger than eight bytes indirectly.  Their
-        // ABI word is an address, not their value, so never box it as data.
+        // Win64 passes large value types by address, not by value - never box that word as data.
         const std::vector<std::uint8_t> fallback = (!is_by_ref && value_size <= sizeof(std::uint64_t))
             ? scalar_bytes(record.arguments[index], sizeof(std::uint64_t))
             : std::vector<std::uint8_t>{};
@@ -335,16 +547,19 @@ DecodedRecord decode_record(const MethodTracer::Snapshot& trace, const MethodTra
             ? trace.parameter_value_classes[index] : nullptr;
         const std::string_view underlying = index < trace.parameter_enum_underlying_types.size()
             ? std::string_view(trace.parameter_enum_underlying_types[index]) : std::string_view{};
-        bool readable = false;
-        decoded.arguments[index] = decode_value_type(
-            type, type_handle, value_class, bytes ? *bytes : fallback, is_enum, underlying, readable);
-        decoded.argument_readable[index] = readable;
+        ValueNode node = build_value_node(
+            type, type_handle, value_class, bytes ? *bytes : fallback, is_enum, underlying);
+        decoded.arguments[index] = node.display;
+        decoded.argument_readable[index] = node.readable;
+        decoded.argument_nodes[index] = std::move(node);
     }
 
     if (!record.return_captured)
         return decoded;
     if (trace.return_is_reference) {
-        decoded.result = decode_reference(record.return_rax, trace.return_type, decoded.return_readable);
+        decoded.return_node = build_reference_node(record.return_rax, trace.return_type, 0);
+        decoded.result = decoded.return_node.display;
+        decoded.return_readable = decoded.return_node.readable;
         return decoded;
     }
     if (!trace.return_is_value_type && !trace.return_is_enum)
@@ -352,15 +567,21 @@ DecodedRecord decode_record(const MethodTracer::Snapshot& trace, const MethodTra
     const std::vector<std::uint8_t>* bytes = !record.return_value_bytes.empty() ? &record.return_value_bytes : nullptr;
     const std::vector<std::uint8_t> fallback = scalar_bytes(
         trace.return_is_floating ? record.return_xmm_low : record.return_rax, sizeof(std::uint64_t));
-    decoded.result = decode_value_type(
+    decoded.return_node = build_value_node(
         trace.return_type, trace.return_type_handle, trace.return_value_class, bytes ? *bytes : fallback,
-        trace.return_is_enum, trace.return_enum_underlying_type, decoded.return_readable);
+        trace.return_is_enum, trace.return_enum_underlying_type);
+    decoded.result = decoded.return_node.display;
+    decoded.return_readable = decoded.return_node.readable;
     return decoded;
 }
 
 } // namespace
 
 void resolve_displays(MethodTracer::Snapshot& trace) {
+    // Decoding walks referenced fields, so bound it by time (like the hierarchy
+    // census) rather than record count; the rest decodes on later frames.
+    const std::chrono::steady_clock::time_point deadline =
+        std::chrono::steady_clock::now() + std::chrono::milliseconds(3);
     auto apply = [&](MethodTracer::Record& record) {
         const std::uint64_t key = cache_key(trace, record.sequence);
         auto found = cache().find(key);
@@ -374,10 +595,11 @@ void resolve_displays(MethodTracer::Snapshot& trace) {
         record.argument_displays = found->second.arguments;
         record.argument_readable = found->second.argument_readable;
         record.return_readable = found->second.return_readable;
+        record.argument_nodes = found->second.argument_nodes;
+        record.return_node = found->second.return_node;
     };
 
-    // Reapply values already resolved in a previous snapshot first. This is
-    // cheap and makes decoded rows stable while the recorder is still active.
+    // Reapply already-cached values first, cheaply, so rows stay stable while recording.
     for (MethodTracer::Record& record : trace.records) {
         const auto found = cache().find(cache_key(trace, record.sequence));
         if (found == cache().end())
@@ -387,6 +609,8 @@ void resolve_displays(MethodTracer::Snapshot& trace) {
         record.argument_displays = found->second.arguments;
         record.argument_readable = found->second.argument_readable;
         record.return_readable = found->second.return_readable;
+        record.argument_nodes = found->second.argument_nodes;
+        record.return_node = found->second.return_node;
     }
 
     if (trace.records.empty())
@@ -399,6 +623,8 @@ void resolve_displays(MethodTracer::Snapshot& trace) {
         if (!cache().contains(cache_key(trace, record.sequence))) {
             apply(record);
             --budget;
+            if (std::chrono::steady_clock::now() >= deadline)
+                return;
         }
     }
 
@@ -421,6 +647,10 @@ void resolve_displays(MethodTracer::Snapshot& trace) {
         if (!cache().contains(cache_key(trace, record.sequence))) {
             apply(record);
             --budget;
+            if (std::chrono::steady_clock::now() >= deadline) {
+                cursor.next_sequence = record.sequence;
+                return;
+            }
         }
         index = (index + 1) % trace.records.size();
     }

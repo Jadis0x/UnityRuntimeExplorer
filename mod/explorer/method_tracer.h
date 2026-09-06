@@ -15,6 +15,20 @@ constexpr std::size_t max_records = 1024;
 constexpr std::size_t max_sessions = 12;
 using TraceId = std::uint64_t;
 
+// A decoded value plus, recursively, the fields/elements inside it.
+struct ValueNode {
+    // Empty on the root; a field, element or facet name on a child.
+    std::string name;
+    std::string type;
+    std::string display;
+    bool readable = false;
+    // Non-zero for an inspectable managed reference; zero for value types.
+    std::uint64_t inspect_address = 0;
+    std::vector<ValueNode> children;
+    // Set when the decoder stopped early (too many members to walk).
+    bool truncated = false;
+};
+
 struct Record {
     std::uint64_t sequence = 0;
     std::uint64_t sequence_start = 0;
@@ -31,25 +45,23 @@ struct Record {
     bool return_captured = false;
     std::uint64_t return_reference_token = 0;
     std::vector<std::uint8_t> return_value_bytes;
-    // Resolved on the Explorer thread; the detour never follows managed pointers.
+    // Resolved on the Explorer thread; the detour never touches managed memory.
     std::string return_display;
     std::vector<std::uint64_t> arguments;
-    // Retain XMM lanes for floating-point and value-type arguments.
     std::vector<std::uint64_t> argument_xmm_low;
     std::vector<std::uint64_t> argument_xmm_high;
-    // For ref/out parameters this contains the value copied after the callee
-    // returned. `arguments` intentionally remains the original ABI address.
+    // Value copied after the callee returns, for ref/out parameters.
     std::vector<std::vector<std::uint8_t>> argument_byref_value_bytes;
-    // Value-type arguments are copied at entry, before the callee can mutate
-    // caller-owned temporaries. This keeps their display independent from the
-    // live stack/register state when the Explorer renders the trace later.
+    // Value-type arguments copied at entry, before the callee can mutate them.
     std::vector<std::vector<std::uint8_t>> argument_value_bytes;
-    // Filled on the Explorer thread; the detour does not resolve managed objects.
     std::string caller_display;
     std::string target_display;
     std::vector<std::string> argument_displays;
     std::vector<bool> argument_readable;
     bool return_readable = false;
+    // One node per argument plus the result; filled in when decoded.
+    std::vector<ValueNode> argument_nodes;
+    ValueNode return_node;
 };
 
 struct Snapshot {
@@ -81,11 +93,10 @@ struct Snapshot {
     bool return_is_opaque = false;
     const void* return_value_class = nullptr;
     std::size_t return_value_size = 0;
-    // Struct returns can use a hidden Win64 output buffer; RAX is not the result.
+    // Set when a struct return uses a hidden Win64 output buffer, not RAX.
     bool return_uses_indirect_abi = false;
     bool return_is_floating = false;
-    // False when the trace runs as a mid-function entry hook, which cannot see
-    // the return value.
+    // False for a mid-function entry hook, which cannot see the return value.
     bool captures_return = false;
     std::uint64_t total_calls = 0;
     std::uint64_t overwritten_records = 0;
@@ -96,19 +107,11 @@ struct Snapshot {
     std::string error;
 };
 
-// A native hook captures game calls as well as Explorer invocations.
-// capture_return selects the strategy:
-//   false - a SafetyHook mid-function hook at the entry. Arguments, caller,
-//           thread and timing are recorded; the return value is not observable.
-//   true  - the legacy entry stub, which rewrites the return address so the
-//           callee returns through the tracer. That captures the return value
-//           but corrupts unwinding if a managed exception escapes the callee,
-//           so it stays opt-in.
-// instance_filter, when set, drops calls whose `this` is a different object.
-// A property watch uses it so a setter shared by every instance only reports
-// writes to the object being watched. Such a trace passes user_visible = false:
-// it belongs to the watch, and listing it in the Traces panel would invite
-// closing it there, which silently drops the watch back to polling.
+// capture_return: false hooks the entry only (no return value); true rewrites
+// the return address to capture it too, but can corrupt unwinding if the
+// callee throws, so it's opt-in. instance_filter restricts to one `this`
+// (used by property watches, which pass user_visible = false to stay hidden
+// from the Traces panel).
 bool start(const URK::Unity::Inspect::MethodInfo &method, bool capture_return, const void *instance_filter,
            bool user_visible, std::string &error);
 
@@ -118,23 +121,19 @@ struct WriteSignal {
     std::uint64_t total_calls = 0;
     std::uintptr_t last_caller = 0;
     std::uint32_t last_thread_id = 0;
-    // The setter's own argument: the value actually written, as opposed to
-    // whatever a later poll happens to observe.
+    // The setter's own argument, not whatever a later poll observes.
     bool has_written_value = false;
     std::uint64_t written_raw = 0;
     std::uint64_t written_xmm_low = 0;
 };
 WriteSignal write_signal(TraceId id);
-// The trace id most recently created by start(), for callers that need to
-// track the session they just opened.
+// Id of the trace most recently created by start().
 TraceId last_started_id();
 bool stop(const URK::managed::Method *method);
 bool stop(TraceId id);
 bool clear(TraceId id);
-// Upgrades a running entry-hook trace to the stub that also records return
-// values, keeping the trace's identity, tab and metadata. Calls recorded so far
-// are dropped: they carry no return, and mixing them with the ones that do is
-// how "Returns: not recorded" ends up looking like a bug.
+// Upgrades a running trace to also capture returns, keeping its identity;
+// existing records are dropped since they have no return to show.
 bool capture_returns(TraceId id, std::string &error);
 bool close(TraceId id);
 void stop_all();

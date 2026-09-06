@@ -337,6 +337,23 @@ if(URK_BUILD_TESTS)
     urk_disable_vs_vcpkg_integration(urk_invoke_result_decode_tests)
     add_test(NAME invoke_result_decode_contract COMMAND urk_invoke_result_decode_tests)
 
+    add_executable(urk_method_trace_value_tests
+        tests/method_trace_value_tests.cpp
+        mod/explorer/method_trace_value_decoder.cpp
+    )
+    target_include_directories(urk_method_trace_value_tests PRIVATE .)
+    target_compile_features(urk_method_trace_value_tests PRIVATE cxx_std_20)
+    target_compile_definitions(urk_method_trace_value_tests PRIVATE
+        WIN32_LEAN_AND_MEAN
+        NOMINMAX
+        URK_BACKEND_IL2CPP
+    )
+    if(MSVC)
+        target_compile_options(urk_method_trace_value_tests PRIVATE /W4 /permissive- /EHsc /utf-8)
+    endif()
+    urk_disable_vs_vcpkg_integration(urk_method_trace_value_tests)
+    add_test(NAME method_trace_value_contract COMMAND urk_method_trace_value_tests)
+
     add_executable(urk_method_trace_format_tests
         tests/method_trace_format_tests.cpp
         mod/explorer/method_trace_format.cpp

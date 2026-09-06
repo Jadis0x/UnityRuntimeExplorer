@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <chrono>
 #include <cerrno>
 #include <cstdio>
 #include <cstdlib>
@@ -45,7 +46,11 @@ namespace Explorer {
 		}
 
 		struct ManagedCallerIndex {
+			// unordered_map keeps element addresses stable across rehash, so the
+			// sorted view can borrow the names instead of copying them.
 			std::unordered_map<std::uintptr_t, std::string> methods;
+			std::vector<std::pair<std::uintptr_t, const std::string*>> sorted;
+			bool sorted_stale = true;
 		};
 
 		ManagedCallerIndex& managed_caller_index() {
@@ -434,8 +439,7 @@ namespace Explorer {
 		if (!method.handle || method.name.empty())
 			return;
 #if defined(URK_BACKEND_MONO)
-		// Avoid compiling arbitrary Mono metadata methods; non-JITtable methods
-		// can raise native exceptions. Explicit trace targets remain supported.
+		// Avoid JIT-compiling arbitrary metadata methods; that can raise native exceptions.
 		return;
 #else
 #if defined(_WIN32)
@@ -447,9 +451,11 @@ namespace Explorer {
 			const std::string name = method.declaring_type.full_name.empty()
 				? method.name
 				: method.declaring_type.full_name + "." + method.name;
-			auto& methods = managed_caller_index().methods;
-			const auto [found, inserted] = methods.emplace(reinterpret_cast<std::uintptr_t>(pointer), name);
-			if (!inserted && found->second != name)
+			auto& index = managed_caller_index();
+			const auto [found, inserted] = index.methods.emplace(reinterpret_cast<std::uintptr_t>(pointer), name);
+			if (inserted)
+				index.sorted_stale = true;
+			else if (found->second != name)
 				found->second = "<shared managed generic code>";
 #if defined(_WIN32)
 		}
@@ -460,16 +466,65 @@ namespace Explorer {
 	#endif
 	}
 
+	namespace {
+
+		const std::vector<std::pair<std::uintptr_t, const std::string*>>& sorted_caller_entries() {
+			ManagedCallerIndex& index = managed_caller_index();
+			if (!index.sorted_stale)
+				return index.sorted;
+			// Re-sorting every frame while the index is being built is too costly; throttle it.
+			using SortClock = std::chrono::steady_clock;
+			static SortClock::time_point last_sort{};
+			const SortClock::time_point now = SortClock::now();
+			if (!index.sorted.empty() && now - last_sort < std::chrono::milliseconds(500))
+				return index.sorted;
+			last_sort = now;
+			index.sorted.clear();
+			index.sorted.reserve(index.methods.size());
+			for (const auto& entry : index.methods)
+				index.sorted.emplace_back(entry.first, &entry.second);
+			std::sort(index.sorted.begin(), index.sorted.end(),
+				[](const auto& left, const auto& right) { return left.first < right.first; });
+			index.sorted_stale = false;
+			return index.sorted;
+		}
+
+		// Nearest indexed entry at or below the address, only if a later entry confirms
+		// it's still in range - generic sharing/cold chunks make naive nearest-below wrong.
+		std::string enclosing_indexed_method(std::uintptr_t address) {
+			const auto& entries = sorted_caller_entries();
+			if (entries.empty())
+				return {};
+			const auto next = std::upper_bound(entries.begin(), entries.end(), address,
+				[](std::uintptr_t value, const auto& entry) { return value < entry.first; });
+			if (next == entries.begin() || next == entries.end())
+				return {};
+			const auto entry = std::prev(next);
+			const std::uintptr_t offset = address - entry->first;
+			// A megabyte gap means these entries aren't neighbours in the same function.
+			constexpr std::uintptr_t kMaxMethodExtent = 1u << 20;
+			if (offset > kMaxMethodExtent)
+				return {};
+			char suffix[32]{};
+			std::snprintf(suffix, sizeof(suffix), " +0x%llX", static_cast<unsigned long long>(offset));
+			return *entry->second + suffix;
+		}
+
+	} // namespace
+
 	std::string managed_caller_location(std::uintptr_t address) {
+		if (!address)
+			return module_location(address);
 		DWORD64 image_base = 0;
 		const PRUNTIME_FUNCTION function = RtlLookupFunctionEntry(static_cast<DWORD64>(address), &image_base, nullptr);
-		if (!function)
-			return module_location(address);
-		const std::uintptr_t function_start = static_cast<std::uintptr_t>(image_base + function->BeginAddress);
-		const auto found = managed_caller_index().methods.find(function_start);
-		if (found == managed_caller_index().methods.end())
-			return module_location(address);
-		return found->second;
+		if (function) {
+			const std::uintptr_t function_start = static_cast<std::uintptr_t>(image_base + function->BeginAddress);
+			const auto found = managed_caller_index().methods.find(function_start);
+			if (found != managed_caller_index().methods.end())
+				return found->second;
+		}
+		const std::string enclosing = enclosing_indexed_method(address);
+		return enclosing.empty() ? module_location(address) : enclosing;
 	}
 
 } // namespace Explorer

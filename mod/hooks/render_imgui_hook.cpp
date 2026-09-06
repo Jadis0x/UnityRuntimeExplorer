@@ -393,6 +393,16 @@ namespace ModRenderHook {
 			(swap_chain == g_active_swap_chain || same_com_identity(swap_chain, g_active_swap_chain));
 	}
 
+	// A monitor/adapter change is a real-world trigger for device removal;
+	// touching platform-viewport swap chains or queues afterward is unsafe.
+	inline bool dx11_device_removed() {
+		return g_device && FAILED(g_device->GetDeviceRemovedReason());
+	}
+
+	inline bool dx12_device_removed() {
+		return g_dx12_device && FAILED(g_dx12_device->GetDeviceRemovedReason());
+	}
+
 	inline void platform_renderer_create_window(ImGuiViewport* viewport) {
 		PlatformRendererGuard guard{};
 		if (g_platform_renderer_callbacks.create_window)
@@ -2018,6 +2028,20 @@ namespace ModRenderHook {
 		std::lock_guard<std::recursive_mutex> lock(g_imgui_mutex);
 		if (g_shutting_down.load(std::memory_order_acquire)) return;
 		if (!init_imgui(swap_chain)) return;
+		// A monitor/adapter-output change is a real-world trigger for device
+		// removal; RenderPlatformWindowsDefault would spin/Present on dead
+		// per-viewport queues and swap chains if we pressed on regardless.
+		if ((g_backend == GraphicsBackend::dx11 && dx11_device_removed()) ||
+			(g_backend == GraphicsBackend::dx12 && dx12_device_removed())) {
+			if (!g_dx12_queue_wait_logged) {
+				log("Graphics device removed (monitor/adapter change or driver reset); "
+					"tearing down the UI instead of presenting into invalid platform-viewport resources.");
+				g_dx12_queue_wait_logged = true;
+			}
+			shutdown_imgui();
+			return;
+		}
+		g_dx12_queue_wait_logged = false;
 		if (g_backend == GraphicsBackend::dx11 || g_backend == GraphicsBackend::dx12)
 			pump_platform_window_messages();
 		if (g_backend == GraphicsBackend::dx12) {

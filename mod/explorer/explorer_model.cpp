@@ -223,10 +223,8 @@ namespace Explorer {
 			update_highlight();
 			next_highlight_refresh_ = now + kHighlightInterval;
 		}
-		// Watches continue sampling while Live Data is paused. Sampling runs
-		// every frame so a write that lands and reverts between two publishes
-		// still registers as a change; only graph points and the snapshot
-		// publish stay on the slower cadence.
+		// Watches keep sampling every frame even while Live Data is paused, so a write
+		// that reverts between publishes still registers; only graph points stay slow-cadence.
 		if (has_active_field_watches() && !event_refresh_pending_) {
 			const bool due = now >= next_field_watch_refresh_;
 			refresh_field_watches(due);
@@ -347,9 +345,7 @@ namespace Explorer {
 			pending.swap(commands_);
 		}
 
-		// Coalesce destruction bursts in place. Scene hints remain ordering
-		// barriers; moving them to the end allowed pre-transition commands to run
-		// against objects from a different scene generation.
+		// Coalesce destruction bursts in place; scene hints must stay as ordering barriers.
 		if (pending.size() > 1) {
 			const std::size_t original_count = pending.size();
 			std::vector<Command> coalesced;
@@ -365,8 +361,7 @@ namespace Explorer {
 					coalesced.push_back(std::move(command));
 				}
 				else if (command.instance_id == working_.selected_instance_id) {
-					// Clearing early is safe and retains the selected object's
-					// identity without processing every notification in a burst.
+					// Safe to clear early; keeps the selected object's identity without replaying the whole burst.
 					coalesced[*destroy_index] = std::move(command);
 				}
 			}
@@ -1017,8 +1012,7 @@ namespace Explorer {
 				clear_selection();
 				clear_object_inspector();
 			}
-			// Non-selected destruction also invalidates hierarchy membership.
-			// Debounce the census rather than silently retaining a stale tree.
+			// Debounce the census instead of silently keeping a stale tree.
 			event_refresh_pending_ = true;
 			event_refresh_due_ = Clock::now() + kEventRefreshDebounce;
 			return;
@@ -1186,8 +1180,7 @@ namespace Explorer {
 	void RuntimeModel::publish() {
 		working_.runtime_backend = ModConfig::backend_name;
 #if defined(URK_BACKEND_MONO)
-		// Mono resolves a method's native code by JIT-compiling it, and compiling
-		// arbitrary metadata methods can fault, so the address index is IL2CPP only.
+		// Mono JIT-compiles to resolve a method's address, which can fault; IL2CPP only.
 		working_.caller_index_supported = false;
 #endif
 		working_.runtime_capabilities = URK::runtime_capabilities();
@@ -1215,16 +1208,28 @@ namespace Explorer {
 			const Snapshot::FieldWatch& right) {
 				return left.id < right.id;
 			});
+        bool unnamed_caller = false;
         for (MethodTracer::Snapshot& trace : working_.method_traces) {
             // Decode ABI captures on the Explorer thread, outside the detour.
             MethodTraceValueDecoder::resolve_displays(trace);
-            for (MethodTracer::Record& record : trace.records)
+            for (MethodTracer::Record& record : trace.records) {
                 record.caller_display = managed_caller_location(record.caller_address);
+                // A bare module offset is the shape an unindexed caller takes.
+                if (record.caller_address != 0 && record.caller_display.find("+0x") != std::string::npos &&
+                    record.caller_display.find(".dll+0x") != std::string::npos)
+                    unnamed_caller = true;
+            }
             MethodTraceFormat::collapse_repeated_records(trace);
+        }
+        // Auto-start the caller index the first time a trace records an unnamed caller.
+        if (unnamed_caller && !caller_index_auto_requested_ && !caller_index_scan_ &&
+            !working_.caller_index_built && working_.caller_index_supported) {
+            caller_index_auto_requested_ = true;
+            build_managed_caller_index();
         }
 		std::unordered_set<TraceReturnKey, TraceReturnKeyHash> live_trace_returns;
 		for (MethodTracer::Snapshot& trace : working_.method_traces) {
-			// Root only recent object results; older trace rows remain raw diagnostics.
+			// Only recent results get rooted; older rows stay as raw diagnostics.
 			constexpr std::size_t kMaxRootedTraceReturns = 128;
 			const std::size_t first_rooted_reference = trace.records.size() > kMaxRootedTraceReturns
 				? trace.records.size() - kMaxRootedTraceReturns : 0;
