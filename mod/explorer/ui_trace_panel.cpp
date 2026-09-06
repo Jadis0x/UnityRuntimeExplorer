@@ -44,15 +44,90 @@ TraceViewState &trace_view_state(MethodTracer::TraceId id) {
     return ui_state().trace_views.touch(id);
 }
 
+std::string short_trace_type_name(std::string_view type_name) {
+    const std::size_t separator = type_name.rfind('.');
+    return separator == std::string_view::npos ? std::string(type_name) : std::string(type_name.substr(separator + 1));
+}
+
+bool caller_is_unnamed(std::string_view caller) {
+    return caller.empty() || caller.find(".dll+0x") != std::string_view::npos ||
+           caller.find("<module>+0x") != std::string_view::npos;
+}
+
 std::string friendly_trace_caller(std::string_view caller) {
     if (caller.empty())
-        return "Native caller address was not captured";
+        return "caller address was not captured";
+    // The long-form explanation belongs in a tooltip; the cell just needs the
+    // site, or the row turns into a paragraph.
     if (caller.find("GameAssembly.dll+") != std::string_view::npos)
-        return "Native GameAssembly call site: " + std::string(caller) +
-               " (runtime did not expose an owning managed method)";
+        return std::string(caller) + " (unnamed - build the caller index)";
     if (caller == "<shared managed generic code>")
         return std::string("shared generic ") + ModConfig::backend_name + " code";
     return std::string(caller);
+}
+
+void enqueue_method_trace_capture_returns(MethodTracer::TraceId id) {
+    Command command{};
+    command.kind = CommandKind::CaptureMethodTraceReturns;
+    command.reference_token = id;
+    RuntimeModel::instance().enqueue(std::move(command));
+}
+
+void enqueue_caller_index_build() {
+    RuntimeModel::instance().enqueue(Command{.kind = CommandKind::BuildManagedCallerIndex});
+}
+
+// A trace's caller is a raw return address. Naming it needs an index of every
+// managed method's native entry point, which is expensive enough to build only
+// when the user actually wants names - so offer it exactly where the unnamed
+// callers are on screen.
+void render_caller_index_notice(const Snapshot &snapshot, const MethodTracer::Snapshot &trace) {
+    const bool unnamed = std::any_of(trace.records.begin(), trace.records.end(),
+                                     [](const MethodTracer::Record &record) {
+                                         return caller_is_unnamed(record.caller_display);
+                                     });
+    if (snapshot.caller_index_active) {
+        ImGui::TextColored(ImVec4(0.66f, 0.76f, 0.86f, 1.0f), "Indexing caller names... %zu method(s) in %zu class(es)",
+                           snapshot.caller_index_methods, snapshot.caller_index_classes);
+        return;
+    }
+    if (!unnamed)
+        return;
+    if (!snapshot.caller_index_supported) {
+        ImGui::TextDisabled("Some callers are raw addresses. Naming them needs method address metadata this "
+                            "runtime backend does not expose.");
+        return;
+    }
+    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.80f, 0.71f, 0.45f, 1.0f));
+    ImGui::TextWrapped(snapshot.caller_index_built
+                           ? "Some callers are still raw addresses: their code has no managed method behind it, "
+                             "or it was compiled after the index was built."
+                           : "Callers show as raw addresses because managed method addresses have not been indexed "
+                             "yet.");
+    ImGui::PopStyleColor();
+    if (ImGui::SmallButton(snapshot.caller_index_built ? "Rebuild caller index" : "Build caller index"))
+        enqueue_caller_index_build();
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Walks every loaded assembly and records where each managed method starts.\n"
+                          "Runs in slices in the background; existing trace rows pick the names up as it goes.");
+    if (snapshot.caller_index_built) {
+        ImGui::SameLine();
+        ImGui::TextDisabled("%zu method(s) indexed", snapshot.caller_index_methods);
+    }
+}
+
+// One explanation of "why is Returns empty", offered wherever the user is
+// looking when they ask it.
+void render_return_capture_notice(const MethodTracer::Snapshot &trace) {
+    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.80f, 0.71f, 0.45f, 1.0f));
+    ImGui::TextWrapped("Return values are not recorded. This trace hooks the method's entry, so it sees the "
+                       "arguments and the caller but never the result.");
+    ImGui::PopStyleColor();
+    if (ImGui::SmallButton("Record return values"))
+        enqueue_method_trace_capture_returns(trace.id);
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Re-hooks the method so calls return through the tracer.\n"
+                          "Clears the calls recorded so far, and is unsafe on methods that throw.");
 }
 
 // Derive hue from stable value/type text to prevent live-trace flicker.
@@ -88,7 +163,7 @@ void trace_card_row(std::string_view label, std::string_view color_key,
     trace_value_text(color_key, value, readable);
 }
 
-void render_method_trace(const MethodTracer::Snapshot &trace) {
+void render_method_trace(const Snapshot &snapshot, const MethodTracer::Snapshot &trace) {
     TraceViewState &state = trace_view_state(trace.id);
     if (trace.active) {
         ImGui::TextDisabled("%llu calls | %zu groups", static_cast<unsigned long long>(trace.total_calls),
@@ -126,6 +201,10 @@ void render_method_trace(const MethodTracer::Snapshot &trace) {
     ImGui::SameLine();
     ImGui::Checkbox("Addresses", &state.show_addresses);
     const std::string_view filter = state.filter.data();
+
+    if (!trace.captures_return)
+        render_return_capture_notice(trace);
+    render_caller_index_notice(snapshot, trace);
 
     if (ImGui::CollapsingHeader("Technical details")) {
         ImGui::TextDisabled("Method metadata address: %s", trace.method_pointer_text.empty() ? "<unavailable>"
@@ -226,7 +305,11 @@ void render_method_trace(const MethodTracer::Snapshot &trace) {
                 trace_card_row("Arguments", argument_summary,
                                argument_summary.empty() ? std::string_view("none") : std::string_view(argument_summary),
                                readable_arguments);
-                trace_card_row("Returns", trace.return_type + result, result, record.return_readable);
+                const std::string return_line =
+                    trace.return_type.empty() || trace.return_type == "System.Void" || trace.return_type == "Void"
+                        ? result
+                        : result + "   (" + short_trace_type_name(trace.return_type) + ")";
+                trace_card_row("Returns", trace.return_type + result, return_line, record.return_readable);
                 ImGui::EndTable();
             }
 
@@ -283,8 +366,7 @@ void render_method_trace(const MethodTracer::Snapshot &trace) {
 
                 ImGui::SeparatorText("Return value");
                 if (!trace.captures_return) {
-                    ImGui::TextDisabled("Not captured: this trace is a mid-function entry hook.");
-                    ImGui::TextDisabled("Close it and re-trace with return values to record them.");
+                    render_return_capture_notice(trace);
                 } else {
                 ImGui::TextDisabled("Type: %s", trace.return_type.empty() ? "<unknown>" : trace.return_type.c_str());
                 trace_value_text(trace.return_type + result, result, record.return_readable);
@@ -344,11 +426,6 @@ void enqueue_method_trace_close(MethodTracer::TraceId id) {
     command.kind = CommandKind::CloseMethodTrace;
     command.reference_token = id;
     RuntimeModel::instance().enqueue(std::move(command));
-}
-
-std::string short_trace_type_name(std::string_view type_name) {
-    const std::size_t separator = type_name.rfind('.');
-    return separator == std::string_view::npos ? std::string(type_name) : std::string(type_name.substr(separator + 1));
 }
 
 std::string trace_list_display_name(const MethodTracer::Snapshot& trace) {
@@ -415,7 +492,7 @@ void render_method_traces(const Snapshot &snapshot) {
         if (ImGui::SmallButton("Close"))
             enqueue_method_trace_close(trace->id);
     }
-    render_method_trace(*trace);
+    render_method_trace(snapshot, *trace);
     ImGui::EndChild();
 }
 

@@ -42,98 +42,177 @@
 namespace Explorer::UI {
 namespace {
 
+// One place to mix a colour towards a panel's accent. t = 0 keeps the neutral
+// surface, t = 1 is the accent itself.
+ImVec4 tint(const ImVec4& base, const ImVec4& accent, float t, float alpha) {
+    return ImVec4(base.x + (accent.x - base.x) * t, base.y + (accent.y - base.y) * t,
+                  base.z + (accent.z - base.z) * t, alpha);
+}
+
+ImVec4 with_alpha(const ImVec4& color, float alpha) {
+    return ImVec4(color.x, color.y, color.z, alpha);
+}
+
+// The Explorer's own palette. Surfaces are cool near-blacks at three clearly
+// separated levels - window, child, input well - so a panel, a list inside it
+// and an editable field never read as the same slab of grey.
+namespace Palette {
+constexpr ImVec4 window{0.098f, 0.106f, 0.122f, 1.0f};
+constexpr ImVec4 child{0.071f, 0.078f, 0.090f, 1.0f};
+constexpr ImVec4 popup{0.129f, 0.139f, 0.157f, 1.0f};
+constexpr ImVec4 well{0.047f, 0.052f, 0.063f, 1.0f};
+constexpr ImVec4 raised{0.180f, 0.196f, 0.224f, 1.0f};
+constexpr ImVec4 border{0.031f, 0.035f, 0.043f, 1.0f};
+constexpr ImVec4 line{0.204f, 0.220f, 0.251f, 1.0f};
+constexpr ImVec4 text{0.878f, 0.894f, 0.918f, 1.0f};
+constexpr ImVec4 text_dim{0.478f, 0.510f, 0.561f, 1.0f};
+constexpr ImVec4 accent{0.290f, 0.596f, 0.980f, 1.0f};
+} // namespace Palette
+
 int push_explorer_theme(float opacity) {
     const float surface_opacity = std::clamp(opacity, 0.35f, 1.0f);
-    const auto color = [](float r, float g, float b, float alpha) { return ImVec4(r, g, b, alpha); };
-    const auto surface = [surface_opacity](float r, float g, float b, float alpha) {
-        return ImVec4(r, g, b, std::clamp(alpha * surface_opacity, 0.28f, 1.0f));
+    int pushed = 0;
+    const auto push = [&pushed](ImGuiCol index, const ImVec4& value) {
+        ImGui::PushStyleColor(index, value);
+        ++pushed;
     };
+    // Only the large surfaces follow the opacity slider; text, controls and
+    // borders stay opaque or the overlay becomes unreadable over bright scenes.
+    const auto surface = [surface_opacity](const ImVec4& color, float alpha) {
+        return ImVec4(color.x, color.y, color.z, std::clamp(alpha * surface_opacity, 0.30f, 1.0f));
+    };
+    const ImVec4& accent = Palette::accent;
 
-    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.82f, 0.82f, 0.82f, 1.0f));
-    ImGui::PushStyleColor(ImGuiCol_WindowBg, surface(0.176f, 0.176f, 0.176f, 0.99f));
-    ImGui::PushStyleColor(ImGuiCol_ChildBg, surface(0.157f, 0.157f, 0.157f, 0.97f));
-    ImGui::PushStyleColor(ImGuiCol_PopupBg, surface(0.205f, 0.205f, 0.205f, 0.99f));
-    ImGui::PushStyleColor(ImGuiCol_Border, color(0.105f, 0.105f, 0.105f, 0.95f));
-    ImGui::PushStyleColor(ImGuiCol_BorderShadow, color(0.0f, 0.0f, 0.0f, 0.42f));
-    ImGui::PushStyleColor(ImGuiCol_TitleBg, surface(0.145f, 0.145f, 0.145f, 0.99f));
-    ImGui::PushStyleColor(ImGuiCol_TitleBgActive, surface(0.205f, 0.205f, 0.205f, 1.0f));
-    ImGui::PushStyleColor(ImGuiCol_FrameBg, color(0.125f, 0.125f, 0.125f, 0.96f));
-    ImGui::PushStyleColor(ImGuiCol_FrameBgHovered, color(0.235f, 0.235f, 0.235f, 0.99f));
-    ImGui::PushStyleColor(ImGuiCol_FrameBgActive, color(0.270f, 0.270f, 0.270f, 1.0f));
-    ImGui::PushStyleColor(ImGuiCol_Header, color(0.235f, 0.235f, 0.235f, 0.95f));
-    ImGui::PushStyleColor(ImGuiCol_HeaderHovered, color(0.255f, 0.350f, 0.445f, 0.98f));
-    ImGui::PushStyleColor(ImGuiCol_HeaderActive, color(0.225f, 0.445f, 0.690f, 1.0f));
-    ImGui::PushStyleColor(ImGuiCol_Button, color(0.235f, 0.235f, 0.235f, 0.98f));
-    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, color(0.315f, 0.315f, 0.315f, 1.0f));
-    ImGui::PushStyleColor(ImGuiCol_ButtonActive, color(0.225f, 0.445f, 0.690f, 1.0f));
-    ImGui::PushStyleColor(ImGuiCol_Separator, color(0.105f, 0.105f, 0.105f, 0.95f));
-    ImGui::PushStyleColor(ImGuiCol_SeparatorHovered, color(0.32f, 0.49f, 0.62f, 0.95f));
-    ImGui::PushStyleColor(ImGuiCol_SeparatorActive, color(0.34f, 0.57f, 0.74f, 1.0f));
-    ImGui::PushStyleColor(ImGuiCol_TableRowBg, color(0.170f, 0.170f, 0.170f, 0.88f));
-    ImGui::PushStyleColor(ImGuiCol_TableRowBgAlt, color(0.195f, 0.195f, 0.195f, 0.90f));
-    ImGui::PushStyleColor(ImGuiCol_TableHeaderBg, color(0.235f, 0.235f, 0.235f, 0.98f));
-    ImGui::PushStyleColor(ImGuiCol_TextDisabled, ImVec4(0.57f, 0.59f, 0.62f, 1.0f));
-    ImGui::PushStyleColor(ImGuiCol_CheckMark, ImVec4(0.35f, 0.67f, 0.90f, 1.0f));
-    ImGui::PushStyleColor(ImGuiCol_TextSelectedBg, color(0.225f, 0.445f, 0.690f, 0.92f));
-    ImGui::PushStyleColor(ImGuiCol_ScrollbarBg, color(0.09f, 0.095f, 0.10f, 0.90f));
-    ImGui::PushStyleColor(ImGuiCol_ScrollbarGrab, color(0.28f, 0.29f, 0.31f, 0.98f));
-    ImGui::PushStyleColor(ImGuiCol_ScrollbarGrabHovered, color(0.36f, 0.38f, 0.40f, 1.0f));
-    ImGui::PushStyleColor(ImGuiCol_ScrollbarGrabActive, color(0.29f, 0.49f, 0.66f, 1.0f));
-    ImGui::PushStyleColor(ImGuiCol_Tab, color(0.145f, 0.145f, 0.145f, 0.99f));
-    ImGui::PushStyleColor(ImGuiCol_TabHovered, color(0.260f, 0.310f, 0.360f, 1.0f));
-    ImGui::PushStyleColor(ImGuiCol_TabSelected, color(0.235f, 0.235f, 0.235f, 1.0f));
-    ImGui::PushStyleColor(ImGuiCol_TabDimmed, color(0.125f, 0.125f, 0.125f, 0.97f));
-    ImGui::PushStyleColor(ImGuiCol_TabDimmedSelected, color(0.190f, 0.190f, 0.190f, 0.99f));
-    ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 1.0f);
+    push(ImGuiCol_Text, Palette::text);
+    push(ImGuiCol_TextDisabled, Palette::text_dim);
+    push(ImGuiCol_WindowBg, surface(Palette::window, 0.99f));
+    push(ImGuiCol_ChildBg, surface(Palette::child, 0.97f));
+    push(ImGuiCol_PopupBg, surface(Palette::popup, 0.99f));
+    push(ImGuiCol_MenuBarBg, surface(Palette::child, 0.99f));
+    push(ImGuiCol_Border, Palette::border);
+    push(ImGuiCol_BorderShadow, ImVec4(0.0f, 0.0f, 0.0f, 0.40f));
+    push(ImGuiCol_TitleBg, surface(Palette::child, 0.99f));
+    push(ImGuiCol_TitleBgActive, surface(Palette::window, 1.0f));
+    push(ImGuiCol_TitleBgCollapsed, surface(Palette::child, 0.85f));
+    // Inputs sit below the window surface, not above it: a well reads as
+    // editable, a raised slab reads as a button.
+    push(ImGuiCol_FrameBg, Palette::well);
+    push(ImGuiCol_FrameBgHovered, ImVec4(0.125f, 0.137f, 0.161f, 1.0f));
+    push(ImGuiCol_FrameBgActive, tint(Palette::well, accent, 0.22f, 1.0f));
+    push(ImGuiCol_Header, with_alpha(accent, 0.32f));
+    push(ImGuiCol_HeaderHovered, with_alpha(accent, 0.52f));
+    push(ImGuiCol_HeaderActive, with_alpha(accent, 0.78f));
+    push(ImGuiCol_Button, Palette::raised);
+    push(ImGuiCol_ButtonHovered, tint(Palette::raised, accent, 0.34f, 1.0f));
+    push(ImGuiCol_ButtonActive, tint(Palette::raised, accent, 0.62f, 1.0f));
+    push(ImGuiCol_Separator, Palette::line);
+    push(ImGuiCol_SeparatorHovered, with_alpha(accent, 0.72f));
+    push(ImGuiCol_SeparatorActive, accent);
+    push(ImGuiCol_ResizeGrip, with_alpha(accent, 0.24f));
+    push(ImGuiCol_ResizeGripHovered, with_alpha(accent, 0.60f));
+    push(ImGuiCol_ResizeGripActive, accent);
+    push(ImGuiCol_TableRowBg, ImVec4(0.0f, 0.0f, 0.0f, 0.0f));
+    push(ImGuiCol_TableRowBgAlt, ImVec4(1.0f, 1.0f, 1.0f, 0.028f));
+    push(ImGuiCol_TableHeaderBg, ImVec4(0.145f, 0.157f, 0.180f, 1.0f));
+    push(ImGuiCol_TableBorderStrong, Palette::line);
+    push(ImGuiCol_TableBorderLight, ImVec4(0.145f, 0.157f, 0.180f, 1.0f));
+    push(ImGuiCol_CheckMark, ImVec4(0.42f, 0.74f, 1.0f, 1.0f));
+    push(ImGuiCol_SliderGrab, with_alpha(accent, 0.85f));
+    push(ImGuiCol_SliderGrabActive, accent);
+    push(ImGuiCol_TextSelectedBg, with_alpha(accent, 0.42f));
+    push(ImGuiCol_DragDropTarget, ImVec4(1.0f, 0.74f, 0.30f, 0.95f));
+    push(ImGuiCol_NavCursor, with_alpha(accent, 0.85f));
+    push(ImGuiCol_ScrollbarBg, ImVec4(0.043f, 0.047f, 0.055f, 0.90f));
+    push(ImGuiCol_ScrollbarGrab, ImVec4(0.239f, 0.259f, 0.294f, 1.0f));
+    push(ImGuiCol_ScrollbarGrabHovered, ImVec4(0.318f, 0.345f, 0.392f, 1.0f));
+    push(ImGuiCol_ScrollbarGrabActive, accent);
+    push(ImGuiCol_Tab, surface(Palette::child, 0.99f));
+    push(ImGuiCol_TabHovered, tint(Palette::window, accent, 0.34f, 1.0f));
+    push(ImGuiCol_TabSelected, tint(Palette::window, accent, 0.22f, 1.0f));
+    push(ImGuiCol_TabSelectedOverline, accent);
+    push(ImGuiCol_TabDimmed, surface(Palette::child, 0.97f));
+    push(ImGuiCol_TabDimmedSelected, tint(Palette::window, accent, 0.12f, 1.0f));
+    push(ImGuiCol_TabDimmedSelectedOverline, with_alpha(accent, 0.45f));
+    push(ImGuiCol_DockingPreview, with_alpha(accent, 0.55f));
+    push(ImGuiCol_DockingEmptyBg, surface(Palette::child, 0.60f));
+    push(ImGuiCol_PlotLines, with_alpha(accent, 0.90f));
+    push(ImGuiCol_PlotLinesHovered, ImVec4(1.0f, 0.74f, 0.30f, 1.0f));
+    push(ImGuiCol_PlotHistogram, with_alpha(accent, 0.85f));
+    push(ImGuiCol_PlotHistogramHovered, ImVec4(1.0f, 0.74f, 0.30f, 1.0f));
+
+    ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 3.0f);
     ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 0.0f);
-    ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, 0.0f);
+    ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, 3.0f);
     ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 1.0f);
     ImGui::PushStyleVar(ImGuiStyleVar_ChildBorderSize, 1.0f);
-    ImGui::PushStyleVar(ImGuiStyleVar_FrameBorderSize, 1.0f);
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(9.0f, 7.0f));
-    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(6.0f, 3.0f));
-    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(6.0f, 4.0f));
-    ImGui::PushStyleVar(ImGuiStyleVar_CellPadding, ImVec2(5.0f, 3.0f));
+    ImGui::PushStyleVar(ImGuiStyleVar_FrameBorderSize, 0.0f);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(10.0f, 8.0f));
+    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(7.0f, 4.0f));
+    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(7.0f, 5.0f));
+    ImGui::PushStyleVar(ImGuiStyleVar_CellPadding, ImVec2(6.0f, 4.0f));
     ImGui::PushStyleVar(ImGuiStyleVar_IndentSpacing, 16.0f);
-    return 35;
+    return pushed;
 }
 
+// Each panel repaints its title bar, tabs, borders and highlight controls in its
+// own accent. Previously the accent was mixed in at 15-24%, which on a near
+// black surface is indistinguishable from no accent at all.
 int push_panel_accent(const ImVec4& accent, float opacity) {
     const float surface_opacity = std::clamp(opacity, 0.35f, 1.0f);
-    const auto neutral = [surface_opacity](float base, float alpha) {
-        return ImVec4(base, base + 0.004f, base + 0.009f,
-                      std::clamp(alpha * surface_opacity, 0.25f, 1.0f));
+    int pushed = 0;
+    const auto push = [&pushed](ImGuiCol index, const ImVec4& value) {
+        ImGui::PushStyleColor(index, value);
+        ++pushed;
     };
-    ImGui::PushStyleColor(ImGuiCol_WindowBg, neutral(0.176f, 0.99f));
-    ImGui::PushStyleColor(ImGuiCol_ChildBg, neutral(0.157f, 0.97f));
-    ImGui::PushStyleColor(ImGuiCol_Border, neutral(0.105f, 0.95f));
-    ImGui::PushStyleColor(ImGuiCol_Separator, neutral(0.105f, 0.95f));
-    ImGui::PushStyleColor(ImGuiCol_TitleBg,
-                          ImVec4(0.105f + accent.x * 0.15f, 0.105f + accent.y * 0.15f,
-                                 0.105f + accent.z * 0.15f, 0.99f));
-    ImGui::PushStyleColor(ImGuiCol_TitleBgActive,
-                          ImVec4(0.125f + accent.x * 0.24f, 0.125f + accent.y * 0.24f,
-                                 0.125f + accent.z * 0.24f, 1.0f));
-    ImGui::PushStyleColor(ImGuiCol_TabSelected,
-                          ImVec4(0.145f + accent.x * 0.20f, 0.145f + accent.y * 0.20f,
-                                 0.145f + accent.z * 0.20f, 1.0f));
-    ImGui::PushStyleColor(ImGuiCol_TabHovered,
-                          ImVec4(0.155f + accent.x * 0.17f, 0.155f + accent.y * 0.17f,
-                                 0.155f + accent.z * 0.17f, 1.0f));
-    ImGui::PushStyleColor(ImGuiCol_Text,
-                          ImVec4(0.74f + accent.x * 0.14f, 0.74f + accent.y * 0.14f,
-                                 0.74f + accent.z * 0.14f, 1.0f));
-    return 9;
+    const auto surface = [surface_opacity](const ImVec4& color, float alpha) {
+        return ImVec4(color.x, color.y, color.z, std::clamp(alpha * surface_opacity, 0.30f, 1.0f));
+    };
+    push(ImGuiCol_WindowBg, surface(tint(Palette::window, accent, 0.05f, 1.0f), 0.99f));
+    push(ImGuiCol_ChildBg, surface(tint(Palette::child, accent, 0.04f, 1.0f), 0.97f));
+    push(ImGuiCol_MenuBarBg, tint(Palette::child, accent, 0.20f, 1.0f));
+    push(ImGuiCol_Border, tint(Palette::border, accent, 0.30f, 1.0f));
+    push(ImGuiCol_Separator, tint(Palette::line, accent, 0.30f, 1.0f));
+    push(ImGuiCol_SeparatorHovered, with_alpha(accent, 0.75f));
+    push(ImGuiCol_SeparatorActive, accent);
+    push(ImGuiCol_TitleBg, tint(Palette::child, accent, 0.24f, 0.99f));
+    push(ImGuiCol_TitleBgActive, tint(Palette::child, accent, 0.58f, 1.0f));
+    push(ImGuiCol_TitleBgCollapsed, tint(Palette::child, accent, 0.18f, 0.90f));
+    push(ImGuiCol_Tab, tint(Palette::child, accent, 0.10f, 0.99f));
+    push(ImGuiCol_TabHovered, tint(Palette::window, accent, 0.50f, 1.0f));
+    push(ImGuiCol_TabSelected, tint(Palette::window, accent, 0.36f, 1.0f));
+    push(ImGuiCol_TabSelectedOverline, accent);
+    push(ImGuiCol_TabDimmed, tint(Palette::child, accent, 0.07f, 0.97f));
+    push(ImGuiCol_TabDimmedSelected, tint(Palette::window, accent, 0.20f, 1.0f));
+    push(ImGuiCol_TabDimmedSelectedOverline, with_alpha(accent, 0.45f));
+    push(ImGuiCol_Header, with_alpha(accent, 0.28f));
+    push(ImGuiCol_HeaderHovered, with_alpha(accent, 0.48f));
+    push(ImGuiCol_HeaderActive, with_alpha(accent, 0.72f));
+    push(ImGuiCol_CheckMark, tint(ImVec4(1.0f, 1.0f, 1.0f, 1.0f), accent, 0.70f, 1.0f));
+    push(ImGuiCol_SliderGrab, with_alpha(accent, 0.85f));
+    push(ImGuiCol_SliderGrabActive, accent);
+    push(ImGuiCol_ButtonHovered, tint(Palette::raised, accent, 0.40f, 1.0f));
+    push(ImGuiCol_ButtonActive, tint(Palette::raised, accent, 0.70f, 1.0f));
+    push(ImGuiCol_ResizeGrip, with_alpha(accent, 0.26f));
+    push(ImGuiCol_ResizeGripHovered, with_alpha(accent, 0.62f));
+    push(ImGuiCol_ResizeGripActive, accent);
+    push(ImGuiCol_TextSelectedBg, with_alpha(accent, 0.40f));
+    push(ImGuiCol_ScrollbarGrabActive, accent);
+    push(ImGuiCol_NavCursor, with_alpha(accent, 0.85f));
+    return pushed;
 }
 
+// Drawn across the top of the content area rather than the window frame: a
+// docked panel has no title bar, and that is exactly when telling one panel
+// from another is hardest.
 void draw_panel_accent_bar(const ImVec4& accent) {
     ImDrawList* draw_list = ImGui::GetWindowDrawList();
     if (!draw_list)
         return;
-    const ImVec2 position = ImGui::GetWindowPos();
-    const ImVec2 size = ImGui::GetWindowSize();
-    draw_list->AddLine(position, ImVec2(position.x + size.x, position.y),
-                       ImGui::GetColorU32(ImVec4(accent.x, accent.y, accent.z, 0.95f)), 2.0f);
+    const ImVec2 start = ImGui::GetCursorScreenPos();
+    const float width = std::max(1.0f, ImGui::GetContentRegionAvail().x);
+    draw_list->AddRectFilled(start, ImVec2(start.x + width, start.y + 3.0f),
+                             ImGui::GetColorU32(with_alpha(accent, 1.0f)), 1.5f);
+    ImGui::Dummy(ImVec2(width, 5.0f));
 }
 
 void render_toggle_key_setting() {
@@ -214,62 +293,6 @@ void render_diagnostics(const Snapshot &snapshot) {
 
 void render_reference_graph(const Snapshot& snapshot) {
     ReferenceGraphUI::render(snapshot);
-}
-
-const ImGuiPlatformMonitor* find_secondary_monitor(const ImGuiViewport* main_viewport) {
-    if (!main_viewport)
-        return nullptr;
-
-    const ImVec2 main_center(
-        main_viewport->WorkPos.x + main_viewport->WorkSize.x * 0.5f,
-        main_viewport->WorkPos.y + main_viewport->WorkSize.y * 0.5f);
-    const ImGuiPlatformIO& platform_io = ImGui::GetPlatformIO();
-    for (const ImGuiPlatformMonitor& monitor : platform_io.Monitors) {
-        const ImRect work_area(
-            monitor.WorkPos,
-            ImVec2(
-                monitor.WorkPos.x + monitor.WorkSize.x,
-                monitor.WorkPos.y + monitor.WorkSize.y));
-        if (!work_area.Contains(main_center))
-            return &monitor;
-    }
-    return nullptr;
-}
-
-void render_secondary_workspace(const ImGuiViewport* main_viewport) {
-    const ImGuiIO& io = ImGui::GetIO();
-    if ((io.ConfigFlags & (ImGuiConfigFlags_DockingEnable |
-                           ImGuiConfigFlags_ViewportsEnable)) !=
-        (ImGuiConfigFlags_DockingEnable | ImGuiConfigFlags_ViewportsEnable))
-        return;
-
-    const ImGuiPlatformMonitor* monitor = find_secondary_monitor(main_viewport);
-    if (!monitor || monitor->WorkSize.x <= 1.0f || monitor->WorkSize.y <= 1.0f)
-        return;
-
-    // Use a stationary host as the secondary monitor's docking target.
-    ImGuiWindowClass workspace_class{};
-    workspace_class.ViewportFlagsOverrideSet =
-        ImGuiViewportFlags_NoFocusOnAppearing | ImGuiViewportFlags_NoTaskBarIcon;
-    ImGui::SetNextWindowClass(&workspace_class);
-    ImGui::SetNextWindowPos(monitor->WorkPos, ImGuiCond_Always);
-    ImGui::SetNextWindowSize(monitor->WorkSize, ImGuiCond_Always);
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 0.0f);
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0f);
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.0f, 0.0f));
-    const ImGuiWindowFlags flags =
-        ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoCollapse |
-        ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
-        ImGuiWindowFlags_NoDocking | ImGuiWindowFlags_NoBringToFrontOnFocus |
-        ImGuiWindowFlags_NoNavFocus | ImGuiWindowFlags_NoBackground |
-        ImGuiWindowFlags_NoSavedSettings;
-    ImGui::Begin("URK Explorer Secondary Workspace##urk-secondary-workspace", nullptr, flags);
-    ImGui::PopStyleVar(3);
-    ImGui::DockSpace(
-        ImGui::GetID("URKExplorerSecondaryDockSpace"),
-        ImVec2(0.0f, 0.0f),
-        ImGuiDockNodeFlags_PassthruCentralNode);
-    ImGui::End();
 }
 
 } // namespace
@@ -367,137 +390,162 @@ void render() {
         dock_layout_initialized = true;
     }
     ImGui::DockSpaceOverViewport(dockspace_id, viewport, ImGuiDockNodeFlags_PassthruCentralNode);
-    render_secondary_workspace(viewport);
 
     ImGui::SetNextWindowPos(ImVec2(work_pos.x + 12.0f, work_pos.y + 12.0f), ImGuiCond_FirstUseEver);
-    ImGui::SetNextWindowSize(ImVec2(std::min(980.0f, work_size.x - 24.0f), 74.0f), ImGuiCond_FirstUseEver);
-    if (ImGui::Begin("URK Explorer Workspace", nullptr, ImGuiWindowFlags_NoCollapse)) {
+    ImGui::SetNextWindowSize(ImVec2(std::min(980.0f, work_size.x - 24.0f), 112.0f), ImGuiCond_FirstUseEver);
+    // Every entry used to be an identically shaped coloured button in one row,
+    // so "open a panel", "run an action" and "change a setting" were
+    // indistinguishable. Menus separate them by kind.
+    const ImVec4 workspace_accent(0.98f, 0.78f, 0.28f, 1.0f);
+    const int workspace_colors = push_panel_accent(workspace_accent, opacity);
+    if (ImGui::Begin("URK Explorer Workspace", nullptr,
+                     ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_MenuBar)) {
+        if (ImGui::BeginMenuBar()) {
+            if (ImGui::BeginMenu("Panels")) {
+                ImGui::MenuItem("Hierarchy", nullptr, &show_hierarchy);
+                ImGui::MenuItem("Inspector", nullptr, &show_inspector);
+                ImGui::MenuItem("Object Inspector", nullptr, &show_object_inspector);
+                ImGui::MenuItem("Class Browser", nullptr, &show_class_browser);
+                ImGui::Separator();
+                ImGui::MenuItem("Method Calls", nullptr, &show_method_traces);
+                ImGui::MenuItem("Value Watches", nullptr, &show_field_watches);
+                ImGui::MenuItem("Reference Graph", nullptr, &show_reference_graph);
+                ImGui::MenuItem("Activity Log", nullptr, &show_diagnostics);
+                ImGui::Separator();
+                if (ImGui::MenuItem("Runtime Monitor")) {
+                    show_method_traces = true;
+                    show_field_watches = true;
+                }
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("Opens Method Calls and Value Watches together");
+                ImGui::EndMenu();
+            }
+            if (ImGui::BeginMenu("Runtime")) {
+                bool live_data = snapshot->live_data;
+                if (ImGui::MenuItem("Live data", nullptr, &live_data)) {
+                    Command command{.kind = CommandKind::SetLiveData};
+                    command.bool_value = live_data;
+                    RuntimeModel::instance().enqueue(std::move(command));
+                }
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("Re-read inspected values from the running game every tick");
+                ImGui::BeginDisabled(!snapshot->camera_focus_active);
+                if (ImGui::MenuItem("Return camera"))
+                    enqueue_simple(CommandKind::RestoreCamera, 0);
+                ImGui::EndDisabled();
+                ImGui::EndMenu();
+            }
+            if (ImGui::BeginMenu("Settings")) {
+                ImGui::SeparatorText("Overlay");
+                ImGui::SetNextItemWidth(180.0f);
+                ImGui::SliderFloat("Panel background", &opacity, 0.35f, 1.0f, "%.2f");
+                ImGui::TextDisabled("Text, controls and borders remain opaque for readability.");
+                const bool multi_monitor =
+                    (ImGui::GetIO().ConfigFlags & ImGuiConfigFlags_ViewportsEnable) != 0;
+                ImGui::TextDisabled("Multi-monitor windows: %s",
+                                    multi_monitor ? "enabled" : "unavailable on this renderer");
+                if (multi_monitor)
+                    ImGui::TextDisabled("Drag a panel's tab out of the dock, then onto your other monitor.");
+                ImGui::SeparatorText("Controls");
+                render_toggle_key_setting();
+                ImGui::SeparatorText("Selection Highlight");
+                bool highlight_enabled = snapshot->highlight_enabled;
+                if (ImGui::Checkbox("Enabled", &highlight_enabled)) {
+                    Command command{.kind = CommandKind::SetHighlightEnabled};
+                    command.bool_value = highlight_enabled;
+                    RuntimeModel::instance().enqueue(std::move(command));
+                }
+                ImGui::BeginDisabled(!highlight_enabled);
+                ImGui::SetNextItemWidth(220.0f);
+                if (ImGui::DragFloat("Max distance", &highlight_max_distance, 10.0f, 0.0f, 100000.0f, "%.0f")) {
+                    highlight_max_distance = std::clamp(highlight_max_distance, 0.0f, 100000.0f);
+                    Command command{.kind = CommandKind::SetHighlightDistance};
+                    command.float_value = highlight_max_distance;
+                    RuntimeModel::instance().enqueue(std::move(command));
+                }
+                ImGui::SameLine();
+                ImGui::TextDisabled("0 = unlimited");
+                ImGui::EndDisabled();
+                ImGui::TextDisabled("Measured from the active game camera.");
+                ImGui::SeparatorText("Camera Focus");
+                bool camera_focus_top_down = snapshot->camera_focus_top_down;
+                if (ImGui::Checkbox("Force top-down view", &camera_focus_top_down)) {
+                    Command command{.kind = CommandKind::SetCameraFocusTopDown};
+                    command.bool_value = camera_focus_top_down;
+                    RuntimeModel::instance().enqueue(std::move(command));
+                }
+                float camera_focus_distance = snapshot->camera_focus_distance;
+                ImGui::SetNextItemWidth(220.0f);
+                if (ImGui::DragFloat(camera_focus_top_down ? "Top-down height / zoom" : "Focus distance / zoom",
+                                     &camera_focus_distance, 0.25f, 1.0f, 100.0f, "%.2f units")) {
+                    camera_focus_distance = std::clamp(camera_focus_distance, 1.0f, 100.0f);
+                    Command command{.kind = CommandKind::SetCameraFocusDistance};
+                    command.float_value = camera_focus_distance;
+                    RuntimeModel::instance().enqueue(std::move(command));
+                }
+                if (camera_focus_top_down) {
+                    float camera_focus_tilt = snapshot->camera_focus_tilt;
+                    ImGui::SetNextItemWidth(220.0f);
+                    if (ImGui::DragFloat("Perspective tilt", &camera_focus_tilt, 0.25f, 0.0f, 100.0f, "%.2f units")) {
+                        camera_focus_tilt = std::clamp(camera_focus_tilt, 0.0f, 100.0f);
+                        Command command{.kind = CommandKind::SetCameraFocusTilt};
+                        command.float_value = camera_focus_tilt;
+                        RuntimeModel::instance().enqueue(std::move(command));
+                    }
+                }
+                float camera_offset[3]{
+                    snapshot->camera_focus_offset.x,
+                    snapshot->camera_focus_offset.y,
+                    snapshot->camera_focus_offset.z,
+                };
+                ImGui::SetNextItemWidth(300.0f);
+                if (ImGui::DragFloat3("Target offset X/Y/Z", camera_offset, 0.1f, -10000.0f, 10000.0f, "%.2f")) {
+                    Command command{.kind = CommandKind::SetCameraFocusOffset};
+                    command.vector_value = {camera_offset[0], camera_offset[1], camera_offset[2]};
+                    RuntimeModel::instance().enqueue(std::move(command));
+                }
+                ImGui::SameLine();
+                if (ImGui::SmallButton("Reset##camera-offset")) {
+                    Command command{.kind = CommandKind::SetCameraFocusOffset};
+                    command.vector_value = {};
+                    RuntimeModel::instance().enqueue(std::move(command));
+                }
+                ImGui::TextDisabled(camera_focus_top_down
+                    ? "Height and tilt define the base view; X/Y/Z adds a world-space offset."
+                    : "Distance preserves the active view axis; X/Y/Z offsets the camera in world space.");
+                ImGui::EndMenu();
+            }
+            if (ImGui::BeginMenu("Help")) {
+                if (ImGui::MenuItem("Diagnostics"))
+                    show_diagnostics = true;
+                ImGui::Separator();
+                if (ImGui::MenuItem("GitHub"))
+                    ShellExecuteA(nullptr, "open", ModConfig::url, nullptr, nullptr, SW_SHOWNORMAL);
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("%s", ModConfig::url);
+                if (ImGui::MenuItem("Support"))
+                    ShellExecuteA(nullptr, "open", ModConfig::social, nullptr, nullptr, SW_SHOWNORMAL);
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("%s", ModConfig::social);
+                ImGui::EndMenu();
+            }
+            // Refresh is the one action that gets used constantly, so it stays a
+            // one-click button on the bar instead of living inside a menu.
+            ImGui::Separator();
+            if (workspace_button("Refresh", ImVec4(0.22f, 0.39f, 0.54f, 1.0f)))
+                enqueue_simple(CommandKind::Refresh, 0);
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Re-read the scene hierarchy from the running game");
+            ImGui::EndMenuBar();
+        }
         ImGui::TextColored(ImVec4(0.91f, 0.92f, 0.94f, 1.0f), "%s", ModConfig::display_name);
         ImGui::SameLine();
         ImGui::TextColored(ImVec4(0.42f, 0.69f, 0.91f, 1.0f), "%s", ModConfig::backend_name);
         ImGui::SameLine();
         ImGui::TextDisabled("Runtime Explorer  |  %s  |  v%s", ModConfig::author, ModConfig::version);
-        ImGui::Separator();
-        if (workspace_button("Panels", ImVec4(0.27f, 0.29f, 0.32f, 1.0f)))
-            ImGui::OpenPopup("##workspace-panels");
-        if (ImGui::BeginPopup("##workspace-panels")) {
-            ImGui::TextDisabled("Visible panels");
-            ImGui::Checkbox("Hierarchy", &show_hierarchy);
-            ImGui::Checkbox("Inspector", &show_inspector);
-            ImGui::Checkbox("Object Inspector", &show_object_inspector);
-            ImGui::Checkbox("Class Browser", &show_class_browser);
-            ImGui::Checkbox("Method Calls", &show_method_traces);
-            ImGui::Checkbox("Value Watches", &show_field_watches);
-            ImGui::Checkbox("Reference Graph", &show_reference_graph);
-            ImGui::Checkbox("Activity log", &show_diagnostics);
-            ImGui::EndPopup();
-        }
-        ImGui::SameLine();
-        if (workspace_button("Refresh", ImVec4(0.22f, 0.39f, 0.54f, 1.0f)))
-            enqueue_simple(CommandKind::Refresh, 0);
-        ImGui::SameLine();
-        if (workspace_button("Runtime Monitor", ImVec4(0.47f, 0.34f, 0.20f, 1.0f))) {
-            show_method_traces = true;
-            show_field_watches = true;
-        }
-        ImGui::SameLine();
-        if (workspace_button("Reference Graph", ImVec4(0.20f, 0.40f, 0.48f, 1.0f)))
-            show_reference_graph = true;
-        ImGui::SameLine();
-        if (workspace_button("Diagnostics", ImVec4(0.47f, 0.27f, 0.24f, 1.0f)))
-            show_diagnostics = true;
-        ImGui::SameLine();
-        if (workspace_button("Options", ImVec4(0.29f, 0.29f, 0.31f, 1.0f)))
-            ImGui::OpenPopup("##workspace-options");
-        ImGui::SameLine();
-        workspace_link_button("GitHub", ModConfig::url, ImVec4(0.24f, 0.34f, 0.44f, 1.0f));
-        ImGui::SameLine();
-        workspace_link_button("Support", ModConfig::social, ImVec4(0.88f, 0.66f, 0.13f, 1.0f),
-                              ImVec4(0.10f, 0.085f, 0.045f, 1.0f));
-        if (ImGui::BeginPopup("##workspace-options")) {
-            ImGui::SeparatorText("Overlay");
-            bool live_data = snapshot->live_data;
-            if (ImGui::Checkbox("Live Data", &live_data)) {
-                Command command{.kind = CommandKind::SetLiveData};
-                command.bool_value = live_data;
-                RuntimeModel::instance().enqueue(std::move(command));
-            }
-            ImGui::SetNextItemWidth(180.0f);
-            ImGui::SliderFloat("Panel background", &opacity, 0.35f, 1.0f, "%.2f");
-            ImGui::TextDisabled("Text, controls and borders remain opaque for readability.");
-            const bool multi_monitor =
-                (ImGui::GetIO().ConfigFlags & ImGuiConfigFlags_ViewportsEnable) != 0;
-            ImGui::TextDisabled("Multi-monitor windows: %s", multi_monitor ? "enabled" : "unavailable on this renderer");
-            if (multi_monitor)
-                ImGui::TextWrapped("Drag an undocked panel or tab outside the game window to place it on your other monitor.");
-            ImGui::SeparatorText("Controls");
-            render_toggle_key_setting();
-            ImGui::SeparatorText("Selection Highlight");
-            bool highlight_enabled = snapshot->highlight_enabled;
-            if (ImGui::Checkbox("Enabled", &highlight_enabled)) {
-                Command command{.kind = CommandKind::SetHighlightEnabled};
-                command.bool_value = highlight_enabled;
-                RuntimeModel::instance().enqueue(std::move(command));
-            }
-            ImGui::BeginDisabled(!highlight_enabled);
-            ImGui::SetNextItemWidth(220.0f);
-            if (ImGui::DragFloat("Max distance", &highlight_max_distance, 10.0f, 0.0f, 100000.0f, "%.0f")) {
-                highlight_max_distance = std::clamp(highlight_max_distance, 0.0f, 100000.0f);
-                Command command{.kind = CommandKind::SetHighlightDistance};
-                command.float_value = highlight_max_distance;
-                RuntimeModel::instance().enqueue(std::move(command));
-            }
+        if (!snapshot->live_data) {
             ImGui::SameLine();
-            ImGui::TextDisabled("0 = unlimited");
-            ImGui::EndDisabled();
-            ImGui::TextDisabled("Measured from the active game camera.");
-            ImGui::SeparatorText("Camera Focus");
-            bool camera_focus_top_down = snapshot->camera_focus_top_down;
-            if (ImGui::Checkbox("Force top-down view", &camera_focus_top_down)) {
-                Command command{.kind = CommandKind::SetCameraFocusTopDown};
-                command.bool_value = camera_focus_top_down;
-                RuntimeModel::instance().enqueue(std::move(command));
-            }
-            float camera_focus_distance = snapshot->camera_focus_distance;
-            ImGui::SetNextItemWidth(220.0f);
-            if (ImGui::DragFloat(camera_focus_top_down ? "Top-down height / zoom" : "Focus distance / zoom",
-                                 &camera_focus_distance, 0.25f, 1.0f, 100.0f, "%.2f units")) {
-                camera_focus_distance = std::clamp(camera_focus_distance, 1.0f, 100.0f);
-                Command command{.kind = CommandKind::SetCameraFocusDistance};
-                command.float_value = camera_focus_distance;
-                RuntimeModel::instance().enqueue(std::move(command));
-            }
-            if (camera_focus_top_down) {
-                float camera_focus_tilt = snapshot->camera_focus_tilt;
-                ImGui::SetNextItemWidth(220.0f);
-                if (ImGui::DragFloat("Perspective tilt", &camera_focus_tilt, 0.25f, 0.0f, 100.0f, "%.2f units")) {
-                    camera_focus_tilt = std::clamp(camera_focus_tilt, 0.0f, 100.0f);
-                    Command command{.kind = CommandKind::SetCameraFocusTilt};
-                    command.float_value = camera_focus_tilt;
-                    RuntimeModel::instance().enqueue(std::move(command));
-                }
-            }
-            float camera_offset[3]{
-                snapshot->camera_focus_offset.x,
-                snapshot->camera_focus_offset.y,
-                snapshot->camera_focus_offset.z,
-            };
-            ImGui::SetNextItemWidth(300.0f);
-            if (ImGui::DragFloat3("Target offset X/Y/Z", camera_offset, 0.1f, -10000.0f, 10000.0f, "%.2f")) {
-                Command command{.kind = CommandKind::SetCameraFocusOffset};
-                command.vector_value = {camera_offset[0], camera_offset[1], camera_offset[2]};
-                RuntimeModel::instance().enqueue(std::move(command));
-            }
-            ImGui::SameLine();
-            if (ImGui::SmallButton("Reset##camera-offset")) {
-                Command command{.kind = CommandKind::SetCameraFocusOffset};
-                command.vector_value = {};
-                RuntimeModel::instance().enqueue(std::move(command));
-            }
-            ImGui::TextDisabled(camera_focus_top_down
-                ? "Height and tilt define the base view; X/Y/Z adds a world-space offset."
-                : "Distance preserves the active view axis; X/Y/Z offsets the camera in world space.");
-            ImGui::EndPopup();
+            ImGui::TextColored(ImVec4(0.80f, 0.71f, 0.45f, 1.0f), "|  live data off");
         }
         if (snapshot->camera_focus_active) {
             ImGui::SameLine();
@@ -506,14 +554,20 @@ void render() {
             if (ImGui::IsItemHovered())
                 ImGui::SetTooltip("Restore the camera pose saved before focusing");
         }
+        // The result of the last command used to be visible only in the Activity
+        // Log, so a rejected trace or write looked like the button did nothing.
+        ImGui::TextDisabled("%s", snapshot->status.empty() ? "Ready" : snapshot->status.c_str());
+        if (ImGui::IsItemHovered() && !snapshot->status.empty())
+            ImGui::SetTooltip("%s", snapshot->status.c_str());
     }
     ImGui::End();
+    ImGui::PopStyleColor(workspace_colors);
 
     if (show_hierarchy) {
         ImGui::SetNextWindowPos(ImVec2(work_pos.x + 12.0f, work_pos.y + 120.0f), ImGuiCond_FirstUseEver);
         ImGui::SetNextWindowSize(ImVec2(std::max(300.0f, work_size.x * 0.26f), std::max(420.0f, work_size.y * 0.72f)),
                                  ImGuiCond_FirstUseEver);
-        const ImVec4 accent(0.24f, 0.56f, 0.52f, 1.0f);
+        const ImVec4 accent(0.16f, 0.76f, 0.62f, 1.0f);
         const int panel_colors = push_panel_accent(accent, opacity);
         if (ImGui::Begin("Hierarchy##urk-hierarchy", &show_hierarchy, ImGuiWindowFlags_NoCollapse)) {
             draw_panel_accent_bar(accent);
@@ -533,7 +587,7 @@ void render() {
             ImGui::SetNextWindowSize(ImVec2(inspector_width, std::max(480.0f, work_size.y * 0.80f)),
                                      ImGuiCond_FirstUseEver);
         const std::string title = "Inspector###urk-inspector";
-        const ImVec4 accent(0.32f, 0.50f, 0.74f, 1.0f);
+        const ImVec4 accent(0.29f, 0.60f, 0.98f, 1.0f);
         const int panel_colors = push_panel_accent(accent, opacity);
         if (ImGui::Begin(title.c_str(), &show_inspector, ImGuiWindowFlags_NoCollapse)) {
             draw_panel_accent_bar(accent);
@@ -551,7 +605,7 @@ void render() {
         const std::string title = snapshot->object_inspector.valid
                                       ? "Object Inspector - " + snapshot->object_inspector.type_name + "###urk-object"
                                       : "Object Inspector###urk-object";
-        const ImVec4 accent(0.48f, 0.62f, 0.42f, 1.0f);
+        const ImVec4 accent(0.55f, 0.80f, 0.30f, 1.0f);
         const int panel_colors = push_panel_accent(accent, opacity);
         if (ImGui::Begin(title.c_str(), &show_object_inspector, ImGuiWindowFlags_NoCollapse)) {
             draw_panel_accent_bar(accent);
@@ -565,7 +619,7 @@ void render() {
         ImGui::SetNextWindowPos(ImVec2(work_pos.x + work_size.x * 0.20f, work_pos.y + 150.0f), ImGuiCond_FirstUseEver);
         ImGui::SetNextWindowSize(ImVec2(std::max(520.0f, work_size.x * 0.42f), std::max(520.0f, work_size.y * 0.74f)),
                                  ImGuiCond_FirstUseEver);
-        const ImVec4 accent(0.56f, 0.45f, 0.73f, 1.0f);
+        const ImVec4 accent(0.68f, 0.47f, 0.98f, 1.0f);
         const int panel_colors = push_panel_accent(accent, opacity);
         if (ImGui::Begin("Class Browser###urk-class-browser", &show_class_browser, ImGuiWindowFlags_NoCollapse)) {
             draw_panel_accent_bar(accent);
@@ -580,7 +634,7 @@ void render() {
         ImGui::SetNextWindowSize(ImVec2(std::max(680.0f, work_size.x * 0.58f), std::max(420.0f, work_size.y * 0.62f)),
                                  ImGuiCond_FirstUseEver);
         const std::string title = "Runtime Monitor - Calls (" + std::to_string(snapshot->method_traces.size()) + ")###urk-method-traces";
-        const ImVec4 accent(0.72f, 0.51f, 0.30f, 1.0f);
+        const ImVec4 accent(0.98f, 0.62f, 0.20f, 1.0f);
         const int panel_colors = push_panel_accent(accent, opacity);
         if (ImGui::Begin(title.c_str(), &show_method_traces, ImGuiWindowFlags_NoCollapse)) {
             draw_panel_accent_bar(accent);
@@ -596,7 +650,7 @@ void render() {
                                  ImGuiCond_FirstUseEver);
         const std::string title =
             "Runtime Monitor - Values (" + std::to_string(snapshot->field_watches.size()) + ")###urk-field-watches";
-        const ImVec4 accent(0.63f, 0.42f, 0.54f, 1.0f);
+        const ImVec4 accent(0.96f, 0.40f, 0.64f, 1.0f);
         const int panel_colors = push_panel_accent(accent, opacity);
         if (ImGui::Begin(title.c_str(), &show_field_watches, ImGuiWindowFlags_NoCollapse)) {
             draw_panel_accent_bar(accent);
@@ -610,9 +664,9 @@ void render() {
         ImGui::SetNextWindowPos(ImVec2(work_pos.x + work_size.x * 0.18f, work_pos.y + 145.0f), ImGuiCond_FirstUseEver);
         ImGui::SetNextWindowSize(ImVec2(std::max(760.0f, work_size.x * 0.62f),
                                        std::max(480.0f, work_size.y * 0.68f)), ImGuiCond_FirstUseEver);
-        const int panel_colors = push_panel_accent(ImVec4(0.31f, 0.55f, 0.68f, 1.0f), opacity);
+        const int panel_colors = push_panel_accent(ImVec4(0.24f, 0.74f, 0.94f, 1.0f), opacity);
         if (ImGui::Begin("Reference Graph###urk-reference-graph", &show_reference_graph, ImGuiWindowFlags_NoCollapse)) {
-            draw_panel_accent_bar(ImVec4(0.31f, 0.55f, 0.68f, 1.0f));
+            draw_panel_accent_bar(ImVec4(0.24f, 0.74f, 0.94f, 1.0f));
             render_reference_graph(*snapshot);
         }
         ImGui::End();
@@ -624,7 +678,7 @@ void render() {
         ImGui::SetNextWindowSize(ImVec2(std::min(760.0f, work_size.x - 60.0f), 230.0f), ImGuiCond_FirstUseEver);
         const std::string title =
             "Activity Log (" + std::to_string(snapshot->diagnostics.size()) + ")###urk-diagnostics";
-        const ImVec4 accent(0.68f, 0.40f, 0.34f, 1.0f);
+        const ImVec4 accent(0.96f, 0.40f, 0.34f, 1.0f);
         const int panel_colors = push_panel_accent(accent, opacity);
         if (ImGui::Begin(title.c_str(), &show_diagnostics)) {
             draw_panel_accent_bar(accent);

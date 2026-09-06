@@ -131,6 +131,11 @@ TraceId last_started_id();
 bool stop(const URK::managed::Method *method);
 bool stop(TraceId id);
 bool clear(TraceId id);
+// Upgrades a running entry-hook trace to the stub that also records return
+// values, keeping the trace's identity, tab and metadata. Calls recorded so far
+// are dropped: they carry no return, and mixing them with the ones that do is
+// how "Returns: not recorded" ends up looking like a bug.
+bool capture_returns(TraceId id, std::string &error);
 bool close(TraceId id);
 void stop_all();
 void shutdown();

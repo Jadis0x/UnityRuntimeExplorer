@@ -376,6 +376,14 @@ struct Snapshot {
     std::shared_ptr<const ComponentInfo::Metadata> class_browser_members;
     std::size_t class_browser_scanned_objects = 0;
     std::size_t class_browser_static_roots = 0;
+    std::size_t class_browser_scene_roots = 0;
+    // Progress of the managed method -> native address index that turns a
+    // trace's "GameAssembly.dll+0x..." caller into a method name.
+    bool caller_index_active = false;
+    bool caller_index_built = false;
+    bool caller_index_supported = true;
+    std::size_t caller_index_methods = 0;
+    std::size_t caller_index_classes = 0;
     bool class_browser_scan_truncated = false;
     bool class_browser_scan_active = false;
     InspectorInfo inspector;

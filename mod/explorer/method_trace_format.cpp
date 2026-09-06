@@ -113,7 +113,7 @@ ArgumentView argument_view(const MethodTracer::Snapshot& trace,
 
     if (by_ref && (index >= record.argument_byref_value_bytes.size() ||
                    record.argument_byref_value_bytes[index].empty())) {
-        argument.value = "<by-reference value unavailable; see Raw ABI>";
+        argument.value = "ref parameter - the runtime did not expose the value behind it";
         return argument;
     }
     const std::uint64_t value = by_ref ? byref_value(record, index) : record.arguments[index];
@@ -125,11 +125,14 @@ ArgumentView argument_view(const MethodTracer::Snapshot& trace,
         return argument;
     }
 
+    bool placeholder = false;
     if (opaque) {
-        argument.value = "<runtime-specific value; see Raw ABI>";
+        argument.value = "runtime-internal value - see Raw ABI";
+        placeholder = true;
     } else if (reference) {
         argument.inspectable_reference = value != 0;
-        argument.value = value == 0 ? "null" : "<reference unavailable>";
+        placeholder = value != 0;
+        argument.value = value == 0 ? "null" : "object - its value could not be read";
     } else if (is_enum) {
         const std::string_view underlying =
             index < trace.parameter_enum_underlying_types.size()
@@ -139,11 +142,15 @@ ArgumentView argument_view(const MethodTracer::Snapshot& trace,
     } else {
         argument.value = scalar_value(argument.type, value);
         if (argument.value.empty()) {
-            argument.value = aggregate ? "<value type; see Raw ABI>"
-                                       : "<unsupported scalar; see Raw ABI>";
+            argument.value = aggregate ? "struct value - not decoded, see Raw ABI"
+                                       : "unrecognised numeric type - see Raw ABI";
+            placeholder = true;
         }
     }
-    argument.readable = !argument.value.empty() && argument.value.find("<") == std::string::npos;
+    // Placeholders are tracked explicitly: the styling used to key off an angle
+    // bracket in the text, which quietly turned every plain-English fallback
+    // into something the viewer coloured as a real decoded value.
+    argument.readable = !placeholder && !argument.value.empty();
     return argument;
 }
 
@@ -293,22 +300,23 @@ std::string result(const MethodTracer::Snapshot& trace, const MethodTracer::Reco
     if (type_is(trace.return_type, "System.Void", "Void", "void"))
         return "void";
     if (!record.return_captured)
-        return trace.captures_return ? "<pending return>" : "<not captured: entry hook>";
+        return trace.captures_return ? "waiting for this call to return"
+                                     : "not recorded - this trace watches the call, not the return";
     if (!record.return_display.empty())
         return record.return_display;
     if (trace.return_is_opaque)
-        return "<runtime-specific return; see Raw ABI>";
+        return "runtime-internal value - see Raw ABI";
     if (trace.return_is_enum) {
         return enum_value(trace.return_type, trace.return_enum_underlying_type,
                           trace.return_is_floating ? record.return_xmm_low : record.return_rax);
     }
     if (trace.return_uses_indirect_abi)
-        return "<value type captured; decoding unavailable>";
+        return "struct return - this runtime does not expose its fields";
     const std::uint64_t raw = trace.return_is_floating ? record.return_xmm_low : record.return_rax;
     if (trace.return_is_reference)
-        return raw == 0 ? "null" : "<reference unavailable>";
+        return raw == 0 ? "null" : "object - its value could not be read";
     const std::string decoded = scalar_value(trace.return_type, raw);
-    return decoded.empty() ? "<unsupported scalar; see Raw ABI>" : decoded;
+    return decoded.empty() ? "unrecognised numeric type - see Raw ABI" : decoded;
 }
 
 std::string raw_result(const MethodTracer::Snapshot& trace, const MethodTracer::Record& record) {

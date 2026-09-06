@@ -68,6 +68,8 @@ enum class CommandKind {
     ExportDiagnosticBundle = 59,
     BuildReferenceGraph = 60,
     ClearReferenceGraph = 61,
+    CaptureMethodTraceReturns = 62,
+    BuildManagedCallerIndex = 63,
 };
 
 struct Command {

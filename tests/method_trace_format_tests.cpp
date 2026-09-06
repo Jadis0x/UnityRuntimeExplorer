@@ -92,8 +92,10 @@ int main() {
     trace.parameter_is_value_type[0] = true;
     trace.parameter_is_enum[0] = false;
     const auto aggregate = MethodTraceFormat::arguments(trace, record);
-    require(aggregate[0].value == "<value type; see Raw ABI>", "aggregate value must not masquerade as a pointer");
+    require(aggregate[0].value == "struct value - not decoded, see Raw ABI",
+            "aggregate value must not masquerade as a pointer");
     require(aggregate[0].value.find("0x") == std::string::npos, "raw ABI must stay out of friendly values");
+    require(!aggregate[0].readable, "an undecoded placeholder must not be styled as a decoded value");
 
     record.argument_displays = {"Example.LargeStruct {state=3, flags=Ready}"};
     record.argument_readable = {true};
@@ -139,10 +141,11 @@ int main() {
     record.return_captured = false;
     record.return_display.clear();
     trace.captures_return = false;
-    require(MethodTraceFormat::result(trace, record) == "<not captured: entry hook>",
+    require(MethodTraceFormat::result(trace, record) ==
+                "not recorded - this trace watches the call, not the return",
             "an entry-hook trace must say the return was never captured");
     trace.captures_return = true;
-    require(MethodTraceFormat::result(trace, record) == "<pending return>",
+    require(MethodTraceFormat::result(trace, record) == "waiting for this call to return",
             "a return-capturing trace still reports an unfinished call as pending");
 
     std::cout << "method trace formatting contract passed\n";

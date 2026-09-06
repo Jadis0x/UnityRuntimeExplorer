@@ -85,6 +85,18 @@ struct RuntimeModel::ClassInstanceScan {
 	Clock::time_point started{};
 };
 
+// Walks every loaded assembly's classes and remembers each method's native
+// entry point, so a trace record's raw return address can be named. Sliced the
+// same way the instance scan is: a full IL2CPP image holds hundreds of
+// thousands of methods and doing it in one go would stall the game.
+struct RuntimeModel::CallerIndexScan {
+	std::size_t assembly_index = 0;
+	std::size_t class_index = 0;
+	std::size_t indexed_methods = 0;
+	std::size_t scanned_classes = 0;
+	Clock::time_point started{};
+};
+
 // Command queue processing debounces destroy-triggered refreshes so a burst
 // of native lifecycle events collapses into a single hierarchy rescan.
 inline constexpr auto kEventRefreshDebounce = std::chrono::milliseconds(180);

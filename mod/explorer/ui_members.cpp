@@ -1524,17 +1524,19 @@ namespace {
 } // namespace
 } // namespace
 void render_trace_button(const std::function<void(bool)> &start_trace) {
+    // Return capture used to hide behind a right-click, so the common outcome
+    // was a trace whose every row reported no return and no way to say why.
     if (ImGui::SmallButton("Trace"))
         start_trace(false);
     if (ImGui::IsItemHovered())
-        ImGui::SetTooltip("Record arguments, caller and timing with a mid-function hook.\n"
-                          "Right-click to also capture return values.");
-    if (ImGui::BeginPopupContextItem("##trace-options")) {
-        if (ImGui::MenuItem("Trace with return values"))
-            start_trace(true);
-        ImGui::TextDisabled("Rewrites the return address. Avoid on methods that throw.");
-        ImGui::EndPopup();
-    }
+        ImGui::SetTooltip("Records arguments, caller, thread and timing for every call.\n"
+                          "Return values are NOT recorded - use \"Trace + returns\" for those.");
+    ImGui::SameLine();
+    if (ImGui::SmallButton("Trace + returns"))
+        start_trace(true);
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Records everything above plus what the method returns.\n"
+                          "Rewrites the return address, so avoid it on methods that throw.");
 }
 namespace {
 } // namespace

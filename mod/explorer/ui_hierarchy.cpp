@@ -210,6 +210,11 @@ void render_hierarchy(const HierarchyInfo &hierarchy, int selected_instance_id,
         ImGui::EndPopup();
     }
     ImGui::SameLine();
+    if (ImGui::SmallButton("Refresh"))
+        enqueue_simple(CommandKind::Refresh, 0);
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Re-read the scene hierarchy from the running game");
+    ImGui::SameLine();
     const float mode_width = std::min(155.0f, ImGui::GetContentRegionAvail().x * 0.38f);
     ImGui::SetNextItemWidth(std::max(100.0f, ImGui::GetContentRegionAvail().x - mode_width -
                                              ImGui::GetStyle().ItemSpacing.x));

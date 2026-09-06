@@ -1097,6 +1097,52 @@ bool clear(TraceId id) {
     return false;
 }
 
+bool capture_returns(TraceId id, std::string &error) {
+    std::lock_guard lock(g_state.control_mutex);
+    for (const auto &session : g_state.sessions) {
+        if (session->id != id)
+            continue;
+        if (session->captures_return) {
+            error = "This trace already records return values";
+            return false;
+        }
+        if (session->detach_pending.load(std::memory_order_acquire)) {
+            error = "A call is still unwinding through this hook; try again in a moment";
+            return false;
+        }
+        if (session->active.load(std::memory_order_acquire) && !deactivate(*session)) {
+            error = "A call is still running inside this method; try again in a moment";
+            return false;
+        }
+        if (session->mid_hook) {
+            error = "The runtime would not detach the existing entry hook";
+            return false;
+        }
+        if (!create_stub(*session, error))
+            return false;
+        session->captures_return = true;
+        reset_records(*session);
+        g_state.diagnostic.clear();
+        if (!attach_session(*session, session->method_name.c_str())) {
+            error = g_state.diagnostic.empty() ? "The runtime refused to re-hook this method for return capture"
+                                               : g_state.diagnostic;
+            // Leave the session as the entry hook it was, minus the hook itself:
+            // stopped, but re-startable from the member row.
+            session->captures_return = false;
+            VirtualFree(session->stub, 0, MEM_RELEASE);
+            session->stub = nullptr;
+            return false;
+        }
+        session->flight_state.store(HookSession::flight_accepting, std::memory_order_release);
+        session->active.store(true, std::memory_order_release);
+        g_state.last_started_id = session->id;
+        error.clear();
+        return true;
+    }
+    error = "This trace is no longer available";
+    return false;
+}
+
 bool close(TraceId id) {
     std::lock_guard lock(g_state.control_mutex);
     for (auto it = g_state.sessions.begin(); it != g_state.sessions.end(); ++it) {

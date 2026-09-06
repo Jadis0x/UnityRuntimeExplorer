@@ -178,6 +178,8 @@ namespace Explorer {
 		update_pending_scene_load();
 		if (class_instance_scan_)
 			continue_class_instance_scan();
+		if (caller_index_scan_)
+			continue_managed_caller_index();
 
 		const Clock::time_point now = Clock::now();
 		update_camera_focus();
@@ -484,7 +486,9 @@ namespace Explorer {
 			command.kind == CommandKind::SetArrayPage || command.kind == CommandKind::RefreshByteArrayInspection ||
 			command.kind == CommandKind::InvokeMethod ||
 			command.kind == CommandKind::SetMethodTrace || command.kind == CommandKind::ClearMethodTrace ||
-			command.kind == CommandKind::CloseMethodTrace || command.kind == CommandKind::SetFieldWatch ||
+			command.kind == CommandKind::CloseMethodTrace ||
+			command.kind == CommandKind::CaptureMethodTraceReturns ||
+			command.kind == CommandKind::BuildManagedCallerIndex || command.kind == CommandKind::SetFieldWatch ||
 			command.kind == CommandKind::ConfigureFieldWatch ||
 			command.kind == CommandKind::BuildReferenceGraph || command.kind == CommandKind::ClearReferenceGraph ||
 			command.kind == CommandKind::ClearFieldWatch || command.kind == CommandKind::CloseFieldWatch ||
@@ -577,6 +581,14 @@ namespace Explorer {
 			return;
 		case CommandKind::CloseMethodTrace:
 			close_method_trace(command.reference_token);
+			publish();
+			return;
+		case CommandKind::CaptureMethodTraceReturns:
+			capture_method_trace_returns(command.reference_token);
+			publish();
+			return;
+		case CommandKind::BuildManagedCallerIndex:
+			build_managed_caller_index();
 			publish();
 			return;
 		case CommandKind::SetFieldWatch:
@@ -1103,6 +1115,8 @@ namespace Explorer {
 		case CommandKind::SampleMemberValue: return "Read member";
 		case CommandKind::InvokeMethod: return "Execute method";
 		case CommandKind::SetMethodTrace: return "Configure method trace";
+		case CommandKind::CaptureMethodTraceReturns: return "Record method trace returns";
+		case CommandKind::BuildManagedCallerIndex: return "Index managed caller names";
 		case CommandKind::SetFieldWatch: return "Configure value watch";
 		case CommandKind::ConfigureFieldWatch: return "Configure watch alarm";
 		case CommandKind::ExportDiagnosticBundle: return "Export diagnostic bundle";
@@ -1171,6 +1185,11 @@ namespace Explorer {
 
 	void RuntimeModel::publish() {
 		working_.runtime_backend = ModConfig::backend_name;
+#if defined(URK_BACKEND_MONO)
+		// Mono resolves a method's native code by JIT-compiling it, and compiling
+		// arbitrary metadata methods can fault, so the address index is IL2CPP only.
+		working_.caller_index_supported = false;
+#endif
 		working_.runtime_capabilities = URK::runtime_capabilities();
 		if (working_.unity_version.empty())
 			working_.unity_version = unity_version_text();

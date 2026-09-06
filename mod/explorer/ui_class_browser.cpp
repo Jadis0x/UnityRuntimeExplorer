@@ -470,9 +470,9 @@ void render_class_browser(const Snapshot &snapshot) {
     if (snapshot.class_browser_query.full_name == state.selected.full_name &&
         snapshot.class_browser_query.image == state.selected.image) {
         ImGui::SeparatorText("Instances");
-        ImGui::TextDisabled("%zu result(s) | %zu reachable objects | %zu static roots%s",
+        ImGui::TextDisabled("%zu result(s) | %zu reachable objects | %zu scene roots | %zu static roots%s",
                             snapshot.class_browser_instances.size(), snapshot.class_browser_scanned_objects,
-                            snapshot.class_browser_static_roots,
+                            snapshot.class_browser_scene_roots, snapshot.class_browser_static_roots,
                             snapshot.class_browser_scan_truncated ? " (scan cap reached)" : "");
         if (snapshot.class_browser_scan_active) {
             ImGui::SameLine();

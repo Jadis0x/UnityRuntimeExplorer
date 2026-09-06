@@ -50,6 +50,8 @@ class RuntimeModel {
     void load_component_class_catalog();
     void load_class_browser_catalog();
     void find_class_instances(const Command &command);
+    struct ClassInstanceScan;
+    std::size_t seed_scene_component_roots(ClassInstanceScan &scan);
     void build_reference_graph(const Command &command);
     void clear_reference_graph();
     void continue_class_instance_scan();
@@ -71,6 +73,10 @@ class RuntimeModel {
     void set_method_trace(const Command &command);
     void clear_method_trace(MethodTracer::TraceId id);
     void close_method_trace(MethodTracer::TraceId id);
+    void capture_method_trace_returns(MethodTracer::TraceId id);
+    struct CallerIndexScan;
+    void build_managed_caller_index();
+    void continue_managed_caller_index();
     void set_field_watch(const Command &command);
     void configure_field_watch(const Command &command);
     void clear_field_watch(std::uint64_t id);
@@ -171,8 +177,8 @@ class RuntimeModel {
     std::string active_metadata_stage_;
     std::shared_ptr<const ComponentClassCatalog> component_class_catalog_;
     std::shared_ptr<const ClassBrowserCatalog> class_browser_catalog_;
-    struct ClassInstanceScan;
     std::unique_ptr<ClassInstanceScan> class_instance_scan_;
+    std::unique_ptr<CallerIndexScan> caller_index_scan_;
     ComponentReflection class_browser_reflection_;
     std::unordered_map<std::uint64_t, URK::Unity::Inspect::ObjectHandle> class_browser_handles_;
     std::unordered_map<std::uint64_t, URK::Unity::Inspect::ObjectHandle> class_browser_static_handles_;
@@ -245,6 +251,7 @@ class RuntimeModel {
     Clock::time_point next_field_watch_refresh_{};
     Clock::time_point next_trace_publish_{};
     Clock::time_point next_class_scan_publish_{};
+    Clock::time_point next_caller_index_publish_{};
     bool event_refresh_pending_ = false;
     bool live_data_ = false;
     std::atomic<bool> native_faulted_{false};

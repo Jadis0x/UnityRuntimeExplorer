@@ -27,13 +27,52 @@ std::string short_field_component_name(std::string_view type_name) {
     return separator == std::string_view::npos ? std::string(type_name) : std::string(type_name.substr(separator + 1));
 }
 
+
+// -1 collapses every component on the next frame, +1 expands, 0 leaves the
+// per-component state alone. Consumed once per inspector frame.
+int &component_bulk_toggle() {
+    static int state = 0;
+    return state;
+}
+
 void render_components(const InspectorInfo &info, const Snapshot &snapshot, int only_component_id = 0,
                        const char *fixed_filter = nullptr, bool show_inherited = false) {
     const bool live_data = snapshot.live_data;
+    const std::string_view inspector_filter(fixed_filter ? fixed_filter : "");
+    const bool searching = !inspector_filter.empty();
+    const int bulk_toggle = component_bulk_toggle();
+    component_bulk_toggle() = 0;
     for (const ComponentInfo &component : info.components) {
         if (only_component_id != 0 && component.instance_id != only_component_id)
             continue;
         ImGui::PushID(component.instance_id);
+        const std::string display_type = short_field_component_name(component.type_name);
+        // While a search is running the list shows only components that can
+        // answer it. A component whose metadata has not arrived yet cannot be
+        // judged, so it stays visible until its members are known.
+        if (searching && component.metadata && !component.metadata_unavailable &&
+            !contains_case_insensitive(component.type_name, inspector_filter)) {
+            const ComponentInfo::Metadata &probe = *component.metadata;
+            const auto in_scope = [&](std::string_view declaring) {
+                return show_inherited || declaring.empty() || declaring == component.type_name;
+            };
+            bool any_match = false;
+            for (const auto &field : probe.fields)
+                any_match = any_match || (in_scope(field.declaring_type) &&
+                                          member_matches_filter(field.name, field.type_name, field.declaring_type,
+                                                                inspector_filter));
+            for (const auto &property : probe.properties)
+                any_match = any_match || (in_scope(property.declaring_type) &&
+                                          member_matches_filter(property.name, property.type_name,
+                                                                property.declaring_type, inspector_filter));
+            for (const auto &method : probe.methods)
+                any_match = any_match ||
+                            (in_scope(method.declaring_type) && method_matches_filter(method, inspector_filter));
+            if (!any_match) {
+                ImGui::PopID();
+                continue;
+            }
+        }
         if (component.enabled_supported) {
             bool enabled = component.enabled;
             if (ImGui::Checkbox("##enabled", &enabled)) {
@@ -48,18 +87,42 @@ void render_components(const InspectorInfo &info, const Snapshot &snapshot, int 
         } else
             ImGui::Dummy(ImVec2(ImGui::GetFrameHeight(), ImGui::GetFrameHeight()));
         ImGui::SameLine();
-        ImGui::PushStyleColor(ImGuiCol_Header, ImVec4(0.235f, 0.240f, 0.248f, 1.0f));
-        ImGui::PushStyleColor(ImGuiCol_HeaderHovered, ImVec4(0.285f, 0.292f, 0.302f, 1.0f));
-        ImGui::PushStyleColor(ImGuiCol_HeaderActive, ImVec4(0.315f, 0.325f, 0.338f, 1.0f));
-        const std::string display_type = short_field_component_name(component.type_name);
+        // The expanded component wears a lit header; the closed ones stay a flat
+        // slab. That is the whole "which component am I in" cue, and it beats
+        // drawing a marker line next to the body.
+        const bool was_open = ImGui::TreeNodeGetOpen(ImGui::GetID("##component"));
+        ImGui::PushStyleColor(ImGuiCol_Header, was_open ? ImVec4(0.157f, 0.294f, 0.451f, 1.0f)
+                                                        : ImVec4(0.145f, 0.157f, 0.180f, 1.0f));
+        ImGui::PushStyleColor(ImGuiCol_HeaderHovered, was_open ? ImVec4(0.196f, 0.361f, 0.545f, 1.0f)
+                                                               : ImVec4(0.196f, 0.212f, 0.243f, 1.0f));
+        ImGui::PushStyleColor(ImGuiCol_HeaderActive, ImVec4(0.220f, 0.412f, 0.616f, 1.0f));
+        // Components start closed: a GameObject with a dozen of them used to
+        // open as one undifferentiated wall of members. A search still needs to
+        // reach inside, so it forces its matches open.
+        if (searching)
+            ImGui::SetNextItemOpen(true, ImGuiCond_Always);
+        else if (bulk_toggle != 0)
+            ImGui::SetNextItemOpen(bulk_toggle > 0, ImGuiCond_Always);
+        else if (only_component_id != 0)
+            ImGui::SetNextItemOpen(true, ImGuiCond_FirstUseEver);
         const bool open = ImGui::TreeNodeEx("##component",
                                             ImGuiTreeNodeFlags_OpenOnArrow | ImGuiTreeNodeFlags_OpenOnDoubleClick |
                                                 ImGuiTreeNodeFlags_SpanAvailWidth | ImGuiTreeNodeFlags_Framed |
-                                                ImGuiTreeNodeFlags_FramePadding | ImGuiTreeNodeFlags_DefaultOpen,
+                                                ImGuiTreeNodeFlags_FramePadding,
                                             "%s", display_type.c_str());
         ImGui::PopStyleColor(3);
         if (ImGui::IsItemHovered())
             ImGui::SetTooltip("%s\nRight-click for component actions", component.type_name.c_str());
+        // The namespace rides on the right of the header so two components whose
+        // short names collide stay distinguishable while collapsed.
+        if (!component.namespace_name.empty()) {
+            const float label_width = ImGui::CalcTextSize(component.namespace_name.c_str()).x;
+            const float right_edge = ImGui::GetContentRegionMax().x - label_width - ImGui::GetStyle().FramePadding.x;
+            if (right_edge > ImGui::GetCursorPosX() + 40.0f) {
+                ImGui::SameLine(right_edge);
+                ImGui::TextDisabled("%s", component.namespace_name.c_str());
+            }
+        }
         if (ImGui::BeginPopupContextItem("##component-context")) {
             if (ImGui::MenuItem("Copy Component Pointer"))
                 ImGui::SetClipboardText(component.pointer_text.c_str());
@@ -76,6 +139,10 @@ void render_components(const InspectorInfo &info, const Snapshot &snapshot, int 
             ImGui::EndPopup();
         }
         if (open) {
+            ImGui::Indent(12.0f);
+            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.63f, 0.74f, 0.85f, 1.0f));
+            ImGui::TextWrapped("%s", component.type_name.c_str());
+            ImGui::PopStyleColor();
             render_type_details("Runtime Type", component.assembly_name, component.namespace_name,
                                 component.class_name, component.type_name, false);
             if (!component.metadata) {
@@ -421,9 +488,11 @@ void render_components(const InspectorInfo &info, const Snapshot &snapshot, int 
                 ImGui::EndTabBar();
                 }
             }
+            ImGui::Unindent(12.0f);
         }
         if (open)
             ImGui::TreePop();
+        ImGui::Spacing();
         ImGui::PopID();
     }
     if (!info.component_query_error.empty()) {
@@ -620,12 +689,27 @@ void render_current_inspector(const Snapshot &snapshot) {
     render_transform(info, snapshot.transform_clipboard);
     std::array<char, 128>& filter = component_filter(info.instance_id);
     bool& show_inherited = component_show_inherited(info.instance_id);
+    char components_heading[64];
+    std::snprintf(components_heading, sizeof(components_heading), "Components (%zu)", info.components.size());
+    ImGui::SeparatorText(components_heading);
     ImGui::SetNextItemWidth(std::max(120.0f, ImGui::GetContentRegionAvail().x - 135.0f));
     ImGui::InputTextWithHint("##inspector-member-search", "Search Inspector members...", filter.data(), filter.size());
     ImGui::SameLine();
     ImGui::Checkbox("Debug", &show_inherited);
     if (ImGui::IsItemHovered())
         ImGui::SetTooltip("Show inherited runtime members");
+    if (ImGui::SmallButton("Expand all"))
+        component_bulk_toggle() = 1;
+    ImGui::SameLine();
+    if (ImGui::SmallButton("Collapse all"))
+        component_bulk_toggle() = -1;
+    if (filter[0] != '\0') {
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Clear search"))
+            filter.fill('\0');
+        ImGui::SameLine();
+        ImGui::TextDisabled("showing matching components only");
+    }
     render_components(info, snapshot, 0, filter.data(), show_inherited);
     render_add_component_popup(info, snapshot);
     ImGui::EndChild();

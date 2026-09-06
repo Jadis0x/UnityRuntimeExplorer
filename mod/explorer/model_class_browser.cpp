@@ -192,6 +192,33 @@ namespace Explorer {
 		set_status("Class browser indexed " + std::to_string(class_browser_catalog_->classes.size()) + " loaded types");
 	}
 
+	// Every live component, including ones on inactive objects, as depth-0 roots
+	// for the reachability walk. Capped so a huge scene cannot pin an unbounded
+	// number of GC handles before the walk even starts.
+	std::size_t RuntimeModel::seed_scene_component_roots(ClassInstanceScan& scan) {
+		constexpr std::size_t kMaxSceneRoots = 20000;
+		auto components = detail::FindObjectsUsingRooted<Object>(
+			ResourcesType, "FindObjectsOfTypeAll", "UnityEngine.CoreModule.dll", "UnityEngine", "Component");
+		if (components.empty())
+			components = detail::FindObjectsUsingRooted<Object>(
+				ResourcesType, "FindObjectsOfTypeAll", "UnityEngine.dll", "UnityEngine", "Component");
+		std::size_t seeded = 0;
+		for (const Object& component : components) {
+			if (seeded >= kMaxSceneRoots)
+				break;
+			if (!component.handle() || !scan.seen.insert(component.handle()).second)
+				continue;
+			Inspect::ObjectHandle handle = Inspect::PinObject(component);
+			if (!handle.handle) {
+				scan.seen.erase(component.handle());
+				continue;
+			}
+			scan.pending.push_back({handle, 0, false, "scene component"});
+			++seeded;
+		}
+		return seeded;
+	}
+
 	void RuntimeModel::find_class_instances(const Command& command) {
 		clear_class_instance_scan();
 		for (auto& [_, handle] : class_browser_handles_)
@@ -200,6 +227,7 @@ namespace Explorer {
 		working_.class_browser_instances.clear();
 		working_.class_browser_scanned_objects = 0;
 		working_.class_browser_static_roots = 0;
+		working_.class_browser_scene_roots = 0;
 		working_.class_browser_scan_truncated = false;
 		working_.class_browser_query = {};
 		working_.class_browser_query.image = command.image;
@@ -279,9 +307,17 @@ namespace Explorer {
 			class_instance_scan_->unity_object_base =
 				URK::managed::find_class("UnityEngine.dll", "UnityEngine", "Object");
 		class_instance_scan_->started = Clock::now();
+		// Static fields alone never reach an object that only lives in a
+		// component's instance field, which is where most game state actually
+		// sits - so a type like MonoGame.Core.UnityArrayRef came back with zero
+		// instances even though the scene is full of them. Seeding the walk with
+		// every live component is what puts those objects in range.
+		working_.class_browser_scene_roots = seed_scene_component_roots(*class_instance_scan_);
 		working_.class_browser_scan_active = true;
 		next_class_scan_publish_ = Clock::now();
-		set_status("Scanning static managed roots for " + working_.class_browser_query.full_name + "...");
+		set_status("Scanning " + std::to_string(working_.class_browser_scene_roots) +
+			" scene component(s) and the static managed roots for " +
+			working_.class_browser_query.full_name + "...");
 	}
 
 	void RuntimeModel::clear_class_instance_scan() {
@@ -297,17 +333,17 @@ namespace Explorer {
 		if (!class_instance_scan_)
 			return;
 		ClassInstanceScan& scan = *class_instance_scan_;
-		constexpr std::size_t kMaxGraphNodes = 30000;
+		constexpr std::size_t kMaxGraphNodes = 80000;
 		constexpr std::size_t kMaxArrayElements = 256;
 		constexpr int kMaxGraphDepth = 5;
 		constexpr std::size_t kMaxInstanceResults = 512;
-		constexpr auto kMaxScanDuration = std::chrono::seconds(10);
+		constexpr auto kMaxScanDuration = std::chrono::seconds(25);
 		if (Clock::now() - scan.started >= kMaxScanDuration) {
 			working_.class_browser_scan_truncated = true;
 			const std::size_t found = working_.class_browser_instances.size();
 			const std::size_t scanned = working_.class_browser_scanned_objects;
 			clear_class_instance_scan();
-			set_status("Instance scan stopped after 10 seconds; found " + std::to_string(found) +
+			set_status("Instance scan stopped at its time limit; found " + std::to_string(found) +
 				" instance(s) after scanning " + std::to_string(scanned) + " reachable object(s)");
 			publish();
 			return;
@@ -375,8 +411,10 @@ namespace Explorer {
 			scan.phase = ClassInstanceScan::Phase::ReachableGraph;
 		}
 
-		while (scan.phase == ClassInstanceScan::Phase::ReachableGraph && !scan.pending.empty() &&
-			Clock::now() < deadline) {
+		// Drained in every phase: the scene roots are queued before the static
+		// walk begins, and making them wait for it to finish only delays the
+		// results the user is most likely to be after.
+		while (!scan.pending.empty() && Clock::now() < deadline) {
 			ClassInstanceScan::PendingObject current = std::move(scan.pending.front());
 			scan.pending.pop_front();
 			const Object object = Inspect::ResolveObjectHandle(current.handle);
