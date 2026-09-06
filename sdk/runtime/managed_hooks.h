@@ -49,6 +49,34 @@ inline bool try_hook_method_pointer(
 #endif
 }
 
+// The validated native entry point for a managed method. Mid-function hooks
+// attach to this address directly instead of rewriting MethodInfo::methodPointer.
+inline void* try_resolve_method_pointer(
+    const URK::managed::Method* method, DiagnosticSink sink = nullptr,
+    const char* image = nullptr, const char* namespc = nullptr,
+    const char* klass = nullptr, const char* method_name = nullptr) {
+#if defined(URK_BACKEND_IL2CPP)
+    return URK::il2cpp::helpers::try_method_pointer(
+        method, sink, image, namespc, klass, method_name);
+#else
+    (void)image;
+    (void)namespc;
+    (void)klass;
+    (void)method_name;
+    if (!method) {
+        emit(sink, "[URK Mono runtime] method handle is null");
+        return nullptr;
+    }
+    void* target = URK::managed::method_pointer(method);
+    if (!target) {
+        emit(sink, "[URK Mono runtime] method could not be compiled to a native entry point");
+        if (const char* error = URK::managed::last_error(); error && error[0])
+            emit(sink, error);
+    }
+    return target;
+#endif
+}
+
 inline bool try_hook_managed_method(
     const char* image, const char* namespc, const char* klass,
     const char* method_name, const char* const* parameter_types,

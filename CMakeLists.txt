@@ -98,6 +98,13 @@ set(URK_COMMON_SOURCES
         mod/generated/mod_entry.cpp
         mod/explorer/explorer_model.cpp
         mod/explorer/explorer_ui.cpp
+        mod/explorer/ui_state.cpp
+        mod/explorer/ui_members.cpp
+        mod/explorer/ui_hierarchy.cpp
+        mod/explorer/ui_class_browser.cpp
+        mod/explorer/ui_object_inspector.cpp
+        mod/explorer/ui_inspector.cpp
+        mod/explorer/ui_trace_panel.cpp
         mod/explorer/byte_data_decoder.cpp
         mod/explorer/diagnostic_bundle.cpp
         mod/explorer/reference_graph_layout.cpp
@@ -300,7 +307,7 @@ if(URK_BUILD_TESTS)
         target_compile_options(urk_mono_runtime_tests PRIVATE /W4 /permissive- /EHsc /utf-8)
     endif()
     urk_disable_vs_vcpkg_integration(urk_mono_runtime_tests)
-    add_test(NAME mono_runtime_v7_contract COMMAND urk_mono_runtime_tests)
+    add_test(NAME mono_runtime_v8_contract COMMAND urk_mono_runtime_tests)
 
     add_executable(urk_method_trace_format_tests
         tests/method_trace_format_tests.cpp

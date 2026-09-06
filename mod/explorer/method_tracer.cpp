@@ -43,6 +43,13 @@ struct HookSession {
     const URK::managed::Method *method = nullptr;
     void *original = nullptr;
     void *stub = nullptr;
+    // Set when this trace runs as a SafetyHook mid-function entry hook. Such a
+    // trace has no stub and cannot observe the return value.
+    URK::MidHookHandle *mid_hook = nullptr;
+    void *mid_target = nullptr;
+    bool captures_return = false;
+    // Non-null restricts the trace to calls whose `this` matches.
+    const void *instance_filter = nullptr;
     bool visible = true;
     std::atomic<bool> active{false};
     // The high bit closes the entry gate before a hook is detached. The
@@ -109,6 +116,7 @@ struct State {
     std::mutex control_mutex;
     std::vector<std::unique_ptr<HookSession>> sessions;
     TraceId next_id = 1;
+    TraceId last_started_id = 0;
     LARGE_INTEGER frequency{};
     std::string diagnostic;
 };
@@ -336,7 +344,10 @@ std::uintptr_t push_return_context(HookSession* session, std::uint64_t sequence,
 bool enter_flight(HookSession& session);
 void leave_flight(HookSession& session);
 
-extern "C" std::uintptr_t trace_record_from_stub(const RegisterFrame *frame, HookSession *session) {
+// install_return_hook is false for mid-function hooks, which record the entry
+// and then let the callee return normally.
+static std::uintptr_t trace_record_entry(const RegisterFrame *frame, HookSession *session,
+                                         bool install_return_hook) {
     if (!frame || !session)
         return 0;
     if (!enter_flight(*session))
@@ -349,6 +360,14 @@ extern "C" std::uintptr_t trace_record_from_stub(const RegisterFrame *frame, Hoo
 #if defined(_WIN32)
     __try {
 #endif
+    const std::size_t target_slot = session->return_uses_indirect_abi ? 1 : 0;
+    if (session->instance_filter && !session->is_static &&
+        static_cast<std::uintptr_t>(register_value(frame, target_slot, ArgumentKind::Integer)) !=
+            reinterpret_cast<std::uintptr_t>(session->instance_filter)) {
+        // A call on some other instance; claim no sequence so the ring stays dense.
+        leave_flight(*session);
+        return 0;
+    }
     const std::uint64_t sequence = session->write_sequence.fetch_add(1, std::memory_order_relaxed);
     RingRecord &record = session->records[sequence % max_records];
     LARGE_INTEGER now{};
@@ -391,7 +410,8 @@ extern "C" std::uintptr_t trace_record_from_stub(const RegisterFrame *frame, Hoo
     }
     record.return_published.store(false, std::memory_order_relaxed);
     record.published_sequence.store(sequence + 1, std::memory_order_release);
-    original_return = push_return_context(session, sequence, static_cast<std::uintptr_t>(frame->return_address));
+    if (install_return_hook)
+        original_return = push_return_context(session, sequence, static_cast<std::uintptr_t>(frame->return_address));
 #if defined(_WIN32)
     }
     __except (trace_exception_filter(GetExceptionCode())) {
@@ -401,6 +421,60 @@ extern "C" std::uintptr_t trace_record_from_stub(const RegisterFrame *frame, Hoo
     if (!original_return)
         leave_flight(*session);
     return original_return;
+}
+
+extern "C" std::uintptr_t trace_record_from_stub(const RegisterFrame *frame, HookSession *session) {
+    return trace_record_entry(frame, session, true);
+}
+
+// SafetyHook mid-function entry hook. The loader hands over the live register
+// file; everything the stub used to save by hand is already here, plus xmm6..15
+// and rsp, so stack arguments are read from the frame instead of being copied
+// blind. No return address is rewritten, so a managed exception unwinding out
+// of the callee cannot corrupt anything the tracer installed.
+void trace_mid_entry(URK_HookRegisters *registers, void *user_data) {
+    auto *session = static_cast<HookSession *>(user_data);
+    if (!registers || !session)
+        return;
+    if (registers->size < sizeof(URK_HookRegisters))
+        return;
+    RegisterFrame frame{};
+    frame.rax = registers->rax;
+    frame.rcx = registers->rcx;
+    frame.rdx = registers->rdx;
+    frame.r8 = registers->r8;
+    frame.r9 = registers->r9;
+    frame.r10 = registers->r10;
+    frame.r11 = registers->r11;
+    for (std::size_t lane = 0; lane < frame.xmm.size(); ++lane)
+        std::memcpy(frame.xmm[lane].data(), registers->xmm[lane].u8, frame.xmm[lane].size());
+    // At the entry the stack is: [rsp] return address, then 32 bytes of home
+    // space, then the fifth and later arguments.
+    const auto *stack = reinterpret_cast<const std::uint64_t *>(registers->rsp);
+    if (!stack)
+        return;
+    // The declared parameters bound the copy; reading the whole window would
+    // walk far past the caller frame for a method with few arguments.
+    const std::size_t stack_words =
+        std::min<std::size_t>(session->argument_count + 2, URK::Unity::Inspect::kMaxMethodParameters);
+#if defined(_WIN32)
+    __try {
+#endif
+        frame.return_address = stack[0];
+        for (std::size_t index = 0; index < frame.shadow_space.size(); ++index)
+            frame.shadow_space[index] = stack[1 + index];
+        for (std::size_t index = 0; index < stack_words; ++index)
+            frame.stack_arguments[index] = stack[5 + index];
+#if defined(_WIN32)
+    }
+    __except (trace_exception_filter(GetExceptionCode())) {
+        session->native_faults.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+#endif
+    // trace_record_entry closes the flight gate itself when no return context
+    // is installed, which is always the case here.
+    trace_record_entry(&frame, session, false);
 }
 
 extern "C" std::uintptr_t trace_record_return_from_stub(HookSession* session, std::uint64_t rax,
@@ -522,6 +596,30 @@ bool create_stub(HookSession &session, std::string &error) {
 
 void tracer_diagnostic(const char *message) { if (message && message[0]) g_state.diagnostic = message; }
 
+// Installs whichever hook the session was configured for. The mid-function
+// entry hook is the default; the stub path exists only for return capture.
+bool attach_session(HookSession &session, const char *method_name) {
+    if (!session.captures_return) {
+        session.mid_hook = URK::hooks::mid_attach(session.mid_target, &trace_mid_entry, &session);
+        return session.mid_hook != nullptr;
+    }
+    return URK::managed_hooks::try_hook_method_pointer(session.method, &session.original, session.stub,
+                                                       &tracer_diagnostic, nullptr, nullptr, nullptr, nullptr,
+                                                       method_name);
+}
+
+bool detach_session(HookSession &session) {
+    if (!session.captures_return) {
+        if (!session.mid_hook)
+            return true;
+        if (!URK::hooks::mid_detach(session.mid_hook))
+            return false;
+        session.mid_hook = nullptr;
+        return true;
+    }
+    return !session.original || !session.stub || URK::hooks::detach_ex(&session.original, session.stub);
+}
+
 bool enter_flight(HookSession& session) {
     std::uint64_t state = session.flight_state.load(std::memory_order_acquire);
     for (;;) {
@@ -549,13 +647,12 @@ bool deactivate(HookSession &session) {
     while (flight_count(session) != 0 && std::chrono::steady_clock::now() < deadline)
         SwitchToThread();
     if (flight_count(session) != 0) {
-        // Keep the stub mapped and attached while an already-entered call is
-        // unwinding. The detour is inactive, so new calls pass through safely.
+        // Keep the hook installed while an already-entered call is unwinding.
+        // The session is inactive, so new calls pass straight through.
         session.detach_pending.store(true, std::memory_order_release);
         return false;
     }
-    if (session.original && session.stub &&
-        !URK::hooks::detach_ex(&session.original, session.stub)) {
+    if (!detach_session(session)) {
         session.detach_pending.store(true, std::memory_order_release);
         return false;
     }
@@ -566,8 +663,7 @@ bool deactivate(HookSession &session) {
 bool retry_pending_detach(HookSession& session) {
     if (!session.detach_pending.load(std::memory_order_acquire) || flight_count(session) != 0)
         return false;
-    if (session.original && session.stub &&
-        !URK::hooks::detach_ex(&session.original, session.stub))
+    if (!detach_session(session))
         return false;
     session.detach_pending.store(false, std::memory_order_release);
     return true;
@@ -591,6 +687,7 @@ Snapshot copy_snapshot(const HookSession &session) {
     out.method_pointer_text = session.method_pointer_text;
     out.active = session.active.load(std::memory_order_acquire);
     out.is_static = session.is_static;
+    out.captures_return = session.captures_return;
     out.method_name = session.method_name;
     out.declaring_type = session.declaring_type;
     out.return_type = session.return_type;
@@ -704,9 +801,16 @@ Snapshot copy_snapshot(const HookSession &session) {
 }
 } // namespace
 
-bool start(const URK::Unity::Inspect::MethodInfo &method, std::string &error) {
+bool start(const URK::Unity::Inspect::MethodInfo &method, bool capture_return, const void *instance_filter,
+           std::string &error) {
     std::lock_guard lock(g_state.control_mutex);
     if (!URK::hooks::available()) { error = "Hook API is unavailable in this runtime"; return false; }
+    // Return capture needs the stub that rewrites the return address. Without
+    // mid-function hooks the stub is the only strategy available at all.
+    if (!capture_return && !URK::hooks::mid_available()) {
+        error = "Mid-function hooks are unavailable in this runtime; enable return capture to use the legacy stub";
+        return false;
+    }
     if (!method.handle) { error = "Method metadata handle is unavailable"; return false; }
     if (g_state.frequency.QuadPart <= 0 &&
         (!QueryPerformanceFrequency(&g_state.frequency) || g_state.frequency.QuadPart <= 0)) {
@@ -721,16 +825,23 @@ bool start(const URK::Unity::Inspect::MethodInfo &method, std::string &error) {
             error = "This method is already being traced";
             return false;
         }
+        if (existing->captures_return != capture_return) {
+            error = "This method already has a trace with a different return-capture setting; close it first";
+            return false;
+        }
+        if (existing->instance_filter != instance_filter) {
+            error = "This method already has a trace scoped to a different object; close it first";
+            return false;
+        }
         reset_records(*existing);
         g_state.diagnostic.clear();
-        if (!URK::managed_hooks::try_hook_method_pointer(method_handle, &existing->original, existing->stub,
-                                                          &tracer_diagnostic, nullptr, nullptr, nullptr, nullptr,
-                                                          method.name.c_str())) {
+        if (!attach_session(*existing, method.name.c_str())) {
             error = g_state.diagnostic.empty() ? "The runtime refused to re-enable this method trace" : g_state.diagnostic;
             return false;
         }
         existing->active.store(true, std::memory_order_release);
         existing->visible = true;
+        g_state.last_started_id = existing->id;
         error.clear();
         return true;
     }
@@ -880,19 +991,58 @@ bool start(const URK::Unity::Inspect::MethodInfo &method, std::string &error) {
         }
     }
     reset_records(*session);
-    if (!create_stub(*session, error)) return false;
+    session->captures_return = capture_return;
+    session->instance_filter = instance_filter;
+    if (capture_return) {
+        if (!create_stub(*session, error)) return false;
+    } else {
+        g_state.diagnostic.clear();
+        session->mid_target = URK::managed_hooks::try_resolve_method_pointer(
+            method_handle, &tracer_diagnostic, nullptr, nullptr, nullptr, method.name.c_str());
+        if (!session->mid_target) {
+            error = g_state.diagnostic.empty() ? "The method has no native entry point to hook" : g_state.diagnostic;
+            return false;
+        }
+    }
     HookSession *const raw = session.get();
     g_state.diagnostic.clear();
-    if (!URK::managed_hooks::try_hook_method_pointer(method_handle, &raw->original, raw->stub, &tracer_diagnostic,
-                                                      nullptr, nullptr, nullptr, nullptr, method.name.c_str())) {
+    if (!attach_session(*raw, method.name.c_str())) {
         error = g_state.diagnostic.empty() ? "The runtime refused to hook this method" : g_state.diagnostic;
-        VirtualFree(raw->stub, 0, MEM_RELEASE);
+        if (raw->stub)
+            VirtualFree(raw->stub, 0, MEM_RELEASE);
         return false;
     }
     raw->active.store(true, std::memory_order_release);
+    g_state.last_started_id = raw->id;
     g_state.sessions.push_back(std::move(session));
     error.clear();
     return true;
+}
+
+TraceId last_started_id() {
+    std::lock_guard lock(g_state.control_mutex);
+    return g_state.last_started_id;
+}
+
+WriteSignal write_signal(TraceId id) {
+    std::lock_guard lock(g_state.control_mutex);
+    WriteSignal out{};
+    for (const auto &session : g_state.sessions) {
+        if (session->id != id)
+            continue;
+        out.active = session->active.load(std::memory_order_acquire);
+        const std::uint64_t written = session->write_sequence.load(std::memory_order_acquire);
+        out.total_calls = written;
+        if (written == 0)
+            break;
+        const RingRecord &record = session->records[(written - 1) % max_records];
+        if (record.published_sequence.load(std::memory_order_acquire) == written) {
+            out.last_caller = record.caller_address.load(std::memory_order_relaxed);
+            out.last_thread_id = record.thread_id.load(std::memory_order_relaxed);
+        }
+        break;
+    }
+    return out;
 }
 
 bool stop(const URK::managed::Method *method) {

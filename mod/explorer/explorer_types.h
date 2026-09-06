@@ -331,6 +331,8 @@ struct Snapshot {
         std::string field_name;
         std::string field_type;
         bool active = false;
+        // True when writes come from a hooked setter instead of sampling.
+        bool setter_hooked = false;
         bool value_available = false;
         std::string current_value;
         ComponentInfo::LiveValues::Reference current_reference;

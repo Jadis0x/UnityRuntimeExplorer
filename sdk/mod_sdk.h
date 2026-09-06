@@ -6,15 +6,15 @@
 extern "C" {
 #endif
 
-#define URK_SDK_VERSION 28
-/* The supplied Mono project was generated with SDK v27. Context and service
- * tables used by the Explorer are append-only and size-checked, so v27 remains
- * the oldest compatible loader contract. */
+#define URK_SDK_VERSION 32
+/* Oldest loader contract the Explorer still accepts. Context and service
+ * tables are append-only and size-checked, so an older loader stays usable. */
 #define URK_SDK_MIN_COMPAT_VERSION 27
-#define URK_MONO_API_VERSION 7
-#define URK_RUNTIME_API_VERSION 9
-#define URK_IL2CPP_API_VERSION 6
+#define URK_MONO_API_VERSION 8
+#define URK_RUNTIME_API_VERSION 10
+#define URK_IL2CPP_API_VERSION 7
 #define URK_NETWORK_API_VERSION 1
+#define URK_HOOK_API_VERSION 1
 
 #define URK_SCENE_NAME_MAX 128
 #define URK_OBJECT_NAME_MAX 128
@@ -50,7 +50,8 @@ typedef enum URK_RuntimeCapabilityFlags {
     URK_RUNTIME_CAP_INPUT = 1ull << 9,
     URK_RUNTIME_CAP_GRAPHICS_DEVICE_TYPE = 1ull << 10,
     URK_RUNTIME_CAP_OBJECT_DESTROY_REQUEST_EVENTS = 1ull << 11,
-    URK_RUNTIME_CAP_STEAM_IDENTITY = 1ull << 12
+    URK_RUNTIME_CAP_STEAM_IDENTITY = 1ull << 12,
+    URK_RUNTIME_CAP_MID_HOOKS = 1ull << 13
 } URK_RuntimeCapabilityFlags;
 
 typedef enum URK_RuntimeModuleKind {
@@ -91,10 +92,7 @@ typedef struct URK_NetworkRequest {
     size_t headerCount;
     uint32_t timeoutMs;
     uint32_t flags;
-    /*
-     * Optional libcurl pinned public key, for example
-     * "sha256//BASE64_SHA256_SPKI". Leave null to use platform CA validation.
-     */
+    /* Optional libcurl public-key pin, for example sha256//BASE64_SHA256_SPKI. */
     const char *pinnedPublicKey;
 } URK_NetworkRequest;
 
@@ -112,17 +110,12 @@ typedef struct URK_NetworkResponse {
 typedef struct URK_NetworkApi {
     int version;
     uint32_t size;
-    /*
-     * Performs a synchronous JSON HTTPS request through the loader-owned
-     * transport with TLS verification, HTTPS-only URLs, no redirects, bounded
-     * response buffers, and caller-owned storage. Returns non-zero for transport
-     * success; callers must still validate statusCode and the response JSON.
-     */
     int (*json_request)(const URK_NetworkRequest *request, URK_NetworkResponse *response);
 } URK_NetworkApi;
 
 typedef struct URK_SceneInfo {
     uint32_t size;
+    /* -1 when Unity strips the optional GetBuildIndexInternal binding. */
     int32_t buildIndex;
     int32_t handle;
     char name[URK_SCENE_NAME_MAX];
@@ -253,6 +246,13 @@ typedef struct URK_RuntimeApi {
      * This v9 entry is owner-explicit and automatically released on unload.
      */
     int (*menu_mouse_capture_set_owned)(const void *owner_address, int capture);
+    /*
+     * Returns non-zero only on the Unity thread captured by the runtime event
+     * pump. This v10 entry lets mods reject unsafe Unity calls instead of
+     * mistaking a managed invocation without an exception for a valid
+     * cross-thread Unity operation.
+     */
+    int (*is_main_thread)();
 } URK_RuntimeApi;
 
 typedef struct URK_Il2CppManagedMethodDesc {
@@ -585,6 +585,15 @@ typedef struct URK_Il2CppApi {
     uint32_t (*offset_of_array_bounds_in_array_object_header)();
     uint32_t (*allocation_granularity)();
     int (*array_set_ref)(void *array, size_t index, void *value);
+    /*
+     * Unity 6 changed Il2CppGCHandle from a 32-bit token to a pointer-sized
+     * opaque handle. The older uint32_t entries remain in place for binary
+     * compatibility; new code must use these pointer-sized entries.
+     */
+    uintptr_t (*gchandle_new_v2)(void *object, int pinned);
+    uintptr_t (*gchandle_new_weakref_v2)(void *object, int track_resurrection);
+    void *(*gchandle_get_target_v2)(uintptr_t gchandle);
+    void (*gchandle_free_v2)(uintptr_t gchandle);
 } URK_Il2CppApi;
 
 #ifdef __cplusplus
@@ -611,6 +620,9 @@ static_assert(offsetof(URK_RuntimeApi, menu_cursor_set_open_owned) >
 static_assert(offsetof(URK_RuntimeApi, menu_mouse_capture_set_owned) >
                   offsetof(URK_RuntimeApi, menu_cursor_set_open_owned),
               "URK_RuntimeApi mouse-capture helper must stay appended.");
+static_assert(offsetof(URK_RuntimeApi, is_main_thread) >
+                  offsetof(URK_RuntimeApi, menu_mouse_capture_set_owned),
+              "URK_RuntimeApi main-thread query must stay appended.");
 static_assert(offsetof(URK_ObjectDestroyRequest, typeName) > offsetof(URK_ObjectDestroyRequest, name),
               "URK_ObjectDestroyRequest fields must remain append-only.");
 static_assert(offsetof(URK_Il2CppApi, size) > offsetof(URK_Il2CppApi, version),
@@ -621,6 +633,10 @@ static_assert(offsetof(URK_Il2CppApi, last_error) > offsetof(URK_Il2CppApi, fiel
               "URK_Il2CppApi field order changed unexpectedly.");
 static_assert(offsetof(URK_Il2CppApi, array_set_ref) > offsetof(URK_Il2CppApi, allocation_granularity),
               "URK_Il2CppApi new fields must be appended.");
+static_assert(offsetof(URK_Il2CppApi, gchandle_new_v2) > offsetof(URK_Il2CppApi, array_set_ref),
+              "URK_Il2CppApi pointer-sized GC handle helpers must stay appended.");
+static_assert(offsetof(URK_Il2CppApi, gchandle_free_v2) > offsetof(URK_Il2CppApi, gchandle_new_v2),
+              "URK_Il2CppApi pointer-sized GC handle helper order changed unexpectedly.");
 static_assert(offsetof(URK_NetworkApi, json_request) > offsetof(URK_NetworkApi, size),
               "URK_NetworkApi keeps version and size before callable entries.");
 #endif
@@ -707,6 +723,8 @@ typedef struct URK_MonoApi {
     void *(*method_get_object)(const void *method);
     /* Boxes a value-type storage slot into a managed object. */
     void *(*value_box)(const void *klass, void *data);
+    /* Returns non-zero when the method is a generic method definition or an inflated generic method. */
+    int (*method_is_generic)(const void *method);
 } URK_MonoApi;
 
 #ifdef __cplusplus
@@ -714,6 +732,8 @@ static_assert(offsetof(URK_MonoApi, method_get_object) > offsetof(URK_MonoApi, g
               "URK_MonoApi new fields must be appended.");
 static_assert(offsetof(URK_MonoApi, value_box) > offsetof(URK_MonoApi, method_get_object),
               "URK_MonoApi value_box must be appended.");
+static_assert(offsetof(URK_MonoApi, method_is_generic) > offsetof(URK_MonoApi, value_box),
+              "URK_MonoApi generic method helper must stay appended.");
 #endif
 
 typedef enum URK_HookBackend {
@@ -727,6 +747,74 @@ typedef struct URK_HookOptions {
     uint32_t backend;
     uint32_t flags;
 } URK_HookOptions;
+
+typedef union URK_HookXmmRegister {
+    uint8_t u8[16];
+    uint16_t u16[8];
+    uint32_t u32[4];
+    uint64_t u64[2];
+    float f32[4];
+    double f64[2];
+} URK_HookXmmRegister;
+
+/*
+ * Mid-function hook register context (x64). The loader copies the live
+ * register file in before the callback and copies it back out afterwards, so
+ * writes to these fields change execution when the target resumes.
+ */
+typedef struct URK_HookRegisters {
+    uint32_t size;
+    uint32_t reserved;
+    URK_HookXmmRegister xmm[16];
+    uintptr_t rflags;
+    uintptr_t r15;
+    uintptr_t r14;
+    uintptr_t r13;
+    uintptr_t r12;
+    uintptr_t r11;
+    uintptr_t r10;
+    uintptr_t r9;
+    uintptr_t r8;
+    uintptr_t rdi;
+    uintptr_t rsi;
+    uintptr_t rdx;
+    uintptr_t rcx;
+    uintptr_t rbx;
+    uintptr_t rax;
+    uintptr_t rbp;
+    /* Stack pointer at the hook site. Read-only: writes are ignored. */
+    uintptr_t rsp;
+    /* Stack pointer used when execution resumes. Write this instead of rsp. */
+    uintptr_t trampoline_rsp;
+    /*
+     * On entry this points at a trampoline holding the instruction(s) the hook
+     * displaced, not at the hooked address. Write it to redirect control flow.
+     */
+    uintptr_t rip;
+} URK_HookRegisters;
+
+typedef void (*URK_MidHookCallbackFn)(URK_HookRegisters *registers, void *userData);
+
+typedef struct URK_MidHookOptions {
+    uint32_t size;
+    uint32_t flags;
+    void *userData;
+} URK_MidHookOptions;
+
+typedef struct URK_MidHookHandle URK_MidHookHandle;
+
+typedef struct URK_HookApi {
+    uint32_t version;
+    uint32_t size;
+    /*
+     * Installs a mid-function hook at an arbitrary instruction boundary.
+     * Returns NULL when the address is not hookable or the pool is exhausted.
+     */
+    URK_MidHookHandle *(*mid_attach)(void *target, URK_MidHookCallbackFn callback,
+                                      const URK_MidHookOptions *options);
+    int (*mid_detach)(URK_MidHookHandle *hook);
+    int (*mid_set_enabled)(URK_MidHookHandle *hook, int enabled);
+} URK_HookApi;
 
 typedef struct URK_ModContext {
     int version;
@@ -749,7 +837,13 @@ typedef struct URK_ModContext {
     uintptr_t unityPlayerModuleBase;
     uintptr_t gameAssemblyModuleBase;
     const URK_NetworkApi *network;
+    const URK_HookApi *hooks;
 } URK_ModContext;
+
+static_assert(offsetof(URK_HookApi, mid_attach) > offsetof(URK_HookApi, size),
+              "URK_HookApi must stay append-only.");
+static_assert(offsetof(URK_ModContext, hooks) > offsetof(URK_ModContext, network),
+              "URK_ModContext hook API pointer must stay appended.");
 
 /* Required initialization export. Loaders reject a module when it is missing
  * or returns zero. */
@@ -765,6 +859,11 @@ using RuntimeModuleKind = URK_RuntimeModuleKind;
 using CursorLockState = URK_CursorLockState;
 using CursorState = URK_CursorState;
 using GraphicsDeviceType = URK_GraphicsDeviceType;
+using HookApi = URK_HookApi;
+using HookRegisters = URK_HookRegisters;
+using MidHookCallbackFn = URK_MidHookCallbackFn;
+using MidHookHandle = URK_MidHookHandle;
+using MidHookOptions = URK_MidHookOptions;
 using NetworkApi = URK_NetworkApi;
 using NetworkHeader = URK_NetworkHeader;
 using NetworkHttpMethod = URK_NetworkHttpMethod;

@@ -4252,11 +4252,12 @@ namespace Explorer {
 		}
 		std::string error;
 		remember_managed_method(method);
-		if (!MethodTracer::start(method, error)) {
+		if (!MethodTracer::start(method, command.capture_return, nullptr, error)) {
 			set_status("Method tracing failed: " + error);
 			return;
 		}
-		set_status("Tracing " + method.declaring_type.full_name + "." + method.name + " (all calls)");
+		set_status("Tracing " + method.declaring_type.full_name + "." + method.name +
+			(command.capture_return ? " (all calls, with return values)" : " (all calls)"));
 	}
 
 	void RuntimeModel::clear_method_trace(MethodTracer::TraceId id) {
@@ -4333,6 +4334,7 @@ namespace Explorer {
 				return;
 			}
 			found->second.snapshot.active = false;
+			detach_setter_hook(found->second);
 			set_status("Value watch stopped");
 			return;
 		}
@@ -4442,8 +4444,13 @@ namespace Explorer {
 			(property ? sampled_object_properties_ : sampled_object_fields_).insert(field_index);
 		else
 			sampled_component_members_.insert(component_sample_token(command.instance_id, property, field_index));
+		// A property with a setter can report writes exactly; a raw field has no
+		// managed setter to hook and stays on sampling.
+		const bool hooked = attach_setter_hook(*state, target);
+		state->snapshot.setter_hooked = hooked;
 		set_status("Watching " + state->snapshot.component_type + "." + state->snapshot.field_name +
-			" (" + (property ? "property" : "field") + ") for value changes");
+			" (" + (property ? "property" : "field") + ")" +
+			(hooked ? " with a setter hook" : " for value changes"));
 	}
 
 	void RuntimeModel::configure_field_watch(const Command& command) {
@@ -4492,14 +4499,42 @@ namespace Explorer {
 			set_status("Stop a field watch before closing it");
 			return;
 		}
+		detach_setter_hook(found->second);
 		release_field_watch_references(found->second.snapshot);
 		Inspect::FreeObjectHandle(found->second.target_handle);
 		field_watches_.erase(found);
 		set_status("Closed field watch tab");
 	}
 
+	bool RuntimeModel::attach_setter_hook(FieldWatchState& state, URK::Unity::Object target) {
+		detach_setter_hook(state);
+		if (!state.snapshot.property || !state.property.set_method || !target)
+			return false;
+		// A setter shared by every instance is filtered down to this object.
+		const Inspect::MethodInfo setter = Inspect::method_info(
+			static_cast<const URK::managed::Method*>(state.property.set_method), state.property.declaring_type);
+		std::string error;
+		if (!MethodTracer::start(setter, false, target.handle(), error)) {
+			record_flight("WATCH", "Setter hook unavailable", error);
+			return false;
+		}
+		state.setter_trace = MethodTracer::last_started_id();
+		state.setter_calls_seen = 0;
+		return state.setter_trace != 0;
+	}
+
+	void RuntimeModel::detach_setter_hook(FieldWatchState& state) {
+		if (state.setter_trace == 0)
+			return;
+		MethodTracer::stop(state.setter_trace);
+		MethodTracer::close(state.setter_trace);
+		state.setter_trace = 0;
+		state.setter_calls_seen = 0;
+	}
+
 	void RuntimeModel::release_all_field_watches() {
 		for (auto& [_, state] : field_watches_) {
+			detach_setter_hook(state);
 			release_field_watch_references(state.snapshot);
 			Inspect::FreeObjectHandle(state.target_handle);
 		}
@@ -4533,6 +4568,21 @@ namespace Explorer {
 				record_value_error(watch.component_type + "." + watch.field_name, value);
 				continue;
 			}
+			// A hooked setter reports the exact number of writes, so a value that
+			// was written and reverted between two samples still shows up.
+			std::uint64_t setter_writes = 0;
+			std::uintptr_t setter_caller = 0;
+			if (state.setter_trace != 0) {
+				const MethodTracer::WriteSignal signal = MethodTracer::write_signal(state.setter_trace);
+				if (!signal.active) {
+					state.setter_trace = 0;
+					watch.setter_hooked = false;
+				} else if (signal.total_calls > state.setter_calls_seen) {
+					setter_writes = signal.total_calls - state.setter_calls_seen;
+					setter_caller = signal.last_caller;
+					state.setter_calls_seen = signal.total_calls;
+				}
+			}
 			const double elapsed = std::chrono::duration<double>(now - state.started).count();
 			if (const std::optional<double> numeric = WatchAnalysis::numeric_value(value)) {
 				if (record_sample) {
@@ -4558,15 +4608,22 @@ namespace Explorer {
 				watch.current_reference = watch_reference_for(value);
 				continue;
 			}
-			if (values_equivalent(state.last_value, value))
+			if (values_equivalent(state.last_value, value) && setter_writes == 0)
 				continue;
 			Snapshot::FieldWatchEvent event{};
 			event.sequence = ++watch.change_count;
 			event.seconds_since_start = elapsed;
 			event.previous_value = watched_value_display(state.last_value);
 			event.current_value = watched_value_display(value);
-			event.source = state.explorer_write_pending ? "Explorer write" :
-				(watch.property ? "Runtime / property getter sample" : "Runtime / sampled write window");
+			if (state.explorer_write_pending)
+				event.source = "Explorer write";
+			else if (setter_writes != 0)
+				event.source = "Setter hook" +
+					(setter_writes > 1 ? " (" + std::to_string(setter_writes) + " writes)" : std::string{}) +
+					(setter_caller != 0 ? " from " + MethodTraceFormat::address(setter_caller) : std::string{});
+			else
+				event.source = watch.property ? "Runtime / property getter sample"
+					: "Runtime / sampled write window";
 			event.alarm_triggered = watch.alarm_active;
 			state.explorer_write_pending = false;
 			// The newest history entry already retains the current reference.

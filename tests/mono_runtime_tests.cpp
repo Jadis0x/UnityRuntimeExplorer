@@ -10,12 +10,12 @@
 #include <cstdio>
 #include <cstring>
 
-static_assert(URK_MONO_API_VERSION == 7,
+static_assert(URK_MONO_API_VERSION == 8,
               "The loader-facing Mono table must match the supplied SDK");
 static_assert(sizeof(URK_MonoApi) ==
-                  offsetof(URK_MonoApi, value_box) +
-                      sizeof(((URK_MonoApi*)nullptr)->value_box),
-              "No fields may be read beyond the supplied Mono v7 table");
+                  offsetof(URK_MonoApi, method_is_generic) +
+                      sizeof(((URK_MonoApi*)nullptr)->method_is_generic),
+              "No fields may be read beyond the supplied Mono v8 table");
 
 namespace {
 

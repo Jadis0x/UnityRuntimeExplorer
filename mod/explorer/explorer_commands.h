@@ -85,6 +85,9 @@ struct Command {
     std::uintptr_t expected_object_address = 0;
     std::uint64_t sequence = 0;
     bool bool_value = false;
+    // SetMethodTrace: opt in to the legacy stub that also captures the return
+    // value. Off means a mid-function entry hook, which cannot see returns.
+    bool capture_return = false;
     bool object_inspector_target = false;
     bool class_browser_target = false;
     bool lock_value = false;

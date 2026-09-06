@@ -187,9 +187,17 @@ class RuntimeModel {
         bool has_baseline = false;
         bool alarm_latched = false;
         bool explorer_write_pending = false;
+        // A property whose setter could be hooked reports exact writes instead
+        // of sampled differences. Zero when the watch is polling.
+        MethodTracer::TraceId setter_trace = 0;
+        std::uint64_t setter_calls_seen = 0;
         Clock::time_point started{};
     };
     std::unordered_map<std::uint64_t, FieldWatchState> field_watches_;
+    // Hooks a watched property's setter so writes are reported exactly. Returns
+    // false when the property has no hookable setter, leaving the watch polling.
+    bool attach_setter_hook(FieldWatchState &state, URK::Unity::Object target);
+    void detach_setter_hook(FieldWatchState &state);
     std::unordered_set<std::size_t> sampled_object_fields_;
     std::unordered_set<std::size_t> sampled_object_properties_;
     std::unordered_set<std::string> logged_value_errors_;

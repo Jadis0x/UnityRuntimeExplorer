@@ -84,6 +84,9 @@ struct Snapshot {
     // Struct returns can use a hidden Win64 output buffer; RAX is not the result.
     bool return_uses_indirect_abi = false;
     bool return_is_floating = false;
+    // False when the trace runs as a mid-function entry hook, which cannot see
+    // the return value.
+    bool captures_return = false;
     std::uint64_t total_calls = 0;
     std::uint64_t overwritten_records = 0;
     std::uint64_t native_faults = 0;
@@ -93,8 +96,31 @@ struct Snapshot {
     std::string error;
 };
 
-// A native detour captures game calls as well as Explorer invocations.
-bool start(const URK::Unity::Inspect::MethodInfo &method, std::string &error);
+// A native hook captures game calls as well as Explorer invocations.
+// capture_return selects the strategy:
+//   false - a SafetyHook mid-function hook at the entry. Arguments, caller,
+//           thread and timing are recorded; the return value is not observable.
+//   true  - the legacy entry stub, which rewrites the return address so the
+//           callee returns through the tracer. That captures the return value
+//           but corrupts unwinding if a managed exception escapes the callee,
+//           so it stays opt-in.
+// instance_filter, when set, drops calls whose `this` is a different object.
+// A property watch uses it so a setter shared by every instance only reports
+// writes to the object being watched.
+bool start(const URK::Unity::Inspect::MethodInfo &method, bool capture_return, const void *instance_filter,
+           std::string &error);
+
+// What a watch needs from a setter trace each frame, without copying records.
+struct WriteSignal {
+    bool active = false;
+    std::uint64_t total_calls = 0;
+    std::uintptr_t last_caller = 0;
+    std::uint32_t last_thread_id = 0;
+};
+WriteSignal write_signal(TraceId id);
+// The trace id most recently created by start(), for callers that need to
+// track the session they just opened.
+TraceId last_started_id();
 bool stop(const URK::managed::Method *method);
 bool stop(TraceId id);
 bool clear(TraceId id);
