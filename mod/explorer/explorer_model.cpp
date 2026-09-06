@@ -338,6 +338,17 @@ namespace Explorer {
 		auto current = published_.load();
 		return current ? current : std::make_shared<const Snapshot>();
 	}
+#if defined(_WIN32)
+	bool RuntimeModel::process_command_guarded(const Command &command) {
+		__try {
+			process_command(command);
+			return true;
+		}
+		__except (capture_native_fault(_exception_info())) {
+			return false;
+		}
+	}
+#endif
 	void RuntimeModel::process_commands() {
 		std::vector<Command> pending;
 		{
@@ -374,13 +385,7 @@ namespace Explorer {
 			const Command& command = pending[command_index];
 			record_flight("BEGIN", command_name(command.kind), "seq=" + std::to_string(command.sequence));
 #if defined(_WIN32)
-			bool native_fault = false;
-			__try {
-				process_command(command);
-			}
-			__except (capture_native_fault(_exception_info())) {
-				native_fault = true;
-			}
+			const bool native_fault = !process_command_guarded(command);
 			if (native_fault) {
 				record_flight("FAULT", command_name(command.kind), "native access violation");
 				// Isolate malformed metadata to its component and retain other state.
@@ -450,6 +455,24 @@ namespace Explorer {
 			record_flight("DONE", command_name(command.kind));
 		}
 	}
+
+#if defined(_WIN32)
+	namespace {
+		// process_command() is a large switch with many std::string locals
+		// throughout its other cases; MSVC forbids mixing __try/__except
+		// with objects that require unwinding in the same function (C2712),
+		// so the guarded call for the SetComponentEnabled case lives here.
+		bool set_component_enabled_guarded(Object component, bool enabled) {
+			__try {
+				component.SetProperty("enabled", enabled);
+				return true;
+			}
+			__except (capture_native_fault(_exception_info())) {
+				return false;
+			}
+		}
+	} // namespace
+#endif
 
 	void RuntimeModel::process_command(const Command& command) {
 		const bool lifecycle_command = command.kind == CommandKind::SceneHint ||
@@ -816,10 +839,7 @@ namespace Explorer {
 				return;
 			}
 #if defined(_WIN32)
-			__try {
-				component.SetProperty("enabled", command.bool_value);
-			}
-			__except (capture_native_fault(_exception_info())) {
+			if (!set_component_enabled_guarded(component, command.bool_value)) {
 				clear_error();
 				set_status("Set component enabled blocked an invalid native access");
 				return;
@@ -1177,6 +1197,25 @@ namespace Explorer {
 		}
 	}
 
+#if defined(_WIN32)
+	namespace {
+		// publish() has many std::string/TypeInfo locals throughout; MSVC
+		// forbids mixing __try/__except with objects that require unwinding
+		// in the same function (C2712), so the guarded value_box() call
+		// lives in this leaf function instead.
+		void* value_box_guarded(const URK::managed::Class* klass, void* bytes, bool& faulted) {
+			faulted = false;
+			__try {
+				return URK::managed::value_box(klass, bytes);
+			}
+			__except (capture_native_fault(_exception_info())) {
+				faulted = true;
+				return nullptr;
+			}
+		}
+	} // namespace
+#endif
+
 	void RuntimeModel::publish() {
 		working_.runtime_backend = ModConfig::backend_name;
 #if defined(URK_BACKEND_MONO)
@@ -1293,17 +1332,17 @@ namespace Explorer {
 				}
 				void* boxed = nullptr;
 #if defined(_WIN32)
-				__try {
-#endif
-					boxed = URK::managed::value_box(static_cast<const URK::managed::Class*>(trace.return_value_class),
-						record.return_value_bytes.data());
-#if defined(_WIN32)
-				}
-				__except (capture_native_fault(_exception_info())) {
+				bool value_box_faulted = false;
+				boxed = value_box_guarded(static_cast<const URK::managed::Class*>(trace.return_value_class),
+					record.return_value_bytes.data(), value_box_faulted);
+				if (value_box_faulted) {
 					record.return_display = std::string(URK::compiled_runtime_name) +
 						" value_box raised a native access fault";
 					continue;
 				}
+#else
+				boxed = URK::managed::value_box(static_cast<const URK::managed::Class*>(trace.return_value_class),
+					record.return_value_bytes.data());
 #endif
 				if (!boxed) {
 					record.return_display = std::string(URK::compiled_runtime_name) +

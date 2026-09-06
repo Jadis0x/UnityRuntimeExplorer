@@ -120,21 +120,50 @@ namespace Explorer {
 #endif
 	}
 
+#if defined(_WIN32)
+	// A function containing __try cannot itself construct or return a value
+	// of non-trivial destructor type (C2712), even transiently and even if
+	// immediately discarded -- so this leaf only ever touches raw pointers,
+	// and the caller (which has no __try) builds the std::string from them,
+	// mirroring detail::class_display_name()'s own namespace + "." + name
+	// logic.
+	namespace {
+		struct RawClassNameProbe {
+			const char* namespc = nullptr;
+			const char* name = nullptr;
+		};
+		bool runtime_class_name_probe_guarded(Object object, RawClassNameProbe& out) {
+			__try {
+				const void* klass = detail::Backend::object_get_class(object.handle());
+				if (!klass)
+					return true;
+				out.namespc = detail::Backend::class_get_namespace(klass);
+				out.name = detail::Backend::class_get_name(klass);
+				return true;
+			}
+			__except (capture_native_fault(_exception_info())) {
+				return false;
+			}
+		}
+	} // namespace
+#endif
+
 	std::string safe_runtime_class_name(Object object) {
 		if (!safe_object_alive(object))
 			return {};
 #if defined(_WIN32)
-		__try {
-			clear_error();
-			const std::string name = object.runtime_class_name();
-			if (const char* error = last_error(); error && error[0])
-				clear_error();
-			return name;
-		}
-		__except (capture_native_fault(_exception_info())) {
+		clear_error();
+		RawClassNameProbe probe;
+		if (!runtime_class_name_probe_guarded(object, probe)) {
 			clear_error();
 			return {};
 		}
+		std::string name = probe.namespc && probe.namespc[0]
+			? std::string(probe.namespc) + "." + (probe.name ? probe.name : "<unnamed>")
+			: (probe.name && probe.name[0] ? std::string(probe.name) : std::string{});
+		if (const char* error = last_error(); error && error[0])
+			clear_error();
+		return name;
 #else
 		return object.runtime_class_name();
 #endif
@@ -143,18 +172,9 @@ namespace Explorer {
 	Inspect::TypeInfo safe_type_of(Object object) {
 		if (!object || !readable_address(reinterpret_cast<std::uintptr_t>(object.handle())))
 			return {};
-#if defined(_WIN32)
-		__try {
-			clear_error();
-			return Inspect::TypeOf(object);
-		}
-		__except (capture_native_fault(_exception_info())) {
-			clear_error();
-			return {};
-		}
-#else
+		// Inspect::TypeOf() already guards its own native reads internally.
+		clear_error();
 		return Inspect::TypeOf(object);
-#endif
 	}
 
 	std::string normalized_type(std::string_view name) {
@@ -189,26 +209,42 @@ namespace Explorer {
 		return member;
 	}
 
+#if defined(_WIN32)
+	namespace {
+		// safe_type_of() already guards itself, so only the pin/weak call
+		// needs its own __try here; ObjectHandle is trivial (no std::string
+		// members), which keeps this leaf function C2712-safe.
+		Inspect::ObjectHandle pin_or_weak_guarded(Object object, bool use_pin, bool& faulted) {
+			faulted = false;
+			__try {
+				return use_pin ? Inspect::PinObject(object) : Inspect::WeakObject(object);
+			}
+			__except (capture_native_fault(_exception_info())) {
+				faulted = true;
+				return {};
+			}
+		}
+	} // namespace
+#endif
+
 	Inspect::ObjectHandle tracked_reference_handle(const Inspect::ValueInfo& value) {
 		if (!value.object)
 			return {};
-		Inspect::ObjectHandle handle{};
-#if defined(_WIN32)
-		__try {
-#endif
 		const Object object{ value.object };
 		const Inspect::TypeInfo type = safe_type_of(object);
 		// Keep boxed values and returned strings alive until their Inspector tab closes.
-		handle = type.is_value_type || value.kind == Inspect::ValueKind::String
-			? Inspect::PinObject(object) : Inspect::WeakObject(object);
+		const bool use_pin = type.is_value_type || value.kind == Inspect::ValueKind::String;
 #if defined(_WIN32)
-		}
-		__except (capture_native_fault(_exception_info())) {
+		bool faulted = false;
+		Inspect::ObjectHandle handle = pin_or_weak_guarded(object, use_pin, faulted);
+		if (faulted) {
 			detail::set_error("Tracked reference handle creation raised a native access fault");
-			handle = {};
+			return {};
 		}
-#endif
 		return handle;
+#else
+		return use_pin ? Inspect::PinObject(object) : Inspect::WeakObject(object);
+#endif
 	}
 
 	bool values_equivalent(const Inspect::ValueInfo& expected, const Inspect::ValueInfo& actual) {
@@ -321,6 +357,37 @@ namespace Explorer {
 	}
 
 	// Validate copied pointers through a short-lived GC handle before assignment.
+#if defined(_WIN32)
+	namespace {
+		// A function containing __try cannot itself construct or return a
+		// value of non-trivial destructor type (C2712), even transiently and
+		// even if immediately discarded. Only trivial-typed data (handles,
+		// bools) comes out of this leaf; the caller (which has no __try)
+		// builds the ValueInfo/error message from it afterward.
+		struct ReferenceResolveResult {
+			Inspect::ObjectHandle rooted{};
+			void* resolved_handle = nullptr;
+			bool valid = false;
+		};
+		bool reference_value_from_address_guarded(unsigned long long address, const void* destination_type,
+				bool destination_is_value_type, ReferenceResolveResult& out) {
+			__try {
+				out.rooted = Inspect::PinObject(Object{ reinterpret_cast<void*>(static_cast<std::uintptr_t>(address)) });
+				const Object resolved = Inspect::ResolveObjectHandle(out.rooted);
+				out.resolved_handle = resolved.handle();
+				out.valid =
+					out.rooted.handle && resolved &&
+					(!destination_type || (destination_is_value_type ? Inspect::IsBoxedValueOfType(resolved, destination_type)
+						: Inspect::IsAssignableTo(resolved, destination_type)));
+				return true;
+			}
+			__except (capture_native_fault(_exception_info())) {
+				return false;
+			}
+		}
+	} // namespace
+#endif
+
 	bool reference_value_from_text(std::string_view type_name, const void* destination_type, std::string_view text,
 		Inspect::ValueInfo& value, Inspect::ObjectHandle& rooted) {
 		if (text == "null" || text == "NULL" || text == "0") {
@@ -371,40 +438,43 @@ namespace Explorer {
 		if (!address || errno == ERANGE || end == digits || *end != '\0' ||
 			address > static_cast<unsigned long long>(std::numeric_limits<std::uintptr_t>::max()))
 			return false;
+		const bool destination_is_value_type = destination_type && destination.is_value_type;
 		bool valid = false;
+		void* resolved_handle = nullptr;
 #if defined(_WIN32)
-		__try {
-#endif
-			rooted = Inspect::PinObject(Object{ reinterpret_cast<void*>(static_cast<std::uintptr_t>(address)) });
-			const Object resolved = Inspect::ResolveObjectHandle(rooted);
-			const bool destination_is_value_type = destination_type && destination.is_value_type;
-			valid =
-				rooted.handle && resolved &&
-				(!destination_type || (destination_is_value_type ? Inspect::IsBoxedValueOfType(resolved, destination_type)
-					: Inspect::IsAssignableTo(resolved, destination_type)));
-			if (valid) {
-				value = {};
-				value.kind =
-					destination_is_value_type ? Inspect::ValueKind::ValueType : Inspect::ValueKind::ObjectReference;
-				value.type_name = std::string(type_name);
-				value.object = resolved.handle();
-				value.readable = true;
-				value.display = pointer_text(resolved.handle());
-			}
-			else if (rooted.handle && resolved && destination_type) {
-				const Inspect::ObjectRefInfo actual = Inspect::DescribeObject(resolved);
-				detail::set_error("Reference type mismatch: expected " + std::string(type_name) +
-					", received " + (actual.type.full_name.empty() ? std::string("<unknown>") : actual.type.full_name));
-			}
-#if defined(_WIN32)
-		}
-		__except (capture_native_fault(_exception_info())) {
+		ReferenceResolveResult result;
+		if (!reference_value_from_address_guarded(address, destination_type, destination_is_value_type, result)) {
 			detail::set_error("Reference conversion raised a native access fault");
-			valid = false;
+			rooted = result.rooted;
+			return false;
 		}
+		rooted = result.rooted;
+		resolved_handle = result.resolved_handle;
+		valid = result.valid;
+#else
+		rooted = Inspect::PinObject(Object{ reinterpret_cast<void*>(static_cast<std::uintptr_t>(address)) });
+		const Object resolved = Inspect::ResolveObjectHandle(rooted);
+		resolved_handle = resolved.handle();
+		valid =
+			rooted.handle && resolved &&
+			(!destination_type || (destination_is_value_type ? Inspect::IsBoxedValueOfType(resolved, destination_type)
+				: Inspect::IsAssignableTo(resolved, destination_type)));
 #endif
-		if (valid)
+		if (valid) {
+			value = {};
+			value.kind =
+				destination_is_value_type ? Inspect::ValueKind::ValueType : Inspect::ValueKind::ObjectReference;
+			value.type_name = std::string(type_name);
+			value.object = resolved_handle;
+			value.readable = true;
+			value.display = pointer_text(resolved_handle);
 			return true;
+		}
+		if (rooted.handle && resolved_handle && destination_type) {
+			const Inspect::ObjectRefInfo actual = Inspect::DescribeObject(Object{ resolved_handle });
+			detail::set_error("Reference type mismatch: expected " + std::string(type_name) +
+				", received " + (actual.type.full_name.empty() ? std::string("<unknown>") : actual.type.full_name));
+		}
 		Inspect::FreeObjectHandle(rooted);
 		return false;
 	}
@@ -435,6 +505,25 @@ namespace Explorer {
 			message.find("Map is empty") != std::string_view::npos;
 	}
 
+#if defined(_WIN32)
+	namespace {
+		// Only method_pointer() dereferences a possibly-stale native handle;
+		// isolating just that call keeps this leaf function C2712-safe while
+		// the display-name string and map insertion stay in the caller.
+		void* method_pointer_guarded(const void* handle, bool& faulted) {
+			faulted = false;
+			__try {
+				return URK::managed::method_pointer(static_cast<const URK::managed::Method*>(handle));
+			}
+			__except (capture_native_fault(_exception_info())) {
+				// Caller names do not justify a domain-wide fallback scan.
+				faulted = true;
+				return nullptr;
+			}
+		}
+	} // namespace
+#endif
+
 	void remember_managed_method(const Inspect::MethodInfo& method) {
 		if (!method.handle || method.name.empty())
 			return;
@@ -442,27 +531,26 @@ namespace Explorer {
 		// Avoid JIT-compiling arbitrary metadata methods; that can raise native exceptions.
 		return;
 #else
+		void* pointer = nullptr;
 #if defined(_WIN32)
-		__try {
+		bool faulted = false;
+		pointer = method_pointer_guarded(method.handle, faulted);
+		if (faulted || !pointer)
+			return;
+#else
+		pointer = URK::managed::method_pointer(static_cast<const URK::managed::Method*>(method.handle));
+		if (!pointer)
+			return;
 #endif
-			void* const pointer = URK::managed::method_pointer(static_cast<const URK::managed::Method*>(method.handle));
-			if (!pointer)
-				return;
-			const std::string name = method.declaring_type.full_name.empty()
-				? method.name
-				: method.declaring_type.full_name + "." + method.name;
-			auto& index = managed_caller_index();
-			const auto [found, inserted] = index.methods.emplace(reinterpret_cast<std::uintptr_t>(pointer), name);
-			if (inserted)
-				index.sorted_stale = true;
-			else if (found->second != name)
-				found->second = "<shared managed generic code>";
-#if defined(_WIN32)
-		}
-		__except (capture_native_fault(_exception_info())) {
-			// Caller names do not justify a domain-wide fallback scan.
-		}
-#endif
+		const std::string name = method.declaring_type.full_name.empty()
+			? method.name
+			: method.declaring_type.full_name + "." + method.name;
+		auto& index = managed_caller_index();
+		const auto [found, inserted] = index.methods.emplace(reinterpret_cast<std::uintptr_t>(pointer), name);
+		if (inserted)
+			index.sorted_stale = true;
+		else if (found->second != name)
+			found->second = "<shared managed generic code>";
 	#endif
 	}
 

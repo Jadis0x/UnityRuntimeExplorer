@@ -46,6 +46,35 @@ namespace Explorer {
 			return name ? name : "";
 		}
 
+#if defined(_WIN32)
+		// MSVC forbids mixing __try/__except with objects that require
+		// unwinding (e.g. std::string) in the same function (C2712). The
+		// functions below build up plenty of std::string locals elsewhere in
+		// their bodies, so each guarded call is isolated in its own leaf
+		// function instead.
+		bool component_enabled_guarded(Component component, bool& faulted) {
+			faulted = false;
+			__try {
+				return component.GetProperty<bool>("enabled");
+			}
+			__except (capture_native_fault(_exception_info())) {
+				faulted = true;
+				return false;
+			}
+		}
+
+		Inspect::ObjectHandle pin_object_guarded(Object object, bool& faulted) {
+			faulted = false;
+			__try {
+				return Inspect::PinObject(object);
+			}
+			__except (capture_native_fault(_exception_info())) {
+				faulted = true;
+				return {};
+			}
+		}
+#endif
+
 	} // namespace
 
 	void RuntimeModel::refresh_inspector(bool include_components) {
@@ -123,10 +152,9 @@ namespace Explorer {
 					clear_error();
 					bool enabled = false;
 #if defined(_WIN32)
-					__try {
-						enabled = component.GetProperty<bool>("enabled");
-					}
-					__except (capture_native_fault(_exception_info())) {
+					bool faulted = false;
+					enabled = component_enabled_guarded(component, faulted);
+					if (faulted) {
 						// Record native faults from malformed third-party metadata.
 						clear_error();
 						ModLog::warn("Component enabled probe blocked a native access violation: id=%d type=%s",
@@ -474,6 +502,24 @@ namespace Explorer {
 			set_status("Loaded metadata for " + component->type_name + " with explicit member diagnostics");
 	}
 
+#if defined(_WIN32)
+	bool RuntimeModel::set_property_or_field_from_box_guarded(bool is_property, Object parent,
+			const ComponentReflection& reflection, std::size_t index, Object boxed, bool& faulted) {
+		faulted = false;
+		__try {
+			if (is_property)
+				return index < reflection.properties.size() &&
+					Inspect::SetPropertyFromBox(parent, reflection.properties[index], boxed);
+			return index < reflection.fields.size() &&
+				Inspect::SetFieldFromBox(parent, reflection.fields[index], boxed);
+		}
+		__except (capture_native_fault(_exception_info())) {
+			faulted = true;
+			return false;
+		}
+	}
+#endif
+
 	void RuntimeModel::write_back_value_type_object_inspector() {
 		const ObjectInspectorInfo& inspector = working_.object_inspector;
 		const Object parent = resolve_component(inspector.value_origin_component_id);
@@ -483,26 +529,25 @@ namespace Explorer {
 			set_status("Value-type owner is no longer available");
 			return;
 		}
+		const std::size_t index = static_cast<std::size_t>(inspector.value_origin_member_index);
 		bool written = false;
 #if defined(_WIN32)
-		__try {
-#endif
-			if (inspector.value_origin_property) {
-				const std::size_t index = static_cast<std::size_t>(inspector.value_origin_member_index);
-				if (index < reflection->second.properties.size())
-					written = Inspect::SetPropertyFromBox(parent, reflection->second.properties[index], boxed);
-			}
-			else {
-				const std::size_t index = static_cast<std::size_t>(inspector.value_origin_member_index);
-				if (index < reflection->second.fields.size())
-					written = Inspect::SetFieldFromBox(parent, reflection->second.fields[index], boxed);
-			}
-#if defined(_WIN32)
-		}
-		__except (capture_native_fault(_exception_info())) {
+		bool faulted = false;
+		written = set_property_or_field_from_box_guarded(
+			inspector.value_origin_property, parent, reflection->second, index, boxed, faulted);
+		if (faulted) {
 			clear_error();
 			set_status("Value-type write-back blocked an invalid native access");
 			return;
+		}
+#else
+		if (inspector.value_origin_property) {
+			if (index < reflection->second.properties.size())
+				written = Inspect::SetPropertyFromBox(parent, reflection->second.properties[index], boxed);
+		}
+		else {
+			if (index < reflection->second.fields.size())
+				written = Inspect::SetFieldFromBox(parent, reflection->second.fields[index], boxed);
 		}
 #endif
 		if (written)
@@ -986,12 +1031,10 @@ namespace Explorer {
 
 		if (!root.handle) {
 #if defined(_WIN32)
-			__try {
-				root = Inspect::PinObject(Object{ object.handle() });
-			}
-			__except (capture_native_fault(_exception_info())) {
+			bool faulted = false;
+			root = pin_object_guarded(Object{ object.handle() }, faulted);
+			if (faulted)
 				clear_error();
-			}
 #else
 			root = Inspect::PinObject(Object{ object.handle() });
 #endif

@@ -44,6 +44,12 @@ class RuntimeModel {
 
     void process_commands();
     void process_command(const Command &command);
+#if defined(_WIN32)
+    // Isolates the SEH-guarded call: process_commands() has many
+    // std::string/std::vector locals, and MSVC forbids mixing __try/__except
+    // with objects that require unwinding in the same function (C2712).
+    bool process_command_guarded(const Command &command);
+#endif
     bool refresh_hierarchy();
     void refresh_inspector(bool include_components);
     void load_component_metadata(int component_instance_id);
@@ -168,6 +174,13 @@ class RuntimeModel {
         std::vector<URK::Unity::Inspect::MethodInfo> methods;
     };
     std::unordered_map<int, ComponentReflection> component_reflection_;
+#if defined(_WIN32)
+    // ComponentReflection is private, so the SEH-guarded write-back call
+    // (isolated for the same C2712 reason as process_command_guarded above)
+    // has to be a member rather than a free function.
+    bool set_property_or_field_from_box_guarded(bool is_property, URK::Unity::Object parent,
+        const ComponentReflection &reflection, std::size_t index, URK::Unity::Object boxed, bool &faulted);
+#endif
     std::string active_metadata_stage_;
     std::shared_ptr<const ComponentClassCatalog> component_class_catalog_;
     std::shared_ptr<const ClassBrowserCatalog> class_browser_catalog_;

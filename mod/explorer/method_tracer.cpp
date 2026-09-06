@@ -193,25 +193,41 @@ const URK::managed::Class* resolve_class_by_name(std::string_view name) {
     return nullptr;
 }
 
+// MSVC forbids mixing __try/__except with objects that require unwinding
+// (e.g. std::string) in the same function (C2712). std::string_view has a
+// trivial destructor, so it is used here in place of std::string purely to
+// stay compatible with the __try block below; the comparison logic itself is
+// unchanged from the std::string version.
+bool runtime_class_full_name_matches(const char* namespc, const char* class_name, std::string_view expected) {
+    if (!class_name)
+        return expected.empty();
+    const std::string_view class_name_view(class_name);
+    const std::string_view namespc_view = (namespc && namespc[0] != '\0') ? std::string_view(namespc) : std::string_view{};
+    if (namespc_view.empty())
+        return expected == class_name_view;
+    if (expected.size() != namespc_view.size() + 1 + class_name_view.size())
+        return false;
+    return expected.compare(0, namespc_view.size(), namespc_view) == 0 &&
+        expected[namespc_view.size()] == '.' &&
+        expected.compare(namespc_view.size() + 1, class_name_view.size(), class_name_view) == 0;
+}
+
 RuntimeTypeTraits resolve_runtime_type_traits(const void* type_handle, std::string_view display_name) {
     RuntimeTypeTraits traits{};
+    std::string_view normalized = display_name;
+    while (!normalized.empty() && (normalized.back() == '&' || normalized.back() == '*'))
+        normalized.remove_suffix(1);
 #if defined(_WIN32)
     __try {
 #endif
         const auto* klass = type_handle ? URK::managed::type_get_class_or_element_class(
             static_cast<const URK::managed::Type*>(type_handle)) : nullptr;
-        std::string normalized(display_name);
-        while (!normalized.empty() && (normalized.back() == '&' || normalized.back() == '*'))
-            normalized.pop_back();
         if (klass) {
             const char* namespc = URK::managed::class_get_namespace(klass);
             const char* class_name = URK::managed::class_get_name(klass);
-            const std::string class_display = !class_name ? std::string{}
-                : !namespc || namespc[0] == '\0' ? std::string(class_name)
-                : std::string(namespc) + "." + class_name;
             // Bridge type records can point at a proxy class rather than the
             // declared signature type. Do not use that proxy to choose an ABI.
-            if (!normalized.empty() && class_display != normalized)
+            if (!normalized.empty() && !runtime_class_full_name_matches(namespc, class_name, normalized))
                 klass = nullptr;
         }
         if (!klass)

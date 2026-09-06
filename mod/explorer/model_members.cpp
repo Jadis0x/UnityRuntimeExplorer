@@ -203,6 +203,29 @@ namespace Explorer {
 			"]");
 	}
 
+#if defined(_WIN32)
+	namespace {
+		// MSVC forbids mixing __try/__except with objects that require
+		// unwinding (e.g. std::string) in the same function (C2712).
+		// apply_member() below builds many std::string locals, so the guarded
+		// SetProperty/SetField call is isolated in this leaf function instead.
+		template <bool IsProperty, typename Member>
+		bool set_member_value_guarded(Object target, const Member& member, const Inspect::ValueInfo& value, bool& faulted) {
+			faulted = false;
+			__try {
+				if constexpr (IsProperty)
+					return Inspect::SetProperty(target, member, value);
+				else
+					return Inspect::SetField(target, member, value);
+			}
+			__except (capture_native_fault(_exception_info())) {
+				faulted = true;
+				return false;
+			}
+		}
+	} // namespace
+#endif
+
 	void RuntimeModel::set_member_value(const Command& command, bool property, const Inspect::ValueInfo* prepared,
 		bool verify) {
 		const std::uint64_t lock_key = command.reference_token;
@@ -366,15 +389,9 @@ namespace Explorer {
 			}
 
 #if defined(_WIN32)
-			__try {
-#endif
-				if constexpr (is_property)
-					written = Inspect::SetProperty(target, member, value);
-				else
-					written = Inspect::SetField(target, member, value);
-#if defined(_WIN32)
-			}
-			__except (capture_native_fault(_exception_info())) {
+			bool faulted = false;
+			written = set_member_value_guarded<is_property>(target, member, value, faulted);
+			if (faulted) {
 				Inspect::FreeObjectHandle(argument_root);
 				clear_error();
 				set_status(std::string("Set ") + (is_property ? "property" : "field") +
@@ -382,6 +399,11 @@ namespace Explorer {
 				failure_reported = true;
 				return;
 			}
+#else
+			if constexpr (is_property)
+				written = Inspect::SetProperty(target, member, value);
+			else
+				written = Inspect::SetField(target, member, value);
 #endif
 
 			if (written && verify) {

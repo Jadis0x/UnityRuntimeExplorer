@@ -149,6 +149,30 @@ void remember_managed_method(const URK::Unity::Inspect::MethodInfo& method);
 std::string managed_caller_location(std::uintptr_t address);
 
 // Isolate broken managed references from the host callback.
+//
+// NOTE (real MSVC only -- not clang-cl, which also defines _MSC_VER for STL
+// compatibility): cl.exe rejects a function containing __try/__except that
+// constructs or returns a value of non-trivial destructor type -- not even
+// transiently, and not even if the value is immediately discarded (verified
+// directly against cl.exe: C2712 fires even for a fully-discarded call to a
+// function returning std::string). clang does not enforce this and keeps
+// the guard. ValueInfo is exactly such a type, and `read()` is an arbitrary
+// caller-supplied callback (typically ReadProperty/ReadField/
+// ReadArrayElement/InvokeMethod), so there is no way to keep __try here
+// under real MSVC without also making every one of those call paths return
+// trivial data through out-parameters first (as was done for ReadField and
+// DescribeClass/TypeOf in unity_inspect.h). That is a larger, separate
+// change; until it is done, this call is unguarded under real MSVC and
+// relies on whatever __try exists further up the call stack (e.g. the guard
+// around SetProperty/SetField in model_members.cpp, or
+// process_command_guarded in explorer_model.cpp) to contain a fault raised
+// while reading a value.
+#if defined(_WIN32) && defined(_MSC_VER) && !defined(__clang__)
+template <class Read>
+URK::Unity::Inspect::ValueInfo guarded_managed_read(std::string_view, Read&& read) {
+	return read();
+}
+#else
 template <class Read>
 URK::Unity::Inspect::ValueInfo guarded_managed_read(std::string_view type_name, Read&& read) {
 #if defined(_WIN32)
@@ -163,5 +187,6 @@ URK::Unity::Inspect::ValueInfo guarded_managed_read(std::string_view type_name, 
 	return read();
 #endif
 }
+#endif
 
 } // namespace Explorer

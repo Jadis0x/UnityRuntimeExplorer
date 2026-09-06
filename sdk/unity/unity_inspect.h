@@ -226,6 +226,20 @@ inline std::uint64_t QuarantinedObjectHandleCount() {
     return detail::quarantined_gchandle_counter().load(std::memory_order_relaxed);
 }
 inline void emit(DiagnosticSink sink, const char* text) { if (sink) sink(text); }
+#if defined(_WIN32)
+// MSVC forbids mixing __try/__except with objects that require unwinding
+// (e.g. std::string) in the same function (C2712), so the guarded call is
+// isolated in its own leaf function that only deals in trivial types.
+inline bool type_get_name_guarded(const void* type, char* out, std::size_t out_size, bool& faulted) {
+    faulted = false;
+    __try {
+        return URK::managed::type_get_name(static_cast<const URK::managed::Type*>(type), out, out_size) != 0;
+    } __except (metadata_exception_filter(_exception_code())) {
+        faulted = true;
+        return false;
+    }
+}
+#endif
 inline std::string type_name(const void* type) {
     if (!type) return {};
     char out[256]{};
@@ -233,13 +247,13 @@ inline std::string type_name(const void* type) {
     // Some IL2CPP builds expose transient type records while a generated
     // component is being initialized. A failed type name must not poison the
     // whole reflection pass (or escape the host's main-thread callback).
-    __try {
-        return URK::managed::type_get_name(static_cast<const URK::managed::Type*>(type), out, sizeof(out))
-            ? std::string(out) : std::string{};
-    } __except (metadata_exception_filter(_exception_code())) {
+    bool faulted = false;
+    const bool ok = type_get_name_guarded(type, out, sizeof(out), faulted);
+    if (faulted) {
         detail::set_error("Unity Inspect type_get_name raised a native access fault for an invalid type record");
         return {};
     }
+    return ok ? std::string(out) : std::string{};
 #else
     return URK::managed::type_get_name(static_cast<const URK::managed::Type*>(type), out, sizeof(out))
         ? std::string(out) : std::string{};
@@ -317,14 +331,49 @@ inline MemberTypeInfo describe_member_type(const void* type) {
     }
     return out;
 }
+#if defined(_WIN32)
+// Same C2712 constraint as type_name(): keep this leaf function free of any
+// object with a non-trivial destructor so it can coexist with __try/__except.
+struct ClassMetadataProbe {
+    const char* namespc = nullptr;
+    const char* name = nullptr;
+    std::uint32_t flags = 0;
+    bool is_value_type = false;
+    bool is_enum = false;
+    bool faulted = false;
+};
+inline ClassMetadataProbe probe_class_metadata(const URK::managed::Class* k) {
+    ClassMetadataProbe probe;
+    __try {
+        probe.namespc = URK::managed::class_get_namespace(k);
+        probe.name = URK::managed::class_get_name(k);
+        probe.flags = URK::managed::class_get_flags(k);
+        probe.is_value_type = URK::managed::class_is_valuetype(k);
+        probe.is_enum = URK::managed::class_is_enum(k);
+    } __except (metadata_exception_filter(_exception_code())) {
+        probe.faulted = true;
+    }
+    return probe;
+}
+#endif
 inline TypeInfo DescribeClass(const void* klass) {
     TypeInfo out{};
     out.handle = klass;
     if (!klass) return out;
     const auto* k = static_cast<const URK::managed::Class*>(klass);
 #if defined(_WIN32)
-    __try {
-#endif
+    const ClassMetadataProbe probe = probe_class_metadata(k);
+    if (probe.faulted) {
+        detail::set_error("Unity Inspect DescribeClass raised a native access fault for an invalid class record");
+        return {};
+    }
+    out.namespc = probe.namespc ? probe.namespc : "";
+    out.name = probe.name ? probe.name : "";
+    out.full_name = out.namespc.empty() ? out.name : out.namespc + "." + out.name;
+    out.flags = probe.flags;
+    out.is_value_type = probe.is_value_type;
+    out.is_enum = probe.is_enum;
+#else
     const char* ns = URK::managed::class_get_namespace(k);
     const char* name = URK::managed::class_get_name(k);
     out.namespc = ns ? ns : "";
@@ -333,24 +382,23 @@ inline TypeInfo DescribeClass(const void* klass) {
     out.flags = URK::managed::class_get_flags(k);
     out.is_value_type = URK::managed::class_is_valuetype(k);
     out.is_enum = URK::managed::class_is_enum(k);
-#if defined(_WIN32)
-    } __except (metadata_exception_filter(_exception_code())) {
-        detail::set_error("Unity Inspect DescribeClass raised a native access fault for an invalid class record");
-        return {};
-    }
 #endif
     return out;
 }
+#if defined(_WIN32)
+inline const URK::managed::Class* probe_type_class(const void* type) {
+    __try {
+        return URK::managed::type_get_class_or_element_class(static_cast<const URK::managed::Type*>(type));
+    } __except (metadata_exception_filter(_exception_code())) {
+        detail::set_error("Unity Inspect type_get_class_or_element_class raised a native access fault for an invalid type record");
+        return nullptr;
+    }
+}
+#endif
 inline TypeInfo DescribeType(const void* type) {
     if (!type) return {};
 #if defined(_WIN32)
-    __try {
-        return DescribeClass(URK::managed::type_get_class_or_element_class(
-            static_cast<const URK::managed::Type*>(type)));
-    } __except (metadata_exception_filter(_exception_code())) {
-        detail::set_error("Unity Inspect type_get_class_or_element_class raised a native access fault for an invalid type record");
-        return {};
-    }
+    return DescribeClass(probe_type_class(type));
 #else
     return DescribeClass(URK::managed::type_get_class_or_element_class(
         static_cast<const URK::managed::Type*>(type)));
@@ -379,9 +427,22 @@ inline bool IsDelegateType(const void* type) {
 #endif
     return false;
 }
+#if defined(_WIN32)
+inline const void* probe_object_class(void* handle) {
+    __try {
+        return detail::Backend::object_get_class(handle);
+    } __except (metadata_exception_filter(_exception_code())) {
+        return nullptr;
+    }
+}
+#endif
 inline TypeInfo TypeOf(Object object) {
     detail::clear_error();
+#if defined(_WIN32)
+    const void* klass = probe_object_class(object.handle());
+#else
     const void* klass = detail::Backend::object_get_class(object.handle());
+#endif
     if (!klass) { detail::set_error("Unity Inspect::TypeOf failed: object_get_class failed"); detail::append_backend_error(); return {}; }
     return DescribeClass(klass);
 }
@@ -1529,6 +1590,17 @@ inline bool read_field_scalar_pointer(Object object, const FieldInfo& field, std
     detail::set_error(std::string("Unity Inspect::ReadField failed: unsupported scalar field type: ") + std::string(typeName));
     return false;
 }
+#if defined(_WIN32)
+inline void* field_get_value_object_guarded(const void* field_handle, void* object_handle, bool& faulted) {
+    faulted = false;
+    __try {
+        return detail::Backend::field_get_value_object(field_handle, object_handle);
+    } __except (metadata_exception_filter(_exception_code())) {
+        faulted = true;
+        return nullptr;
+    }
+}
+#endif
 inline ValueInfo ReadField(Object object, const FieldInfo& field) {
     detail::clear_error();
     if (field.type_is_opaque)
@@ -1537,9 +1609,9 @@ inline ValueInfo ReadField(Object object, const FieldInfo& field) {
 	// Use the boxed accessor for generated and generic fields.
 	void* boxed = nullptr;
 #if defined(_WIN32)
-	__try {
-		boxed = detail::Backend::field_get_value_object(field.handle, object.handle());
-	} __except (metadata_exception_filter(_exception_code())) {
+	bool faulted = false;
+	boxed = field_get_value_object_guarded(field.handle, object.handle(), faulted);
+	if (faulted) {
 		detail::set_error(std::string("Unity Inspect::ReadField failed: field accessor raised a native access fault: ") + field.name);
 		return unavailable_value(field.type_name, detail::fallback_error());
 	}
