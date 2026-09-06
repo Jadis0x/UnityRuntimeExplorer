@@ -97,6 +97,16 @@ set(URK_COMMON_SOURCES
         mod/generated/mod_lifecycle.cpp
         mod/generated/mod_entry.cpp
         mod/explorer/explorer_model.cpp
+        mod/explorer/model_shared.cpp
+        mod/explorer/model_hierarchy.cpp
+        mod/explorer/model_class_browser.cpp
+        mod/explorer/model_object_inspector.cpp
+        mod/explorer/model_members.cpp
+        mod/explorer/model_reference_graph.cpp
+        mod/explorer/model_field_watch.cpp
+        mod/explorer/model_tracing.cpp
+        mod/explorer/model_scene.cpp
+        mod/explorer/model_camera_highlight.cpp
         mod/explorer/explorer_ui.cpp
         mod/explorer/ui_state.cpp
         mod/explorer/ui_members.cpp
