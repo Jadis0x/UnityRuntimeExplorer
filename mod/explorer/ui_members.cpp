@@ -1628,6 +1628,12 @@ void render_method_result(const Snapshot &snapshot, int component_id, std::size_
     ImGui::TextWrapped("%s", result.display.c_str());
     if (!result.reference.is_null && result.reference.token != 0) {
         render_reference_context_menu(&result.reference);
+    } else if (ImGui::BeginPopupContextItem("##method-result-copy")) {
+        // A string/scalar result has no managed handle to inspect: its full value
+        // is already the text on screen, so the only useful action left is copying it.
+        if (ImGui::MenuItem("Copy value"))
+            ImGui::SetClipboardText(result.display.c_str());
+        ImGui::EndPopup();
     }
 }
 namespace {
