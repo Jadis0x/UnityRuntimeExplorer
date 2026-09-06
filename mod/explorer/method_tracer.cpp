@@ -148,6 +148,20 @@ const URK::managed::Class* resolve_class_by_name(std::string_view name) {
     if (const auto found = cache.find(normalized); found != cache.end())
         return found->second;
 
+    {
+        const std::size_t separator = normalized.rfind('.');
+        const std::string namespc = separator == std::string::npos ? std::string{} : normalized.substr(0, separator);
+        const std::string leaf = separator == std::string::npos ? normalized : normalized.substr(separator + 1);
+        if (!leaf.empty()) {
+            if (const auto* klass = URK::managed::find_class("", namespc.c_str(), leaf.c_str())) {
+                cache.emplace(std::move(normalized), klass);
+                return klass;
+            }
+        }
+    }
+
+    // Fallback for names the direct lookup cannot express - nested types, and
+    // any backend whose class_from_name does not cover the requested image.
     constexpr std::size_t kMaxClassesToSearch = 250000;
     std::size_t visited = 0;
     for (std::size_t assembly_index = 0;
