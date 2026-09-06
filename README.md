@@ -7,131 +7,110 @@
 
 # UnityRuntimeExplorer
 
-UnityRuntimeExplorer is a runtime inspector for Windows Unity games. It loads
-as a URKit mod and gives you a live view of the running process: scenes,
-GameObjects, components, managed members, references, and selected runtime
-values can be inspected without rebuilding the game.
+A runtime inspector for Windows Unity games. It loads as a URKit mod and lets
+you look at a running game from the inside: scenes, GameObjects, components,
+fields, references, live values, all without rebuilding anything.
 
-The project is built on the [URKit](https://github.com/Jadis0x/URKit) native
-C++ SDK. URKit provides the loader, Unity bindings, Mono/IL2CPP runtime access,
-main-thread dispatch, hooks, and ImGui integration. UnityRuntimeExplorer adds
-the Explorer UI and the inspection model on top of those services.
+It's built on [URKit](https://github.com/Jadis0x/URKit), which handles the
+loader, Unity/Mono/IL2CPP bindings, hooks, and ImGui. UnityRuntimeExplorer is
+the Explorer UI and inspection logic on top of that.
 
 ![UnityRuntimeExplorer](showcase/ss1.png)
 
 ![UnityRuntimeExplorer](showcase/ss2.png)
 
-## Features
+## What it does
 
-- Browse loaded scenes, hidden roots, and `DontDestroyOnLoad` objects.
-- Search GameObjects by name, tag, or instance ID.
-- Inspect GameObjects, components, fields, properties, and methods.
-- Read and edit supported values while the game is running.
-- Copy and paste local transforms from the Inspector or the Hierarchy context
-  menu.
-- Duplicate, delete, enable, disable, and add components when the target game
-  and runtime support the operation.
-- Follow managed object references and open returned objects in the Object
-  Inspector.
-- Invoke methods with supported signatures.
-- Trace managed methods, including callers, arguments, return values, ABI data,
-  and captured value types.
-- Focus the camera on an object and highlight it in the game.
-- Use a dockable ImGui interface with DX11, DX12, and OpenGL render paths.
-- Investigate the live game from MCP clients through a separate helper,
-  including managed type discovery and explicitly approved method tracing.
+It's a live hierarchy/inspector for the running game: scenes, hidden roots,
+and `DontDestroyOnLoad` objects, searchable by name, tag, or instance ID.
+From there you can inspect GameObjects, components, fields, properties, and
+methods, edit values on the spot, copy/paste transforms, duplicate or delete
+components, follow a reference straight into the Object Inspector, or invoke
+a method directly.
 
-The Inspector resolves type and member information from the runtime rather than
-using a game-specific type list. As a result, unsupported or unsafe operations
-are reported as unavailable instead of being guessed.
+The thing that goes beyond just poking at values is method tracing: hook a
+managed method and watch its callers, arguments, return values, and captured
+objects as it actually gets called, live. There's also an optional MCP
+server, so an AI client can drive the same inspection (and even tracing)
+instead of you clicking through it by hand.
 
-## Runtime support
+UI is ImGui, dockable, runs on DX11, DX12, and OpenGL. Everything is read
+from the runtime's own type metadata instead of a hardcoded per-game list, so
+an operation that isn't safe on a given object gets reported as unavailable
+instead of the tool silently doing the wrong thing.
 
-Two plugin binaries are produced:
+## Which DLL to use
+
+Two builds are produced, one per runtime backend:
 
 ```text
 URK_Il2cpp_UnityRuntimeExplorer.dll   # IL2CPP games
 URK_Mono_UnityRuntimeExplorer.dll     # Mono games
 ```
 
-Use only the binary that matches the target game. The two plugins share the
-Explorer UI and inspection code, but use different runtime backends.
+Use whichever matches the game. Mixing them up won't work.
 
-Compatibility depends on the game's Unity version, generated metadata, runtime
-exports, and the URKit version used to load the mod. Mono support also depends
-on the embedding exports shipped by the game.
+Whether it works at all also depends on the game's Unity version, its
+generated metadata, and what runtime exports it ships. Mono games in
+particular need the right embedding exports.
 
-## Installation
+## Installing
 
-Download URKit from the [URKit v0.3.0 release](https://github.com/Jadis0x/URKit/releases/tag/v0.3.0).
+Grab URKit from the [v0.3.0 release](https://github.com/Jadis0x/URKit/releases/tag/v0.3.0).
+You only need `urk-sdk.exe` if you're building your own URKit mods, not for
+this.
 
-`urk-sdk.exe` is not required to use UnityRuntimeExplorer. It is only needed
-for creating new URKit mod projects.
+Then grab the Explorer DLL for the game's runtime (same two files as above).
 
-Download the Explorer DLL matching the target game's runtime:
+### Standard proxy setup
 
-```text
-URK_Il2cpp_UnityRuntimeExplorer.dll   # IL2CPP games
-URK_Mono_UnityRuntimeExplorer.dll     # Mono games
-```
+1. Pick one proxy (`version.dll`, `winhttp.dll`, or `winmm.dll`) matching
+   something the game already imports. Only one, not all three.
+2. Put that proxy DLL next to the game's executable.
+3. Make a `Mods` folder next to the executable.
+4. Drop the matching Explorer DLL into `Mods`.
+5. Launch the game.
+6. Press **F7** to toggle the Explorer.
 
-Use only one of these DLLs. Do not use the IL2CPP plugin for a Mono game, or
-the Mono plugin for an IL2CPP game.
+### Proxy-free (injector) setup
 
-### Standard proxy workflow
+1. Grab `URKitInjector.dll` from the URKit release.
+2. No proxy DLL or `Mods` folder needed.
+3. Inject `URKitInjector.dll` into the game (Windows x64 only).
+4. Pick your URKit `.ini` when prompted.
+5. Pick the matching Explorer DLL.
 
-1. From `version.dll`, `winhttp.dll`, and `winmm.dll`, choose only the proxy
-   matching a DLL imported by the game executable.
-2. Place that single proxy DLL next to the game executable. Do not place all
-   three.
-3. Create a `Mods` folder beside the game executable.
-4. Copy the Explorer DLL matching the game's runtime into the `Mods` folder.
-5. Start the game normally.
-6. Press **F7** to open or close the Explorer.
+Don't inject either Explorer DLL directly, it has to be loaded by URKit or
+the injector as a plugin.
 
-### Proxy-free injector workflow
+If nothing shows up, check `URKit_logs.log` next to the game exe. It'll
+usually tell you if the proxy name, backend, or a runtime export is wrong.
 
-1. Use `URKitInjector.dll` from the URKit release.
-2. No proxy DLL or `Mods` folder is required.
-3. Inject `URKitInjector.dll` into the supported Windows x64 game.
-4. Select the URKit configuration `.ini` when prompted.
-5. Select the Explorer DLL matching the game's runtime.
+## Building it yourself
 
-Do not inject either Explorer DLL directly. It must be loaded by URKit or
-`URKitInjector.dll` as a URKit plugin.
+Windows only, with CMake + Ninja + Clang.
 
-If the Explorer does not appear, inspect `URKit_logs.log` beside the game
-executable. The log usually identifies a wrong proxy name, an incompatible
-backend, or a missing runtime export.
+You'll need:
 
-## Building from source
-
-Builds are supported on Windows with CMake, Ninja, and Clang.
-
-Requirements:
-
-- Windows 10 or newer, x64
-- CMake 3.28 or newer
+- Windows 10+, x64
+- CMake 3.28+
 - LLVM/Clang
 - Ninja
-- Network access for the first configure, which downloads ImGui and the other
-  CMake dependencies
-
-From the repository root:
+- Internet on first configure (pulls ImGui and other dependencies)
 
 ```powershell
 cmake --preset clang-release
 cmake --build --preset clang-release --parallel
 ```
 
-For a debug build:
+Debug build:
 
 ```powershell
 cmake --preset clang-debug
 cmake --build --preset clang-debug --parallel
 ```
 
-Release outputs are written to:
+Output lands in:
 
 ```text
 out/build/clang-release/URK_Il2cpp_UnityRuntimeExplorer.dll
@@ -139,78 +118,74 @@ out/build/clang-release/URK_Mono_UnityRuntimeExplorer.dll
 out/build/clang-release/URK_UnityRuntimeExplorer_McpServer.exe
 ```
 
-Run the test suite with:
+Tests:
 
 ```powershell
 ctest --test-dir out/build/clang-release --output-on-failure
 ```
 
-## MCP integration
+## MCP (optional)
 
-MCP support is optional. The MCP server is not embedded in the injected DLL.
-Instead, the architecture has three parts:
+If you want an AI client to be able to look at (or poke) the running game,
+there's an MCP server for that. It's a separate process, not part of the
+injected DLL:
 
-1. The Explorer DLL runs inside Unity and owns all runtime access.
-2. A local Windows named-pipe bridge carries bounded requests to the Unity main
-   thread.
-3. `URK_UnityRuntimeExplorer_McpServer.exe` is a separate MCP server that
-   speaks JSON-RPC over stdio to the MCP client.
+1. The Explorer DLL runs in-game and owns all runtime access.
+2. A local named pipe carries requests over to the Unity main thread.
+3. `URK_UnityRuntimeExplorer_McpServer.exe` talks JSON-RPC over stdio to your
+   MCP client.
 
-The helper discovers running Explorer instances through:
+The server finds running Explorer instances via:
 
 ```text
 %LOCALAPPDATA%\URK\UnityRuntimeExplorer\bridges
 ```
 
-When one compatible game is running, it attaches automatically. If several are
-running, pass `--game-pid <pid>` in the MCP client configuration.
+If only one compatible game is running it attaches automatically; with
+several running, pass `--game-pid <pid>`.
 
-The MCP helper publishes a complete discovery and control catalog. Explorer's
-**Config** tab is the authoritative permission boundary; clients cannot grant
-themselves capabilities through tool arguments or helper flags.
+Permissions live in Explorer's **Config** tab, that's the real gate. Clients
+can't grant themselves more access just by asking for it.
 
-| Tool | Purpose |
+| Tool | What it's for |
 | --- | --- |
-| `runtime_status` | Runtime backend, scene, GC, revision, and diagnostic status. |
-| `discover_runtime` | Search GameObjects and loaded managed types in one bounded discovery pass. |
-| `hierarchy_search` | Bounded search by name, path, tag, instance ID, component, or dynamic behaviour type. |
-| `find_game_objects` | Rank objects by name/path, components, dynamic behaviour types, scene, activity, and semantic role. |
-| `get_selected_object` | Return the object selected in the Explorer. |
-| `inspect_game_object` | Inspect identity, state, transform, and components. |
-| `list_components` | List component types and opaque component references. |
-| `read_member` | Read one explicitly requested field or readable property. |
-| `inspect_managed_object` | Traverse fields on components and ordinary managed objects; property getters are opt-in. |
-| `read_array` | Page through managed arrays while preserving reference elements as opaque tokens. |
-| `decode_byte_array` | Copy and decode bounded byte arrays as MessagePack, JSON, text, compressed-payload detection, or hex. |
-| `start_instance_scan` | Start a direct Unity-object query or a time-sliced reachable managed-object scan. |
-| `get_instance_scan` | Read scan progress and page through discovered managed instances. |
+| `runtime_status` | Backend, scene, GC, revision, diagnostics. |
+| `discover_runtime` | One-shot search over GameObjects and loaded types. |
+| `hierarchy_search` | Search by name, path, tag, instance ID, component, or behaviour type. |
+| `find_game_objects` | Rank objects by name, components, scene, activity, role. |
+| `get_selected_object` | Whatever's selected in the Explorer. |
+| `inspect_game_object` | Identity, state, transform, components. |
+| `list_components` | Component types and references on an object. |
+| `read_member` | Read one specific field or property. |
+| `inspect_managed_object` | Walk fields on a component or managed object (getters are opt-in). |
+| `read_array` | Page through a managed array. |
+| `decode_byte_array` | Decode a byte array as MessagePack, JSON, text, or hex. |
+| `start_instance_scan` / `get_instance_scan` | Scan for managed instances and page through results. |
 | `search_types` | Search loaded Mono/IL2CPP types and assemblies. |
-| `search_members` | Search fields, properties, and methods across bounded matching types. |
-| `inspect_type` | Inspect fields, properties, methods, and signatures. |
-| `list_method_traces` | List active and retained trace sessions. Consecutive identical calls are grouped. |
-| `get_method_trace` | Read decoded calls, callers, arguments, and results. Grouped calls include their range and repeat count. |
-| `build_call_graph` | Aggregate caller-to-target relationships from captured calls, including grouped repeats. |
-| `get_activity_log` | Read recent Explorer activity and MCP audit events. |
-| `build_reference_graph` | Build a bounded graph for the current selection. |
-| `get_watch_history` | Return watched values and recent changes. |
-| `export_diagnostic_bundle` | Export a diagnostic bundle to the fixed local directory. |
-| `write_member` | Write fields or writable properties using bounded JSON values and opaque references. |
-| `mutate_game_object` | Rename, retag, relayer, activate, transform, duplicate, or destroy a GameObject. |
-| `manage_component` | Add, remove, or enable components. |
-| `load_scene` | Load a build scene by index or name. |
+| `search_members` | Search fields, properties, and methods across types. |
+| `inspect_type` | Fields, properties, methods, signatures. |
+| `list_method_traces` / `get_method_trace` | List and read active/retained method traces. |
+| `build_call_graph` | Turn captured calls into a caller→target graph. |
+| `get_activity_log` | Recent Explorer activity and MCP audit log. |
+| `build_reference_graph` | Reference graph for the current selection. |
+| `get_watch_history` | Watched values and recent changes. |
+| `export_diagnostic_bundle` | Dump a diagnostic bundle to disk. |
+| `write_member` | Write a field or property. |
+| `mutate_game_object` | Rename, retag, relayer, activate, transform, duplicate, destroy. |
+| `manage_component` | Add, remove, enable components. |
+| `load_scene` | Load a scene by index or name. |
 
-Object, component, managed-object, scan, type, method, and trace references are opaque, bounded
-tokens. Managed pointers, native addresses, raw ABI values, and runtime handles
-are never sent to the MCP client.
+Object/component/type/trace references handed to the client are opaque tokens.
+Raw pointers and native addresses never leave the process.
 
-The Config tab provides **Enable full access** and **Read-only preset** actions,
-plus independent controls for automatic discovery, property getters, writes,
-method tracing, managed invocation, and destructive Unity operations. Tool
-calls are schema-validated, bounded, rate-limited, and audited. Raw pointers,
-native-address execution, scripting, and assembly loading remain outside the
-MCP surface because they bypass Explorer's managed object/lifetime model.
+Config also has quick **Enable full access** / **Read-only** presets, plus
+separate toggles for discovery, property getters, writes, tracing, invoking
+methods, and destructive operations. Calls are validated, rate-limited, and
+logged. Raw pointer access, native code execution, and assembly loading are
+not exposed over MCP at all, since they'd bypass Explorer's object model
+entirely.
 
-A typical investigation is:
+A typical session looks like:
 
 ```text
 runtime_status
@@ -218,75 +193,67 @@ runtime_status
   -> inspect_game_object / inspect_type / start_instance_scan
   -> inspect_managed_object / read_array / decode_byte_array
   -> start_method_trace
-  -> reproduce the behavior in game
+  -> (go trigger the behavior in-game)
   -> get_method_trace / build_call_graph
   -> stop_method_trace
 ```
 
-Ready-to-copy MCP client configuration examples are included for:
+Ready-made client configs:
 
 - [Claude Desktop](docs/examples/claude-desktop-config.json)
 - [Codex](docs/examples/codex-config.toml)
 - [Other stdio MCP clients](docs/examples/generic-mcp-config.json)
 
-Replace the placeholder executable path in the selected example with the full
-path to `URK_UnityRuntimeExplorer_McpServer.exe`. If multiple compatible games
-are running, add `"--game-pid", "<pid>"` to the example's `args` list.
+Swap in the real path to `URK_UnityRuntimeExplorer_McpServer.exe`, and add
+`"--game-pid", "<pid>"` to `args` if you've got more than one game running.
 
-Client-specific setup instructions, security properties, troubleshooting, and
-remote HTTPS/tunnel guidance are in [docs/MCP.md](docs/MCP.md).
+Full setup, security notes, troubleshooting, and remote/tunnel info live in
+[docs/MCP.md](docs/MCP.md).
 
-## Compatibility and stability
+## Compatibility
 
-Runtime inspection depends on the target game's metadata and runtime layout.
-The same type or method can have a different ABI or managed representation in
-another game. A member may also be unavailable because metadata was stripped,
-the object was destroyed, or the operation is not safe to perform generically.
+Inspection depends entirely on the target game's metadata and runtime layout,
+so the same type or method can behave differently from one game to the next.
+A member can be unavailable because it's stripped, the object is dead, or the
+operation just isn't safe to do generically.
 
-Tracing, live edits, method calls, and component operations can affect game
-state or stability. Test with a restartable game session and keep backups of
-any data that matters.
+Tracing, live edits, and method calls can affect game state or crash it. Use a
+restartable session and keep backups of anything that matters.
 
 ## Troubleshooting
 
-### The Explorer does not open
+**Explorer won't open**
+- Make sure URKit loaded the DLL matching the game's Mono/IL2CPP backend.
+- Check `URKit_logs.log` next to the game exe.
+- Double check the proxy name and `Mods` layout.
+- Press **F7** after reaching the main menu or a loaded scene, not before.
 
-- Confirm that URKit loaded the DLL matching the game's Mono/IL2CPP backend.
-- Check `URKit_logs.log` beside the game executable.
-- Confirm that the proxy filename and `Mods` layout match the URKit setup.
-- Press **F7** after the game has reached its main menu or a loaded scene.
+**MCP says no bridge available**
+- Start the game (with the Explorer DLL loaded) before starting the MCP client.
+- Check the helper exe path in your client config.
+- More than one game running? Set `--game-pid <pid>`.
+- Look in `%LOCALAPPDATA%\URK\UnityRuntimeExplorer\bridges` and in
+  `URKit_logs.log`.
 
-### MCP reports that no bridge is available
+**An MCP reference expired**
+- Re-run `find_game_objects` or `hierarchy_search` after a scene change.
+  Object/component references survive normal hierarchy refreshes; graph
+  references don't.
 
-- Start the game with the Explorer DLL loaded before starting the MCP client.
-- Confirm that the helper executable exists at the configured path.
-- If more than one game is running, configure `--game-pid <pid>`.
-- Check `%LOCALAPPDATA%\URK\UnityRuntimeExplorer\bridges` for a discovery
-  record and inspect `URKit_logs.log` for runtime load errors.
-
-### An MCP reference has expired
-
-Run `find_game_objects` or `hierarchy_search` again after a scene-generation
-change. Object and component references survive ordinary hierarchy refreshes;
-graph references remain tied to the hierarchy revision that produced them.
-
-### A member cannot be read
-
-The member may be a property with side effects, stripped from metadata, opaque
-to the generic inspector, or attached to a destroyed object. The tool returns
-the failure instead of substituting a default value.
+**A member won't read**
+- It might be a property with side effects, stripped metadata, or attached to
+  a destroyed object. The tool tells you it failed rather than making
+  something up.
 
 ## Project status
 
-UnityRuntimeExplorer is under active development. Compatibility reports and
-small, reproducible examples are especially useful when opening an issue.
-Include the following information:
+Still actively developed. If something doesn't work on your game, an issue
+with the following helps a lot:
 
-- game runtime: IL2CPP or Mono;
-- Unity version, if known;
-- the relevant section of `URKit_logs.log`;
-- the type or method signature involved; and
-- what the Explorer displayed and what you expected to see.
+- runtime (IL2CPP or Mono) and Unity version, if known
+- the relevant bit of `URKit_logs.log`
+- the type/method signature involved
+- what you expected vs. what actually happened
 
 ## License
 
