@@ -293,7 +293,7 @@ std::string result(const MethodTracer::Snapshot& trace, const MethodTracer::Reco
     if (type_is(trace.return_type, "System.Void", "Void", "void"))
         return "void";
     if (!record.return_captured)
-        return "<pending return>";
+        return trace.captures_return ? "<pending return>" : "<not captured: entry hook>";
     if (!record.return_display.empty())
         return record.return_display;
     if (trace.return_is_opaque)

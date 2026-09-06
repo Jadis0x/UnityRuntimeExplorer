@@ -319,6 +319,24 @@ if(URK_BUILD_TESTS)
     urk_disable_vs_vcpkg_integration(urk_mono_runtime_tests)
     add_test(NAME mono_runtime_v8_contract COMMAND urk_mono_runtime_tests)
 
+    add_executable(urk_invoke_result_decode_tests
+        tests/invoke_result_decode_tests.cpp
+        sdk/mono/mono_native_api.cpp
+        sdk/mono/mono_runtime.cpp
+    )
+    target_include_directories(urk_invoke_result_decode_tests PRIVATE .)
+    target_compile_features(urk_invoke_result_decode_tests PRIVATE cxx_std_20)
+    target_compile_definitions(urk_invoke_result_decode_tests PRIVATE
+        WIN32_LEAN_AND_MEAN
+        NOMINMAX
+        URK_BACKEND_MONO
+    )
+    if(MSVC)
+        target_compile_options(urk_invoke_result_decode_tests PRIVATE /W4 /permissive- /EHsc /utf-8)
+    endif()
+    urk_disable_vs_vcpkg_integration(urk_invoke_result_decode_tests)
+    add_test(NAME invoke_result_decode_contract COMMAND urk_invoke_result_decode_tests)
+
     add_executable(urk_method_trace_format_tests
         tests/method_trace_format_tests.cpp
         mod/explorer/method_trace_format.cpp

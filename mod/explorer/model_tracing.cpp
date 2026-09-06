@@ -52,7 +52,7 @@ namespace Explorer {
 		}
 		std::string error;
 		remember_managed_method(method);
-		if (!MethodTracer::start(method, command.capture_return, nullptr, error)) {
+		if (!MethodTracer::start(method, command.capture_return, nullptr, true, error)) {
 			set_status("Method tracing failed: " + error);
 			return;
 		}

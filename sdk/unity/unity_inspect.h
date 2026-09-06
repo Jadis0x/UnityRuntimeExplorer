@@ -743,8 +743,7 @@ inline ValueInfo enum_placeholder(std::string typeName) {
     out.readable = false;
     return out;
 }
-inline std::string enum_underlying_type_name(const void* type) {
-    const void* klass = type ? URK::managed::type_get_class_or_element_class(static_cast<const URK::managed::Type*>(type)) : nullptr;
+inline std::string enum_underlying_type_name_from_class(const void* klass) {
     if (!klass) return {};
     const void* underlying = URK::managed::class_enum_basetype(static_cast<const URK::managed::Class*>(klass));
     if (underlying) return type_name(underlying);
@@ -754,6 +753,10 @@ inline std::string enum_underlying_type_name(const void* type) {
         if (name && std::string_view{name} == "value__") return type_name(URK::managed::field_get_type(field));
     }
     return {};
+}
+inline std::string enum_underlying_type_name(const void* type) {
+    return enum_underlying_type_name_from_class(
+        type ? URK::managed::type_get_class_or_element_class(static_cast<const URK::managed::Type*>(type)) : nullptr);
 }
 inline ValueInfo scalar_from_pointer(std::string typeName, void* data);
 inline ValueInfo enum_from_pointer(std::string typeName, std::string underlyingTypeName, void* data) {
@@ -1302,13 +1305,74 @@ inline ValueInfo void_value() {
     out.readable = true;
     return out;
 }
+// A result pointer is not guaranteed to be a managed object: a runtime-specific
+// return hands back whatever the signature described. Read its header under a
+// fault filter so an unrecognized result degrades instead of taking the host down.
+inline const void* probe_result_class(void* result) {
+    if (!result) return nullptr;
+#if defined(_WIN32)
+    __try {
+        return detail::Backend::object_get_class(result);
+    } __except (metadata_exception_filter(_exception_code())) {
+        return nullptr;
+    }
+#else
+    return detail::Backend::object_get_class(result);
+#endif
+}
+// Decode a result by the class the runtime actually returned. The declared type
+// answers for itself only when it is concrete: `object`, an interface and a
+// generic parameter all describe a box whose contents they cannot name, so
+// decoding by the declaration alone reports System.Int32 where the caller wants 42.
+inline ValueInfo runtime_typed_result(std::string declaredType, void* result) {
+    if (!result) {
+        ValueInfo out{};
+        out.kind = ValueKind::Null;
+        out.type_name = std::move(declaredType);
+        out.display = "null";
+        out.readable = true;
+        return out;
+    }
+    const void* klass = probe_result_class(result);
+    if (!klass) {
+        // Not a managed object, or its header was unreadable. Report the raw
+        // pointer rather than the object: rooting something whose header cannot
+        // even be read would hand a non-object to the collector.
+        ValueInfo out{};
+        out.kind = ValueKind::UnsignedInteger;
+        out.type_name = std::move(declaredType);
+        out.unsigned_value = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(result));
+        out.readable = true;
+        char text[32]{};
+        std::snprintf(text, sizeof(text), "0x%llX", static_cast<unsigned long long>(out.unsigned_value));
+        out.display = std::string(text) + " (raw pointer; runtime type unavailable)";
+        return out;
+    }
+    std::string runtimeName = detail::class_display_name(klass);
+    if (runtimeName.empty()) runtimeName = declaredType;
+    const auto* managedClass = static_cast<const URK::managed::Class*>(klass);
+    if (detail::normalized_type_name(runtimeName) == "system.string")
+        return string_value(std::move(runtimeName), result);
+    if (!URK::managed::class_is_valuetype(managedClass))
+        return object_reference_value(std::move(runtimeName), result);
+    void* raw = detail::Backend::object_unbox(result);
+    if (!raw) return object_reference_value(std::move(runtimeName), result);
+    if (URK::managed::class_is_enum(managedClass)) {
+        const std::string underlying = enum_underlying_type_name_from_class(klass);
+        if (!underlying.empty()) return enum_from_pointer(std::move(runtimeName), underlying, raw);
+    }
+    ValueInfo decoded = scalar_from_pointer(runtimeName, raw);
+    // A struct with no scalar form keeps its box, which an inspector can open.
+    // Dropping it as an unreadable placeholder would lose the only handle to it.
+    return decoded.kind == ValueKind::ValueType ? object_reference_value(std::move(runtimeName), result) : decoded;
+}
 inline ValueInfo invoke_result_value(std::string typeName, const void* type,
                                      bool is_value_type, bool is_enum,
                                      void* result, std::string_view methodName) {
     const std::string normalized = detail::normalized_type_name(typeName);
     if (normalized == "system.void" || typeName.empty()) return void_value();
     if (normalized == "system.string") return string_value(std::move(typeName), result);
-    if (!is_value_type) return object_reference_value(std::move(typeName), result);
+    if (!is_value_type) return runtime_typed_result(std::move(typeName), result);
     if (!result) return unavailable_value(std::move(typeName), std::string("Unity Inspect::InvokeMethod failed: value-type result is null: ") + std::string(methodName));
     void* raw = detail::Backend::object_unbox(result);
     if (!raw) { detail::set_error(std::string("Unity Inspect::InvokeMethod failed: object_unbox failed for result: ") + std::string(methodName)); detail::append_backend_error(); return unavailable_value(std::move(typeName), detail::fallback_error() ? detail::fallback_error() : "method result unbox failed"); }
@@ -1327,11 +1391,6 @@ inline ValueInfo invoke_result_value(std::string typeName, const void* type,
 inline ValueInfo InvokeMethod(Object object, const MethodInfo& method, const std::vector<ValueInfo>& arguments = {}) {
     detail::clear_error();
     if (!method.handle) return unavailable_value(method.return_type, "Unity Inspect::InvokeMethod failed: method handle is null");
-    if (method.return_type_is_opaque && !method.return_type_is_generic_parameter) {
-        return unavailable_value(method.return_type,
-                                 std::string("Unity Inspect::InvokeMethod cannot safely inspect runtime-specific return type: ") +
-                                     method.return_type);
-    }
     if (arguments.size() != method.parameters.size()) return unavailable_value(method.return_type, std::string("Unity Inspect::InvokeMethod failed: argument count mismatch for ") + method.name);
     if (!method.is_static && !object.handle()) return unavailable_value(method.return_type, std::string("Unity Inspect::InvokeMethod failed: target object is null for instance method: ") + method.name);
     std::vector<WriteStorage> storage(arguments.size());
@@ -1357,8 +1416,10 @@ inline ValueInfo InvokeMethod(Object object, const MethodInfo& method, const std
     void* result = nullptr;
     void* ex = nullptr;
     if (!detail::Backend::runtime_invoke(invoke_handle, method.is_static ? nullptr : object.handle(), argv.empty() ? nullptr : argv.data(), &result, &ex) || ex) { detail::set_error(std::string("Unity Inspect::InvokeMethod failed: runtime_invoke threw or failed: ") + method.name); detail::append_backend_error(); return unavailable_value(method.return_type, detail::fallback_error() ? detail::fallback_error() : "method invocation failed"); }
-    if (method.return_type_is_generic_parameter)
-        return object_reference_value(method.return_type, result);
+    // A generic parameter and a runtime-specific signature both leave the
+    // declared name unable to describe the result; the runtime class can.
+    if (method.return_type_is_generic_parameter || method.return_type_is_opaque)
+        return runtime_typed_result(method.return_type, result);
     return invoke_result_value(method.return_type, method.return_type_handle,
                                method.return_is_value_type, method.return_is_enum,
                                result, method.name);
@@ -1435,8 +1496,10 @@ inline ValueInfo InvokeGenericMethod(Object object, const MethodInfo& method,
     void* result = closed.CallExact<void*>("Invoke", {"System.Object", "System.Object[]"}, object, argument_array);
     if (const char* error = URK::Unity::last_error(); error && error[0])
         return unavailable_value(method.return_type, error);
-    if (method.return_type_is_generic_parameter)
-        return object_reference_value(method.return_type, result);
+    // Reflection always hands back a box here, so the runtime class is the only
+    // thing that can name what a closed generic actually returned.
+    if (method.return_type_is_generic_parameter || method.return_type_is_opaque)
+        return runtime_typed_result(method.return_type, result);
     return invoke_result_value(method.return_type, method.return_type_handle,
                                method.return_is_value_type, method.return_is_enum,
                                result, method.name);

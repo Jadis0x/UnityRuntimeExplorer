@@ -132,6 +132,19 @@ int main() {
             "CSV must expose collapse metadata");
     require(csv.find("7,9,3,") != std::string::npos, "CSV must expose the collapsed sequence range");
 
+    // A mid-function entry hook never observes a return. Reporting that as
+    // "pending" reads as "the call has not finished yet", which never resolves.
+    trace = base_trace();
+    record = base_record();
+    record.return_captured = false;
+    record.return_display.clear();
+    trace.captures_return = false;
+    require(MethodTraceFormat::result(trace, record) == "<not captured: entry hook>",
+            "an entry-hook trace must say the return was never captured");
+    trace.captures_return = true;
+    require(MethodTraceFormat::result(trace, record) == "<pending return>",
+            "a return-capturing trace still reports an unfinished call as pending");
+
     std::cout << "method trace formatting contract passed\n";
     return 0;
 }

@@ -545,8 +545,10 @@ namespace Explorer {
 					release_reference_handle(previous.reference.token);
 				it = working_.method_results.erase(it);
 			}
-			if (value && (value->kind == Inspect::ValueKind::ObjectReference ||
-				value->kind == Inspect::ValueKind::ArrayReference || value->kind == Inspect::ValueKind::String) && value->object) {
+			// Any result that still carries a managed pointer is worth retaining,
+			// including a boxed value type and a result whose type could not be
+			// named: the token is the only way to open it in an inspector.
+			if (value && value->object) {
 				std::uint64_t reference_token = 0;
 				do {
 					reference_token = 0x1000000000000000ull | (next_reference_token_++ & 0x0fffffffffffffffull);
@@ -565,8 +567,11 @@ namespace Explorer {
 			}
 			working_.method_results[next_method_result_id_++] = std::move(record);
 		};
-		if ((method.return_type_is_opaque && !method.return_type_is_generic_parameter) || std::any_of(method.parameters.begin(), method.parameters.end(),
-			[](const Inspect::MethodParamInfo& parameter) { return parameter.is_opaque; })) {
+		// Only the arguments have to be marshalled into the callee. A
+		// runtime-specific or generic return is decoded from the runtime class of
+		// whatever comes back, so it no longer blocks the call.
+		if (std::any_of(method.parameters.begin(), method.parameters.end(),
+			[](const Inspect::MethodParamInfo& parameter) { return parameter.is_opaque && !parameter.is_generic_parameter; })) {
 			record_flight("BLOCKED", "Execute " + method.name, "runtime-specific signature");
 			const std::string message = "Method requires runtime-specific marshalling";
 			publish_method_result(false, message);

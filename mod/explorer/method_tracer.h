@@ -106,9 +106,11 @@ struct Snapshot {
 //           so it stays opt-in.
 // instance_filter, when set, drops calls whose `this` is a different object.
 // A property watch uses it so a setter shared by every instance only reports
-// writes to the object being watched.
+// writes to the object being watched. Such a trace passes user_visible = false:
+// it belongs to the watch, and listing it in the Traces panel would invite
+// closing it there, which silently drops the watch back to polling.
 bool start(const URK::Unity::Inspect::MethodInfo &method, bool capture_return, const void *instance_filter,
-           std::string &error);
+           bool user_visible, std::string &error);
 
 // What a watch needs from a setter trace each frame, without copying records.
 struct WriteSignal {
@@ -116,6 +118,11 @@ struct WriteSignal {
     std::uint64_t total_calls = 0;
     std::uintptr_t last_caller = 0;
     std::uint32_t last_thread_id = 0;
+    // The setter's own argument: the value actually written, as opposed to
+    // whatever a later poll happens to observe.
+    bool has_written_value = false;
+    std::uint64_t written_raw = 0;
+    std::uint64_t written_xmm_low = 0;
 };
 WriteSignal write_signal(TraceId id);
 // The trace id most recently created by start(), for callers that need to

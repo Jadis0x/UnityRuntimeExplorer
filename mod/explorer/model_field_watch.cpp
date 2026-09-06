@@ -24,6 +24,30 @@ namespace Explorer {
 			return "<unavailable: " + value.display + ">";
 		}
 
+		// The setter's argument is what the caller actually wrote, which a later
+		// poll cannot recover once the value has been written and reverted.
+		std::optional<std::string> written_value_display(const Inspect::PropertyInfo& property,
+			const MethodTracer::WriteSignal& signal) {
+			if (!signal.has_written_value)
+				return std::nullopt;
+			// Win64 passes anything wider than eight bytes by address, so the
+			// captured word is a pointer rather than the value itself.
+			if (Inspect::structured_component_count(property.type_name) != 0)
+				return std::nullopt;
+			const std::string normalized = normalized_type(property.type_name);
+			std::uint64_t raw = normalized == "system.single" || normalized == "system.double"
+				? signal.written_xmm_low : signal.written_raw;
+			if (property.is_enum) {
+				const std::string underlying = Inspect::enum_underlying_type_name(property.type);
+				if (underlying.empty())
+					return std::nullopt;
+				const Inspect::ValueInfo decoded = Inspect::enum_from_pointer(property.type_name, underlying, &raw);
+				return decoded.readable ? std::optional<std::string>(decoded.display) : std::nullopt;
+			}
+			const Inspect::ValueInfo decoded = Inspect::scalar_from_pointer(property.type_name, &raw);
+			return decoded.readable ? std::optional<std::string>(decoded.display) : std::nullopt;
+		}
+
 	} // namespace
 
 	bool RuntimeModel::has_active_field_watches() const {
@@ -262,20 +286,52 @@ namespace Explorer {
 		detach_setter_hook(state);
 		if (!state.snapshot.property || !state.property.set_method || !target)
 			return false;
-		// A setter shared by every instance is filtered down to this object.
-		const Inspect::MethodInfo setter = Inspect::method_info(
-			static_cast<const URK::managed::Method*>(state.property.set_method), state.property.declaring_type);
+		// Pin before reading the address: the filter compares a raw `this` and a
+		// moving collector would otherwise relocate the object out from under it.
+		state.setter_target_pin = Inspect::PinObject(target, true);
+		const Object pinned = Inspect::ResolveObjectHandle(state.setter_target_pin);
+		if (!state.setter_target_pin.handle || !pinned) {
+			Inspect::FreeObjectHandle(state.setter_target_pin);
+			record_flight("WATCH", "Setter hook unavailable", "the watched object could not be pinned");
+			return false;
+		}
+		const auto* setter_handle = static_cast<const URK::managed::Method*>(state.property.set_method);
+		Inspect::TypeInfo declaring = state.property.declaring_type;
+		// Reflection returns the declaration. A virtual or abstract setter runs an
+		// override for this object, and hooking the declaration would install a
+		// hook nothing ever calls.
+		if (const auto* runtime_class = static_cast<const URK::managed::Class*>(
+				URK::managed::object_get_class(static_cast<URK::managed::Object*>(pinned.handle())))) {
+			const char* setter_name = URK::managed::method_get_name(setter_handle);
+			const char* parameter_type = state.property.type_name.c_str();
+			if (setter_name && setter_name[0]) {
+				if (const auto* concrete =
+						URK::managed::resolve_method_exact(runtime_class, setter_name, &parameter_type, 1)) {
+					setter_handle = concrete;
+					declaring = Inspect::DescribeClass(runtime_class);
+				}
+			}
+		}
+		const Inspect::MethodInfo setter = Inspect::method_info(setter_handle, declaring);
 		std::string error;
-		if (!MethodTracer::start(setter, false, target.handle(), error)) {
+		// The trace belongs to the watch, not to the Traces panel, so it stays
+		// hidden there: closing it from that panel would silently break the watch.
+		if (!MethodTracer::start(setter, false, pinned.handle(), false, error)) {
+			Inspect::FreeObjectHandle(state.setter_target_pin);
 			record_flight("WATCH", "Setter hook unavailable", error);
 			return false;
 		}
 		state.setter_trace = MethodTracer::last_started_id();
 		state.setter_calls_seen = 0;
-		return state.setter_trace != 0;
+		if (state.setter_trace == 0) {
+			Inspect::FreeObjectHandle(state.setter_target_pin);
+			return false;
+		}
+		return true;
 	}
 
 	void RuntimeModel::detach_setter_hook(FieldWatchState& state) {
+		Inspect::FreeObjectHandle(state.setter_target_pin);
 		if (state.setter_trace == 0)
 			return;
 		MethodTracer::stop(state.setter_trace);
@@ -324,6 +380,7 @@ namespace Explorer {
 			// was written and reverted between two samples still shows up.
 			std::uint64_t setter_writes = 0;
 			std::uintptr_t setter_caller = 0;
+			std::optional<std::string> setter_written;
 			if (state.setter_trace != 0) {
 				const MethodTracer::WriteSignal signal = MethodTracer::write_signal(state.setter_trace);
 				if (!signal.active) {
@@ -332,6 +389,7 @@ namespace Explorer {
 				} else if (signal.total_calls > state.setter_calls_seen) {
 					setter_writes = signal.total_calls - state.setter_calls_seen;
 					setter_caller = signal.last_caller;
+					setter_written = written_value_display(state.property, signal);
 					state.setter_calls_seen = signal.total_calls;
 				}
 			}
@@ -370,7 +428,10 @@ namespace Explorer {
 			if (state.explorer_write_pending)
 				event.source = "Explorer write";
 			else if (setter_writes != 0)
+				// The written value is reported separately from current_value: the
+				// last write can already have been reverted by the time we sample.
 				event.source = "Setter hook" +
+					(setter_written ? " wrote " + *setter_written : std::string{}) +
 					(setter_writes > 1 ? " (" + std::to_string(setter_writes) + " writes)" : std::string{}) +
 					(setter_caller != 0 ? " from " + MethodTraceFormat::address(setter_caller) : std::string{});
 			else

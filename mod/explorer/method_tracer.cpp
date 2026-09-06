@@ -802,7 +802,7 @@ Snapshot copy_snapshot(const HookSession &session) {
 } // namespace
 
 bool start(const URK::Unity::Inspect::MethodInfo &method, bool capture_return, const void *instance_filter,
-           std::string &error) {
+           bool user_visible, std::string &error) {
     std::lock_guard lock(g_state.control_mutex);
     if (!URK::hooks::available()) { error = "Hook API is unavailable in this runtime"; return false; }
     // Return capture needs the stub that rewrites the return address. Without
@@ -822,7 +822,10 @@ bool start(const URK::Unity::Inspect::MethodInfo &method, bool capture_return, c
         if (existing->method != method_handle)
             continue;
         if (existing->active.load(std::memory_order_acquire)) {
-            error = "This method is already being traced";
+            // A watch's hook is invisible in the Traces panel, so "already traced"
+            // would point the user at a tab that is not there.
+            error = existing->visible ? "This method is already being traced"
+                                      : "A property watch is already hooked on this method; stop that watch first";
             return false;
         }
         if (existing->captures_return != capture_return) {
@@ -840,7 +843,9 @@ bool start(const URK::Unity::Inspect::MethodInfo &method, bool capture_return, c
             return false;
         }
         existing->active.store(true, std::memory_order_release);
-        existing->visible = true;
+        // A watch re-attaching to a method must not take away a trace tab the
+        // user opened on it earlier.
+        existing->visible = existing->visible || user_visible;
         g_state.last_started_id = existing->id;
         error.clear();
         return true;
@@ -993,6 +998,7 @@ bool start(const URK::Unity::Inspect::MethodInfo &method, bool capture_return, c
     reset_records(*session);
     session->captures_return = capture_return;
     session->instance_filter = instance_filter;
+    session->visible = user_visible;
     if (capture_return) {
         if (!create_stub(*session, error)) return false;
     } else {
@@ -1039,6 +1045,13 @@ WriteSignal write_signal(TraceId id) {
         if (record.published_sequence.load(std::memory_order_acquire) == written) {
             out.last_caller = record.caller_address.load(std::memory_order_relaxed);
             out.last_thread_id = record.thread_id.load(std::memory_order_relaxed);
+            // A setter takes exactly one argument, and it holds the written value.
+            if (session->argument_count == 1 && session->arguments) {
+                const std::size_t slot = argument_slot(*session, written - 1, 0);
+                out.written_raw = session->arguments[slot].load(std::memory_order_relaxed);
+                out.written_xmm_low = session->argument_xmm_low[slot].load(std::memory_order_relaxed);
+                out.has_written_value = true;
+            }
         }
         break;
     }
@@ -1086,12 +1099,23 @@ bool clear(TraceId id) {
 
 bool close(TraceId id) {
     std::lock_guard lock(g_state.control_mutex);
-    for (const auto &session : g_state.sessions)
-        if (session->id == id && !session->active.load(std::memory_order_acquire) &&
-            !session->detach_pending.load(std::memory_order_acquire)) {
-            session->visible = false;
+    for (auto it = g_state.sessions.begin(); it != g_state.sessions.end(); ++it) {
+        HookSession &session = **it;
+        if (session.id != id || session.active.load(std::memory_order_acquire) ||
+            session.detach_pending.load(std::memory_order_acquire))
+            continue;
+        // A stub outlives its tab: a call that entered before the detach can
+        // still return through it. A mid-function hook owns no such memory, so
+        // once it is detached and drained its slot is reclaimable — without
+        // that, every property watch would permanently consume one of the
+        // max_sessions slots.
+        if (!session.stub && !session.mid_hook && flight_count(session) == 0) {
+            g_state.sessions.erase(it);
             return true;
         }
+        session.visible = false;
+        return true;
+    }
     return false;
 }
 

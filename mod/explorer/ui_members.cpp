@@ -47,11 +47,6 @@ AddComponentBuffers &component_buffers() {
     static AddComponentBuffers buffers;
     return buffers;
 }
-namespace {
-
-constexpr std::size_t kMaxRememberedMemberEditors = 4096;
-
-} // namespace
 void copy_text(std::vector<char> &buffer, std::string_view value) {
     buffer.resize(std::max<std::size_t>(256, value.size() + 1));
     std::memcpy(buffer.data(), value.data(), value.size());

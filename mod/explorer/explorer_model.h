@@ -191,6 +191,10 @@ class RuntimeModel {
         // of sampled differences. Zero when the watch is polling.
         MethodTracer::TraceId setter_trace = 0;
         std::uint64_t setter_calls_seen = 0;
+        // The hook filters on a raw `this` pointer, so the address has to stay
+        // put. target_handle is weak and a moving collector would silently
+        // strand the filter on the object's old location.
+        URK::Unity::Inspect::ObjectHandle setter_target_pin;
         Clock::time_point started{};
     };
     std::unordered_map<std::uint64_t, FieldWatchState> field_watches_;
