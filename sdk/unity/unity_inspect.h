@@ -274,6 +274,23 @@ inline std::int32_t metadata_type_code(const void* type) {
     return URK::managed::type_get_type(static_cast<const URK::managed::Type*>(type));
 #endif
 }
+// A VALUETYPE type code only says "this is a value type" - Mono reports enum
+// fields this way (unlike IL2CPP's dedicated ENUM code below), so the actual
+// class must be resolved to tell an enum apart from a plain struct.
+inline bool metadata_valuetype_is_enum(const void* type) {
+    if (!type) return false;
+#if defined(_WIN32)
+    __try {
+        const auto* k = URK::managed::type_get_class_or_element_class(static_cast<const URK::managed::Type*>(type));
+        return k && URK::managed::class_is_enum(k) != 0;
+    } __except (metadata_exception_filter(_exception_code())) {
+        return false;
+    }
+#else
+    const auto* k = URK::managed::type_get_class_or_element_class(static_cast<const URK::managed::Type*>(type));
+    return k && URK::managed::class_is_enum(k) != 0;
+#endif
+}
 inline MemberTypeInfo describe_member_type(const void* type) {
     MemberTypeInfo out{};
     out.name = type_name(type);
@@ -297,11 +314,14 @@ inline MemberTypeInfo describe_member_type(const void* type) {
     case 0x0B: // U8
     case 0x0C: // R4
     case 0x0D: // R8
-    case 0x11: // VALUETYPE
     case 0x16: // TYPEDBYREF
     case 0x18: // I
     case 0x19: // U
         out.is_value_type = true;
+        break;
+    case 0x11: // VALUETYPE
+        out.is_value_type = true;
+        out.is_enum = metadata_valuetype_is_enum(type);
         break;
     case 0x55: // ENUM
         out.is_value_type = true;

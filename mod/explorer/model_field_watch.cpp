@@ -2,8 +2,6 @@
 #include "explorer_model.h"
 #include "model_shared.h"
 
-#include "method_trace_format.h"
-
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
@@ -433,7 +431,7 @@ namespace Explorer {
 				event.source = "Setter hook" +
 					(setter_written ? " wrote " + *setter_written : std::string{}) +
 					(setter_writes > 1 ? " (" + std::to_string(setter_writes) + " writes)" : std::string{}) +
-					(setter_caller != 0 ? " from " + MethodTraceFormat::address(setter_caller) : std::string{});
+					(setter_caller != 0 ? " from " + managed_caller_location(setter_caller) : std::string{});
 			else
 				event.source = watch.property ? "Runtime / property getter sample"
 					: "Runtime / sampled write window";

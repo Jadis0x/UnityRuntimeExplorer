@@ -337,6 +337,24 @@ if(URK_BUILD_TESTS)
     urk_disable_vs_vcpkg_integration(urk_invoke_result_decode_tests)
     add_test(NAME invoke_result_decode_contract COMMAND urk_invoke_result_decode_tests)
 
+    add_executable(urk_enum_field_metadata_tests
+        tests/enum_field_metadata_tests.cpp
+        sdk/mono/mono_native_api.cpp
+        sdk/mono/mono_runtime.cpp
+    )
+    target_include_directories(urk_enum_field_metadata_tests PRIVATE .)
+    target_compile_features(urk_enum_field_metadata_tests PRIVATE cxx_std_20)
+    target_compile_definitions(urk_enum_field_metadata_tests PRIVATE
+        WIN32_LEAN_AND_MEAN
+        NOMINMAX
+        URK_BACKEND_MONO
+    )
+    if(MSVC)
+        target_compile_options(urk_enum_field_metadata_tests PRIVATE /W4 /permissive- /EHsc /utf-8)
+    endif()
+    urk_disable_vs_vcpkg_integration(urk_enum_field_metadata_tests)
+    add_test(NAME enum_field_metadata_contract COMMAND urk_enum_field_metadata_tests)
+
     add_executable(urk_method_trace_value_tests
         tests/method_trace_value_tests.cpp
         mod/explorer/method_trace_value_decoder.cpp
