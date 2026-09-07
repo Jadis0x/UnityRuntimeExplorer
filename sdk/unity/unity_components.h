@@ -390,9 +390,14 @@ struct Animator : Behaviour {
     bool fireEvents() const { return GetProperty<bool>("fireEvents"); }
     void set_fireEvents(bool value) const { SetProperty("fireEvents", value); }
     Object avatar() const { return GetProperty<Object>("avatar"); }
-    void set_avatar(Object value) const { SetProperty("avatar", value); }
+    // These setters take a specific type, not the generic Object the getters
+    // return; SetProperty would infer "UnityEngine.Object" and fail exact
+    // overload lookup (see AudioSource::set_clip's identical fix above).
+    void set_avatar(Object value) const { CallExact<void>("set_avatar", {"UnityEngine.Avatar"}, value); }
     Object runtimeAnimatorController() const { return GetProperty<Object>("runtimeAnimatorController"); }
-    void set_runtimeAnimatorController(Object value) const { SetProperty("runtimeAnimatorController", value); }
+    void set_runtimeAnimatorController(Object value) const {
+        CallExact<void>("set_runtimeAnimatorController", {"UnityEngine.RuntimeAnimatorController"}, value);
+    }
     float GetFloat(std::string_view name) const { return CallExact<float>("GetFloat", {"System.String"}, name); }
     float GetFloat(int id) const { return CallExact<float>("GetFloat", {"System.Int32"}, id); }
     void SetFloat(std::string_view name, float value) const { CallExact<void>("SetFloat", {"System.String", "System.Single"}, name, value); }
@@ -503,7 +508,7 @@ struct Text : Graphic {
     std::string text() const { return GetProperty<std::string>("text"); }
     void set_text(std::string_view value) const { SetProperty("text", value); }
     Object font() const { return GetProperty<Object>("font"); }
-    void set_font(Object value) const { SetProperty("font", value); }
+    void set_font(Object value) const { CallExact<void>("set_font", {"UnityEngine.Font"}, value); }
     int fontSize() const { return GetProperty<int>("fontSize"); }
     void set_fontSize(int value) const { SetProperty("fontSize", value); }
     FontStyle fontStyle() const { return GetProperty<FontStyle>("fontStyle"); }
