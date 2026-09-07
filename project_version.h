@@ -2,5 +2,5 @@
 #pragma once
 
 namespace URK {
-inline constexpr const char *project_version = "0.1.5";
+inline constexpr const char *project_version = "1.0.0";
 } // namespace URK
