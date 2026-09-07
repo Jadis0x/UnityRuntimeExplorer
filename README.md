@@ -56,11 +56,11 @@ particular need the right embedding exports.
 
 ## Installing
 
-Grab URKit from the [v0.3.0 release](https://github.com/Jadis0x/URKit/releases/tag/v0.3.0).
-You only need `urk-sdk.exe` if you're building your own URKit mods, not for
-this.
+Grab URKit from the [v0.3.0 release](https://github.com/Jadis0x/URKit/releases/tag/v0.3.0)
+(the proxy DLL, or `URKitInjector.dll` for the injector setup below). You don't
+need `urk-sdk.exe` unless you're building your own URKit mods.
 
-Then grab the Explorer DLL for the game's runtime (same two files as above).
+Then grab the Explorer DLL matching the game's runtime (Mono or IL2CPP).
 
 ### Standard proxy setup
 
