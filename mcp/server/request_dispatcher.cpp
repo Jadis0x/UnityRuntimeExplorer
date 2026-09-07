@@ -341,9 +341,6 @@ void RequestDispatcher::stop() {
         stopping_ = true;
         for (auto& [_, cancellation] : active_requests_)
             cancellation->requested.store(true, std::memory_order_release);
-        for (auto& [_, task] : tasks_)
-            if (task.cancellation)
-                task.cancellation->requested.store(true, std::memory_order_release);
     }
     condition_.notify_all();
     if (worker_.joinable())
