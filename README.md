@@ -56,7 +56,7 @@ particular need the right embedding exports.
 
 ## Installing
 
-Grab URKit from the [v0.3.0 release](https://github.com/Jadis0x/URKit/releases/tag/v0.3.0)
+Grab URKit from the [v0.3.2 release](https://github.com/Jadis0x/URKit/releases/tag/v0.3.2)
 (the proxy DLL, or `URKitInjector.dll` for the injector setup below). You don't
 need `urk-sdk.exe` unless you're building your own URKit mods.
 
