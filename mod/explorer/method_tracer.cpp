@@ -670,6 +670,18 @@ std::uint64_t flight_count(const HookSession& session) {
     return session.flight_state.load(std::memory_order_acquire) & HookSession::flight_count_mask;
 }
 
+// Once detach_session succeeds, flight_count is already known to be 0 (the
+// caller checked it first), so no call can still be executing inside the
+// stub's return path. Freeing it here is what lets close() reclaim a
+// return-capturing session's slot; without it session.stub stays non-null
+// forever and the trace permanently occupies one of max_sessions slots.
+void release_stub(HookSession &session) {
+    if (!session.stub)
+        return;
+    VirtualFree(session.stub, 0, MEM_RELEASE);
+    session.stub = nullptr;
+}
+
 bool deactivate(HookSession &session) {
     session.active.store(false, std::memory_order_release);
     session.flight_state.fetch_and(~HookSession::flight_accepting, std::memory_order_acq_rel);
@@ -687,6 +699,7 @@ bool deactivate(HookSession &session) {
         return false;
     }
     session.detach_pending.store(false, std::memory_order_release);
+    release_stub(session);
     return true;
 }
 
@@ -696,6 +709,7 @@ bool retry_pending_detach(HookSession& session) {
     if (!detach_session(session))
         return false;
     session.detach_pending.store(false, std::memory_order_release);
+    release_stub(session);
     return true;
 }
 
