@@ -211,7 +211,8 @@ void render_current_object_inspector(const Snapshot &snapshot) {
                                       element.kind == URK::Unity::Inspect::ValueKind::Null;
                 render_live_value(CommandKind::SetFieldValue, 0, static_cast<int>(index), &element, writable,
                                   scoped_ui_key(info.token, 0x2000000000000000ull, index), reference, true,
-                                  snapshot.live_data, false, false, info.token, true, {}, &snapshot.managed_references);
+                                  snapshot.live_data, false, false, info.token, true, {}, &snapshot.managed_references,
+                                  &snapshot.audio_preview, &snapshot.texture_preview);
                 ImGui::PopID();
             }
             ImGui::EndTable();
@@ -279,7 +280,8 @@ void render_current_object_inspector(const Snapshot &snapshot) {
                 render_live_value(properties ? CommandKind::SetPropertyValue : CommandKind::SetFieldValue, 0,
                                   static_cast<int>(index), value, writable, key, reference, true, snapshot.live_data,
                                   snapshot.locked_member_keys.contains(key), true, info.token, member.runtime_safe,
-                                  member.capability_reason, &snapshot.managed_references);
+                                  member.capability_reason, &snapshot.managed_references, &snapshot.audio_preview,
+                                  &snapshot.texture_preview);
 				render_member_write_result(snapshot, 0, index, properties, info.token);
 				{
 					const Snapshot::FieldWatch* watch = field_watch_for(snapshot, 0, index, info.token, property_members);

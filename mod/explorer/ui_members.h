@@ -112,7 +112,9 @@ void render_live_value(CommandKind kind, int component_id, int member_index,
                        bool object_inspector_target = false, bool live_data = false, bool locked = false,
                        bool lockable = true, std::uint64_t object_inspector_token = 0, bool runtime_safe = true,
                        std::string_view capability_reason = {},
-                       const std::vector<ManagedReferenceInfo> *managed_references = nullptr);
+                       const std::vector<ManagedReferenceInfo> *managed_references = nullptr,
+                       const Snapshot::AudioPreview *audio_preview = nullptr,
+                       const Snapshot::TexturePreview *texture_preview = nullptr);
 void render_method_argument(int component_id, std::size_t method_index, std::size_t parameter_index,
                             std::string_view type, std::string_view name,
                             std::uint64_t object_inspector_token = 0,

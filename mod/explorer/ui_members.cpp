@@ -1086,6 +1086,79 @@ void render_structured_value(CommandKind kind, int component_id, int member_inde
         ImGui::SetTooltip("%s - drag components; release to apply", value.type_name.c_str());
 }
 
+bool references_audio_clip(const URK::Unity::Inspect::ValueInfo &value,
+                           const ComponentInfo::LiveValues::Reference *reference) {
+    if (value.kind != URK::Unity::Inspect::ValueKind::ObjectReference)
+        return false;
+    if (URK::Unity::detail::normalized_type_name(value.type_name) == "unityengine.audioclip")
+        return true;
+    // The declared field/property type can be a base type (e.g. UnityEngine.Object)
+    // holding an AudioClip instance; the reference's display carries the runtime class.
+    return reference && URK::Unity::detail::normalized_type_name(reference->display) == "unityengine.audioclip";
+}
+
+void enqueue_play_audio_preview(std::uint64_t reference_token, float volume) {
+    if (reference_token == 0)
+        return;
+    Command command{};
+    command.kind = CommandKind::PlayAudioPreview;
+    command.reference_token = reference_token;
+    command.float_value = volume;
+    RuntimeModel::instance().enqueue(std::move(command));
+}
+
+void enqueue_stop_audio_preview() {
+    Command command{};
+    command.kind = CommandKind::StopAudioPreview;
+    RuntimeModel::instance().enqueue(std::move(command));
+}
+
+void enqueue_export_audio_preview(std::uint64_t reference_token) {
+    if (reference_token == 0)
+        return;
+    Command command{};
+    command.kind = CommandKind::ExportAudioPreview;
+    command.reference_token = reference_token;
+    RuntimeModel::instance().enqueue(std::move(command));
+}
+
+bool is_previewable_image_type(std::string_view normalized) {
+    return normalized == "unityengine.texture2d" || normalized == "unityengine.sprite";
+}
+
+bool references_texture2d(const URK::Unity::Inspect::ValueInfo &value,
+                          const ComponentInfo::LiveValues::Reference *reference) {
+    if (value.kind != URK::Unity::Inspect::ValueKind::ObjectReference)
+        return false;
+    if (is_previewable_image_type(URK::Unity::detail::normalized_type_name(value.type_name)))
+        return true;
+    return reference && is_previewable_image_type(URK::Unity::detail::normalized_type_name(reference->display));
+}
+
+void enqueue_preview_texture(std::uint64_t reference_token) {
+    if (reference_token == 0)
+        return;
+    Command command{};
+    command.kind = CommandKind::PreviewTexture;
+    command.reference_token = reference_token;
+    RuntimeModel::instance().enqueue(std::move(command));
+}
+
+void enqueue_close_texture_preview() {
+    Command command{};
+    command.kind = CommandKind::CloseTexturePreview;
+    RuntimeModel::instance().enqueue(std::move(command));
+}
+
+void enqueue_export_texture_preview(std::uint64_t reference_token) {
+    if (reference_token == 0)
+        return;
+    Command command{};
+    command.kind = CommandKind::ExportTexturePreview;
+    command.reference_token = reference_token;
+    RuntimeModel::instance().enqueue(std::move(command));
+}
+
 } // namespace
 } // namespace
 void render_live_value(CommandKind kind, int component_id, int member_index,
@@ -1094,7 +1167,9 @@ void render_live_value(CommandKind kind, int component_id, int member_index,
                        bool live_data, bool locked, bool lockable,
                        std::uint64_t object_inspector_token, bool runtime_safe,
                        std::string_view capability_reason,
-                       const std::vector<ManagedReferenceInfo>* managed_references) {
+                       const std::vector<ManagedReferenceInfo>* managed_references,
+                       const Snapshot::AudioPreview* audio_preview,
+                       const Snapshot::TexturePreview* texture_preview) {
     using URK::Unity::Inspect::ValueKind;
     if (!runtime_safe) {
         ImGui::TextDisabled("Metadata only");
@@ -1196,6 +1271,52 @@ void render_live_value(CommandKind kind, int component_id, int member_index,
             render_member_lock(kind, component_id, member_index, buffer.text.data(), false, object_inspector_target,
                                buffer_key, locked, lockable, object_inspector_token);
             ImGui::EndPopup();
+        }
+        if (reference && reference->token != 0 && references_audio_clip(*value, reference)) {
+            ImGui::SameLine();
+            const bool is_this_clip_playing = audio_preview && audio_preview->playing &&
+                                              audio_preview->reference_token == reference->token;
+            if (is_this_clip_playing) {
+                if (ImGui::SmallButton("Stop"))
+                    enqueue_stop_audio_preview();
+            } else if (ImGui::SmallButton("Play")) {
+                enqueue_play_audio_preview(reference->token, audio_preview ? audio_preview->volume : 1.0f);
+            }
+            ImGui::SameLine();
+            if (ImGui::SmallButton("Export##audio"))
+                enqueue_export_audio_preview(reference->token);
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Save as a .wav file under the Explorer DLL's URK_Exports folder");
+        }
+        if (reference && reference->token != 0 && references_texture2d(*value, reference)) {
+            const bool is_this_texture_shown =
+                texture_preview && texture_preview->active && texture_preview->reference_token == reference->token;
+            ImGui::SameLine();
+            if (is_this_texture_shown) {
+                if (ImGui::SmallButton("Hide"))
+                    enqueue_close_texture_preview();
+            } else if (ImGui::SmallButton("Preview")) {
+                enqueue_preview_texture(reference->token);
+            }
+            ImGui::SameLine();
+            if (ImGui::SmallButton("Export##texture"))
+                enqueue_export_texture_preview(reference->token);
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Save as a .png file under the Explorer DLL's URK_Exports folder");
+            if (is_this_texture_shown) {
+                if (!texture_preview->status.empty()) {
+                    ImGui::TextColored(ImVec4(0.78f, 0.42f, 0.38f, 1.0f), "%s", texture_preview->status.c_str());
+                } else if (texture_preview->srv && texture_preview->width > 0 && texture_preview->height > 0) {
+                    constexpr float kMaxPreviewSide = 256.0f;
+                    const float scale = std::min(1.0f, kMaxPreviewSide / static_cast<float>(
+                                                            std::max(texture_preview->width, texture_preview->height)));
+                    ImGui::Text("%s (%dx%d)", texture_preview->texture_name.c_str(), texture_preview->width,
+                               texture_preview->height);
+                    ImGui::Image(texture_preview->srv,
+                                ImVec2(static_cast<float>(texture_preview->width) * scale,
+                                       static_cast<float>(texture_preview->height) * scale));
+                }
+            }
         }
         return;
     }

@@ -104,6 +104,10 @@ set(URK_COMMON_SOURCES
         mod/explorer/model_members.cpp
         mod/explorer/model_reference_graph.cpp
         mod/explorer/model_field_watch.cpp
+        mod/explorer/model_audio_preview.cpp
+        mod/explorer/model_texture_preview.cpp
+        mod/explorer/png_writer.cpp
+        mod/explorer/wav_writer.cpp
         mod/explorer/model_tracing.cpp
         mod/explorer/model_scene.cpp
         mod/explorer/model_camera_highlight.cpp
@@ -354,6 +358,22 @@ if(URK_BUILD_TESTS)
     endif()
     urk_disable_vs_vcpkg_integration(urk_enum_field_metadata_tests)
     add_test(NAME enum_field_metadata_contract COMMAND urk_enum_field_metadata_tests)
+
+    add_executable(urk_png_writer_tests
+        tests/png_writer_tests.cpp
+        mod/explorer/png_writer.cpp
+    )
+    target_include_directories(urk_png_writer_tests PRIVATE .)
+    target_compile_features(urk_png_writer_tests PRIVATE cxx_std_20)
+    target_compile_definitions(urk_png_writer_tests PRIVATE
+        WIN32_LEAN_AND_MEAN
+        NOMINMAX
+    )
+    if(MSVC)
+        target_compile_options(urk_png_writer_tests PRIVATE /W4 /permissive- /EHsc /utf-8)
+    endif()
+    urk_disable_vs_vcpkg_integration(urk_png_writer_tests)
+    add_test(NAME png_writer_contract COMMAND urk_png_writer_tests)
 
     add_executable(urk_method_trace_value_tests
         tests/method_trace_value_tests.cpp

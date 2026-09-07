@@ -461,6 +461,10 @@ void* field_get_value_object(const void* field, void* object) {
         : nullptr;
 }
 
+void* array_new(const void* element_class, std::size_t length) {
+    return available() ? native::array_new(domain_get(), element_class, length) : nullptr;
+}
+
 bool field_static_get_value(const Field* field, void* output) {
     const auto* value = api();
     if (!available() || !value->field_static_get_value)

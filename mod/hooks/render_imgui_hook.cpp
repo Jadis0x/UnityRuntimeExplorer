@@ -2748,4 +2748,8 @@ namespace ModRenderHook {
 		g_mod_context = nullptr;
 		return true;
 	}
+
+	void* dx11_device() {
+		return g_device;
+	}
 } // namespace ModRenderHook

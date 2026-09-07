@@ -367,7 +367,8 @@ void render_components(const InspectorInfo &info, const Snapshot &snapshot, int 
                             render_live_value(command, component.instance_id, static_cast<int>(index), value, writable,
                                               key, reference, false, live_data,
                                               snapshot.locked_member_keys.contains(key), true, 0, member.runtime_safe,
-                                              member.capability_reason, &snapshot.managed_references);
+                                              member.capability_reason, &snapshot.managed_references,
+                                              &snapshot.audio_preview, &snapshot.texture_preview);
 							render_member_write_result(snapshot, component.instance_id, index, properties);
                             ImGui::PopID();
                         }

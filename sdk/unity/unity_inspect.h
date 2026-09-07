@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cstring>
 #include <string>
 #include <string_view>
 #include <unordered_set>
@@ -1227,6 +1228,59 @@ inline std::size_t ArrayLength(const ValueInfo& array) {
         return 0;
     }
     return detail::Backend::array_length(array.object);
+}
+#if defined(_WIN32)
+inline bool read_raw_array_bytes_guarded(const void* source, void* destination, std::size_t byteCount, bool& faulted) {
+    faulted = false;
+    __try {
+        std::memcpy(destination, source, byteCount);
+        return true;
+    } __except (metadata_exception_filter(_exception_code())) {
+        faulted = true;
+        return false;
+    }
+}
+#endif
+// Bulk-copies a blittable managed array's contents in one shot instead of the
+// per-element ReadArrayElement round trip - the only practical way to pull
+// something like a Texture2D's GetPixels32() (hundreds of thousands of
+// elements) back into native memory. `array` is the raw managed array
+// pointer (e.g. from Object::Call<void*>("GetPixels32")), not a ValueInfo.
+inline bool ReadRawArrayBytes(void* array, std::size_t elementSize, std::size_t maxCount, void* destination,
+                              std::size_t& outCount) {
+    detail::clear_error();
+    outCount = 0;
+    if (!array || !destination || elementSize == 0) {
+        detail::set_error("Unity Inspect::ReadRawArrayBytes failed: invalid arguments");
+        return false;
+    }
+    if (!detail::Backend::has_array_length()) {
+        detail::set_error("Unity Inspect::ReadRawArrayBytes failed: backend array_length API is unavailable");
+        detail::append_backend_error();
+        return false;
+    }
+    const std::size_t length = detail::Backend::array_length(array);
+    const std::size_t count = std::min(length, maxCount);
+    if (count == 0) return true;
+    void* source = detail::Backend::array_addr_with_size(array, static_cast<int>(elementSize), 0);
+    if (!source) {
+        detail::set_error("Unity Inspect::ReadRawArrayBytes failed: array_addr_with_size failed");
+        detail::append_backend_error();
+        return false;
+    }
+#if defined(_WIN32)
+    bool faulted = false;
+    const bool ok = read_raw_array_bytes_guarded(source, destination, elementSize * count, faulted);
+    if (faulted) {
+        detail::set_error("Unity Inspect::ReadRawArrayBytes raised a native access fault");
+        return false;
+    }
+    if (!ok) return false;
+#else
+    std::memcpy(destination, source, elementSize * count);
+#endif
+    outCount = count;
+    return true;
 }
 inline bool validate_array_element_access(const ValueInfo& array, std::size_t index, std::size_t& length) {
     if (array.kind != ValueKind::ArrayReference || !array.object) { detail::set_error("Unity Inspect array element access failed: value is not an array reference"); return false; }

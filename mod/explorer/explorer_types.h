@@ -300,6 +300,28 @@ struct Snapshot {
         URK::Unity::Vector3 local_rotation{};
         URK::Unity::Vector3 local_scale{1.0f, 1.0f, 1.0f};
     };
+    // A hidden, DontDestroyOnLoad AudioSource used to preview an AudioClip
+    // picked from the inspector, independent of any scene object's own audio.
+    struct AudioPreview {
+        bool active = false;
+        bool playing = false;
+        std::uint64_t reference_token = 0;
+        std::string clip_name;
+        float volume = 1.0f;
+        std::string status;
+    };
+    // A GPU texture (DX11 only, see model_texture_preview.cpp) decoded from a
+    // Texture2D picked in the inspector. `srv` is an opaque ID3D11ShaderResourceView*
+    // - Explorer types stay render-API agnostic, so the UI layer casts it back.
+    struct TexturePreview {
+        bool active = false;
+        std::uint64_t reference_token = 0;
+        std::string texture_name;
+        int width = 0;
+        int height = 0;
+        std::string status;
+        void* srv = nullptr;
+    };
     struct FlightEvent {
         std::uint64_t sequence = 0;
         double seconds_since_start = 0.0;
@@ -389,6 +411,8 @@ struct Snapshot {
     InspectorInfo inspector;
     ObjectInspectorInfo object_inspector;
     TransformClipboard transform_clipboard;
+    AudioPreview audio_preview;
+    TexturePreview texture_preview;
     bool live_data = false;
     bool highlight_enabled = true;
     // This must be configurable because a practical focus distance differs

@@ -237,6 +237,14 @@ namespace Explorer {
 			next_trace_publish_ = now + kTracePublishInterval;
 			publish();
 		}
+		if (working_.audio_preview.active) {
+			const bool was_playing = working_.audio_preview.playing;
+			refresh_audio_preview();
+			if (was_playing != working_.audio_preview.playing)
+				publish();
+		}
+		reap_pending_texture_releases();
+		continue_pending_audio_export();
 	}
 
 	void RuntimeModel::stop() {
@@ -252,6 +260,10 @@ namespace Explorer {
 		clear_object_inspector();
 		managed_references_.clear();
 		release_all_field_watches();
+		release_audio_preview();
+		release_texture_preview_resources();
+		Inspect::FreeObjectHandle(pending_audio_export_.clip_handle);
+		pending_audio_export_ = {};
 		for (auto& [_, handle] : class_browser_handles_)
 			Inspect::FreeObjectHandle(handle);
 		class_browser_handles_.clear();
@@ -520,7 +532,10 @@ namespace Explorer {
 			command.kind == CommandKind::SetCameraFocusTilt ||
 			command.kind == CommandKind::SetCameraFocusOffset ||
 			command.kind == CommandKind::LoadScene || command.kind == CommandKind::PinManagedReference ||
-			command.kind == CommandKind::ReleaseManagedReference || command.kind == CommandKind::ClearManagedReferences;
+			command.kind == CommandKind::ReleaseManagedReference || command.kind == CommandKind::ClearManagedReferences ||
+			command.kind == CommandKind::PlayAudioPreview || command.kind == CommandKind::StopAudioPreview ||
+			command.kind == CommandKind::PreviewTexture || command.kind == CommandKind::CloseTexturePreview ||
+			command.kind == CommandKind::ExportTexturePreview || command.kind == CommandKind::ExportAudioPreview;
 		// Diagnostic export is native-only and does not require a selected GameObject.
 		const bool diagnostic_command = command.kind == CommandKind::ExportDiagnosticBundle;
 		const bool event_command = command.kind == CommandKind::ObjectDestroyRequested;
@@ -671,6 +686,30 @@ namespace Explorer {
 		case CommandKind::ClearManagedReferences:
 			managed_references_.clear();
 			set_status("Pinned reference shelf cleared");
+			publish();
+			return;
+		case CommandKind::PlayAudioPreview:
+			play_audio_preview(command);
+			publish();
+			return;
+		case CommandKind::StopAudioPreview:
+			stop_audio_preview();
+			publish();
+			return;
+		case CommandKind::PreviewTexture:
+			preview_texture(command);
+			publish();
+			return;
+		case CommandKind::CloseTexturePreview:
+			close_texture_preview();
+			publish();
+			return;
+		case CommandKind::ExportTexturePreview:
+			export_texture_preview(command);
+			publish();
+			return;
+		case CommandKind::ExportAudioPreview:
+			export_audio_preview(command);
 			publish();
 			return;
 		case CommandKind::DeleteObject:
@@ -1067,6 +1106,15 @@ namespace Explorer {
 		clear_component_cache();
 		clear_object_inspector();
 		release_all_field_watches();
+		// Just drop the handle here, unlike release_audio_preview(): Stop()/Destroy()
+		// are managed calls, and the runtime may still be in the state that faulted.
+		Inspect::FreeObjectHandle(audio_preview_handle_);
+		working_.audio_preview = {};
+		// The texture preview SRV is a plain native COM object with no tie to the
+		// managed runtime, so releasing it here is unaffected by the fault.
+		release_texture_preview_resources();
+		Inspect::FreeObjectHandle(pending_audio_export_.clip_handle);
+		pending_audio_export_ = {};
 		for (auto& [_, handle] : class_browser_handles_)
 			Inspect::FreeObjectHandle(handle);
 		class_browser_handles_.clear();
@@ -1157,6 +1205,12 @@ namespace Explorer {
 		case CommandKind::CopyLocalTransform: return "Copy local transform";
 		case CommandKind::SceneHint: return "Scene transition";
 		case CommandKind::ClearFlightRecorder: return "Clear flight recorder";
+		case CommandKind::PlayAudioPreview: return "Play audio preview";
+		case CommandKind::StopAudioPreview: return "Stop audio preview";
+		case CommandKind::PreviewTexture: return "Preview texture";
+		case CommandKind::CloseTexturePreview: return "Close texture preview";
+		case CommandKind::ExportTexturePreview: return "Export texture";
+		case CommandKind::ExportAudioPreview: return "Export audio clip";
 		default: return "Explorer command";
 		}
 	}

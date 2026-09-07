@@ -70,6 +70,12 @@ enum class CommandKind {
     ClearReferenceGraph = 61,
     CaptureMethodTraceReturns = 62,
     BuildManagedCallerIndex = 63,
+    PlayAudioPreview = 64,
+    StopAudioPreview = 65,
+    PreviewTexture = 66,
+    CloseTexturePreview = 67,
+    ExportTexturePreview = 68,
+    ExportAudioPreview = 69,
 };
 
 struct Command {

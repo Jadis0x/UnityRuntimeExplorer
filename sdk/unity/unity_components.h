@@ -127,6 +127,7 @@ struct Texture2D : Texture {
     Texture2D() = default;
     explicit Texture2D(void* h) : Texture(h) {}
     static constexpr TypeRef unity_type(){ return Texture2DType; }
+    bool isReadable() const { return GetProperty<bool>("isReadable"); }
     int mipmapCount() const { return GetProperty<int>("mipmapCount"); }
     Color GetPixel(int x, int y) const { return CallExact<Color>("GetPixel", {"System.Int32", "System.Int32"}, x, y); }
     void SetPixel(int x, int y, Color color) const { CallExact<void>("SetPixel", {"System.Int32", "System.Int32", "UnityEngine.Color"}, x, y, color); }
@@ -342,7 +343,9 @@ struct AudioSource : Behaviour {
     explicit AudioSource(void* h) : Behaviour(h) {}
     static constexpr TypeRef unity_type(){ return AudioSourceType; }
     Object clip() const { return GetProperty<Object>("clip"); }
-    void set_clip(Object value) const { SetProperty("clip", value); }
+    // The setter takes AudioClip specifically; SetProperty would infer the
+    // generic Object wrapper and fail exact-overload lookup against it.
+    void set_clip(Object value) const { CallExact<void>("set_clip", {"UnityEngine.AudioClip"}, value); }
     float volume() const { return GetProperty<float>("volume"); }
     void set_volume(float value) const { SetProperty("volume", value); }
     float pitch() const { return GetProperty<float>("pitch"); }

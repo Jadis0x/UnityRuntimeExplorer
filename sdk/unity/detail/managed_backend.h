@@ -154,6 +154,7 @@ struct Backend {
     static int runtime_invoke(const void* method, void* object, void** params, void** result, void** exception) { return URK::managed::runtime_invoke(static_cast<const URK::managed::Method*>(method), static_cast<URK::managed::Object*>(object), params, result, exception); }
     static void* object_unbox(void* object) { return object ? URK::managed::object_unbox(static_cast<URK::managed::Object*>(object)) : nullptr; }
     static void* object_new(const void* klass) { return URK::managed::object_new(static_cast<const URK::managed::Class*>(klass)); }
+    static void* array_new(const void* element_class, std::size_t length) { return URK::managed::array_new(element_class, length); }
     static void runtime_object_init(void* object) { URK::managed::runtime_object_init(static_cast<URK::managed::Object*>(object)); }
     static void* new_string(std::string_view text) {
         if (text.size() > static_cast<std::size_t>(std::numeric_limits<std::uint32_t>::max())) {

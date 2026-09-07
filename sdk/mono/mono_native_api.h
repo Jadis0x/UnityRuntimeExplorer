@@ -31,6 +31,7 @@ const char* method_get_param_name(const void* method, std::uint32_t index,
 
 const void* field_get_parent(const void* field);
 void* field_get_value_object(const void* domain, const void* field, void* object);
+void* array_new(const void* domain, const void* element_class, std::size_t length);
 
 void* string_new_len(const void* domain, const char* utf8, std::uint32_t length);
 std::string exception_message(void* exception);

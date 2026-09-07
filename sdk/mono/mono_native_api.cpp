@@ -24,6 +24,7 @@ using MethodIsGenericFn = int (*)(const void*);
 using MethodGetParamNamesFn = void (*)(const void*, const char**);
 using FieldGetParentFn = const void* (*)(const void*);
 using FieldGetValueObjectFn = void* (*)(const void*, const void*, void*);
+using ArrayNewFn = void* (*)(const void*, const void*, std::size_t);
 using StringNewLenFn = void* (*)(const void*, const char*, std::uint32_t);
 using ObjectToStringFn = void* (*)(void*, void**);
 using StringToUtf8Fn = char* (*)(void*);
@@ -42,6 +43,7 @@ struct Exports {
     MethodGetParamNamesFn method_get_param_names = nullptr;
     FieldGetParentFn field_get_parent = nullptr;
     FieldGetValueObjectFn field_get_value_object = nullptr;
+    ArrayNewFn array_new = nullptr;
     StringNewLenFn string_new_len = nullptr;
     ObjectToStringFn object_to_string = nullptr;
     StringToUtf8Fn string_to_utf8 = nullptr;
@@ -139,6 +141,8 @@ void initialize(const URK::ModContext* context) {
         resolve<FieldGetParentFn>(module, "mono_field_get_parent");
     exports.field_get_value_object =
         resolve<FieldGetValueObjectFn>(module, "mono_field_get_value_object");
+    exports.array_new =
+        resolve<ArrayNewFn>(module, "mono_array_new");
     exports.string_new_len =
         resolve<StringNewLenFn>(module, "mono_string_new_len");
     exports.object_to_string =
@@ -341,6 +345,21 @@ void* field_get_value_object(const void* domain, const void* field, void* object
         return nullptr;
     }
     return current.exports.field_get_value_object(domain, field, object);
+}
+
+void* array_new(const void* domain, const void* element_class, std::size_t length) {
+    State& current = state();
+    std::lock_guard lock(current.mutex);
+    error_slot().clear();
+    if (!domain || !element_class) {
+        set_error("Mono array_new requires a domain and element class");
+        return nullptr;
+    }
+    if (!current.exports.array_new) {
+        set_error("Mono export mono_array_new is unavailable");
+        return nullptr;
+    }
+    return current.exports.array_new(domain, element_class, length);
 }
 
 void* string_new_len(const void* domain, const char* utf8, std::uint32_t length) {

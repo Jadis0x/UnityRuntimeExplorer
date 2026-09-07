@@ -93,6 +93,18 @@ class RuntimeModel {
     bool has_active_field_watches() const;
     ComponentInfo::LiveValues::Reference watch_reference_for(const URK::Unity::Inspect::ValueInfo &value);
     void release_field_watch_references(Snapshot::FieldWatch &watch);
+    void play_audio_preview(const Command &command);
+    void stop_audio_preview();
+    void refresh_audio_preview();
+    void release_audio_preview();
+    void export_audio_preview(const Command &command);
+    void continue_pending_audio_export();
+    URK::Unity::Object ensure_audio_preview_source();
+    void preview_texture(const Command &command);
+    void close_texture_preview();
+    void export_texture_preview(const Command &command);
+    void reap_pending_texture_releases();
+    void release_texture_preview_resources();
     void delete_component(int component_instance_id);
     void inspect_reference(std::uint64_t token);
     void inspect_raw_reference(std::uint64_t address);
@@ -210,6 +222,29 @@ class RuntimeModel {
         Clock::time_point started{};
     };
     std::unordered_map<std::uint64_t, FieldWatchState> field_watches_;
+    // Pins the AudioSource component of a hidden, DontDestroyOnLoad preview
+    // GameObject, created lazily the first time the user plays a clip.
+    URK::Unity::Inspect::ObjectHandle audio_preview_handle_{};
+    // Set while an export waits for AudioClip.LoadAudioData() to finish, since
+    // GetData() only works once the clip's samples are resident in memory.
+    struct PendingAudioExport {
+        bool active = false;
+        URK::Unity::Inspect::ObjectHandle clip_handle{};
+        int attempts_remaining = 0;
+        std::string clip_name;
+    };
+    PendingAudioExport pending_audio_export_;
+    // Opaque ID3D11ShaderResourceView* (DX11 only) for the current texture
+    // preview; kept void* so this header never needs a d3d11.h dependency.
+    void* texture_preview_srv_ = nullptr;
+    struct PendingGpuRelease {
+        void* srv = nullptr;
+        int frames_remaining = 0;
+    };
+    // A replaced or closed SRV outlives a few frames before Release(): the
+    // model thread that decides to swap it may run apart from whichever
+    // thread is still consuming last frame's ImGui draw data.
+    std::vector<PendingGpuRelease> pending_texture_releases_;
     // Returns false when the property has no hookable setter, leaving the watch polling.
     bool attach_setter_hook(FieldWatchState &state, URK::Unity::Object target);
     void detach_setter_hook(FieldWatchState &state);

@@ -93,6 +93,7 @@ const Class* object_get_class(Object* object);
 void* object_unbox(Object* object);
 Object* object_new(const Class* klass);
 void runtime_object_init(Object* object);
+void* array_new(const void* element_class, std::size_t length);
 void* value_box(const Class* klass, void* data);
 
 String* string_new_len(const char* utf8, std::uint32_t length);
