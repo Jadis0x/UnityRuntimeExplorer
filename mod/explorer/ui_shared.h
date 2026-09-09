@@ -27,9 +27,16 @@ bool render_reference_context_menu(const ComponentInfo::LiveValues::Reference *r
 // the item rendered immediately before this call.
 void render_copy_context_menu(const char *popup_id, std::string_view text);
 
+// Opens every ancestor of `instance_id` in the Hierarchy tree and scrolls to
+// it. Selecting an object from outside the tree - a screen pick, a reference
+// jump - is useless if the row stays folded away somewhere off screen.
+// Defined in ui_hierarchy.cpp.
+void reveal_in_hierarchy(int instance_id);
+
 void enqueue_method_trace_clear(MethodTracer::TraceId id);
 void enqueue_field_watch(int component_id, int field_index, bool enabled,
-                         std::uint64_t object_inspector_token = 0, bool property = false);
+                         std::uint64_t object_inspector_token = 0, bool property = false,
+                         bool class_browser_target = false);
 void enqueue_field_watch_clear(std::uint64_t id);
 void enqueue_field_watch_close(std::uint64_t id);
 void enqueue_watch_alarm(std::uint64_t id, WatchAnalysis::AlarmCondition condition, float threshold);

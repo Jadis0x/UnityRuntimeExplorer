@@ -66,6 +66,20 @@ namespace Explorer {
 		if (!safe_object_alive(selected_))
 			return;
 
+		// The shared highlight system is budgeted for many targets at once and
+		// re-projects each one every other frame, which on a moving camera makes
+		// a single box visibly lag and jitter behind the object it marks. The
+		// Explorer highlights one selection, so it pays for a projection every
+		// frame and gets a box that sits still.
+		static bool update_policy_applied = false;
+		if (!update_policy_applied) {
+			ModUI::Highlight::UpdatePolicy policy = ModUI::Highlight::update_policy();
+			policy.mode = ModUI::Highlight::UpdateMode::EveryFrame;
+			policy.projection_interval_frames = 1;
+			ModUI::Highlight::set_update_policy(policy);
+			update_policy_applied = true;
+		}
+
 		ModUI::Highlight::Style style{};
 		style.color = IM_COL32(50, 235, 255, 255);
 		style.fill_color = IM_COL32(40, 190, 255, 36);

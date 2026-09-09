@@ -158,9 +158,21 @@ namespace Explorer {
 				if (!component.metadata->properties[index].runtime_safe)
 					values->properties[index] = Inspect::unavailable_value(component.metadata->properties[index].type_name,
 						"Metadata only: " + component.metadata->properties[index].capability_reason);
-				else if (!component.metadata->properties[index].can_read)
-					values->properties[index] = Inspect::unavailable_value(component.metadata->properties[index].type_name,
-						"Property is not readable");
+				else if (!component.metadata->properties[index].can_read) {
+					// A stripped getter is not the end of the road: an
+					// auto-property still has its backing field.
+					const Inspect::FieldInfo *backing = backing_field_for(
+						reflection->second.fields, component.metadata->properties[index].name,
+						component.metadata->properties[index].declaring_type);
+					values->properties[index] =
+						backing && sampled
+							? guarded_managed_read(component.metadata->properties[index].type_name,
+								[&] { return Inspect::ReadField(target, *backing); })
+						: backing ? Inspect::unavailable_value(component.metadata->properties[index].type_name,
+							"Not sampled")
+						: Inspect::unavailable_value(component.metadata->properties[index].type_name,
+							"No getter in this build (IL2CPP stripped it)");
+				}
 				else if (index < reflection->second.properties.size() && sampled)
 					values->properties[index] = guarded_managed_read(component.metadata->properties[index].type_name, [&] {
 					return Inspect::ReadProperty(target, reflection->second.properties[index]);

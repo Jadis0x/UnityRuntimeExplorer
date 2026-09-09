@@ -51,6 +51,9 @@ namespace Explorer {
 			std::unordered_map<std::uintptr_t, std::string> methods;
 			std::vector<std::pair<std::uintptr_t, const std::string*>> sorted;
 			bool sorted_stale = true;
+			// Set once every assembly has been walked. Until then a missing
+			// entry means "not indexed yet", not "not a managed method".
+			bool complete = false;
 		};
 
 		ManagedCallerIndex& managed_caller_index() {
@@ -96,7 +99,34 @@ namespace Explorer {
 		return memory.State == MEM_COMMIT && (memory.Protect & (PAGE_NOACCESS | PAGE_GUARD)) == 0;
 	}
 
-	bool safe_object_alive(Object object) {
+	const URK::Unity::Inspect::FieldInfo *backing_field_for(
+	const std::vector<URK::Unity::Inspect::FieldInfo> &fields, std::string_view property_name,
+	std::string_view declaring_type) {
+	if (property_name.empty())
+		return nullptr;
+	// The C# compiler names an auto-property's storage "<Name>k__BackingField".
+	// Nothing else in a build is named that way, so the match is exact rather
+	// than a guess at a convention.
+	std::string generated;
+	generated.reserve(property_name.size() + 18);
+	generated += '<';
+	generated += property_name;
+	generated += ">k__BackingField";
+	const URK::Unity::Inspect::FieldInfo *fallback = nullptr;
+	for (const URK::Unity::Inspect::FieldInfo &field : fields) {
+		if (field.name != generated)
+			continue;
+		// A derived class can inherit a same-named property from two levels;
+		// prefer the field declared alongside the property.
+		if (declaring_type.empty() || field.declaring_type.full_name == declaring_type)
+			return &field;
+		if (!fallback)
+			fallback = &field;
+	}
+	return fallback;
+}
+
+bool safe_object_alive(Object object) {
 		if (!object || !readable_address(reinterpret_cast<std::uintptr_t>(object.handle())))
 			return false;
 #if defined(_WIN32)
@@ -577,8 +607,11 @@ namespace Explorer {
 			return index.sorted;
 		}
 
-		// Nearest indexed entry at or below the address, only if a later entry confirms
-		// it's still in range - generic sharing/cold chunks make naive nearest-below wrong.
+		// Nearest indexed entry at or below the address. Only correct for a method
+		// small enough that the compiler emitted no unwind data for it - anything
+		// larger has a .pdata entry and is named exactly, and guessing across the
+		// gap is how a caller inside the IL2CPP runtime ended up labelled with the
+		// name of whichever managed method happened to sit below it.
 		std::string enclosing_indexed_method(std::uintptr_t address) {
 			const auto& entries = sorted_caller_entries();
 			if (entries.empty())
@@ -589,9 +622,14 @@ namespace Explorer {
 				return {};
 			const auto entry = std::prev(next);
 			const std::uintptr_t offset = address - entry->first;
-			// A megabyte gap means these entries aren't neighbours in the same function.
-			constexpr std::uintptr_t kMaxMethodExtent = 1u << 20;
-			if (offset > kMaxMethodExtent)
+			// A leaf method with no frame to unwind. Past this it is another
+			// method's code, not a deep offset into this one.
+			constexpr std::uintptr_t kMaxUnwindlessMethodExtent = 256;
+			if (offset > kMaxUnwindlessMethodExtent)
+				return {};
+			// Anything with unwind data between the two is a different function.
+			DWORD64 unused_base = 0;
+			if (RtlLookupFunctionEntry(static_cast<DWORD64>(entry->first), &unused_base, nullptr) != nullptr)
 				return {};
 			char suffix[32]{};
 			std::snprintf(suffix, sizeof(suffix), " +0x%llX", static_cast<unsigned long long>(offset));
@@ -600,19 +638,85 @@ namespace Explorer {
 
 	} // namespace
 
+	namespace {
+
+		// The unwind fragment a split function chains back to, or 0. Kept free of
+		// objects so the structured handler is allowed here: the unwind data is
+		// read straight out of the image.
+		DWORD64 chained_fragment_start(DWORD64 fragment) {
+			DWORD64 image_base = 0;
+			const PRUNTIME_FUNCTION entry = RtlLookupFunctionEntry(fragment, &image_base, nullptr);
+			if (!entry)
+				return 0;
+			const auto *unwind =
+				reinterpret_cast<const std::uint8_t *>(static_cast<std::uintptr_t>(image_base) + entry->UnwindInfoAddress);
+			DWORD64 parent_start = 0;
+#if defined(_WIN32)
+			__try {
+#endif
+				if (((unwind[0] >> 3) & UNW_FLAG_CHAININFO) != 0) {
+					const std::size_t codes = unwind[2];
+					const std::size_t offset = 4 + ((codes + 1) & ~static_cast<std::size_t>(1)) * 2;
+					RUNTIME_FUNCTION parent{};
+					std::memcpy(&parent, unwind + offset, sizeof(parent));
+					parent_start = image_base + parent.BeginAddress;
+				}
+#if defined(_WIN32)
+			}
+			__except (EXCEPTION_EXECUTE_HANDLER) {
+				parent_start = 0;
+			}
+#endif
+			return parent_start == fragment ? 0 : parent_start;
+		}
+
+	} // namespace
+
+	void mark_caller_index_complete() { managed_caller_index().complete = true; }
+
+	std::string managed_method_location(std::uintptr_t function_start, std::uintptr_t address) {
+		const auto found = managed_caller_index().methods.find(function_start);
+		if (found == managed_caller_index().methods.end())
+			return module_location(address);
+		if (address <= function_start)
+			return found->second;
+		char suffix[32]{};
+		std::snprintf(suffix, sizeof(suffix), " +0x%llX", static_cast<unsigned long long>(address - function_start));
+		return found->second + suffix;
+	}
+
 	std::string managed_caller_location(std::uintptr_t address) {
 		if (!address)
 			return module_location(address);
 		DWORD64 image_base = 0;
 		const PRUNTIME_FUNCTION function = RtlLookupFunctionEntry(static_cast<DWORD64>(address), &image_base, nullptr);
 		if (function) {
-			const std::uintptr_t function_start = static_cast<std::uintptr_t>(image_base + function->BeginAddress);
-			const auto found = managed_caller_index().methods.find(function_start);
-			if (found != managed_caller_index().methods.end())
-				return found->second;
+			// MSVC splits a function into several unwind fragments, and only the
+			// first carries the address metadata knows the method by, so a hit
+			// inside a later fragment has to chain back to it.
+			DWORD64 fragment = image_base + function->BeginAddress;
+			for (int depth = 0; depth < 8 && fragment != 0; ++depth) {
+				const auto found = managed_caller_index().methods.find(static_cast<std::uintptr_t>(fragment));
+				if (found != managed_caller_index().methods.end())
+					return managed_method_location(static_cast<std::uintptr_t>(fragment), address);
+				fragment = chained_fragment_start(fragment);
+			}
 		}
 		const std::string enclosing = enclosing_indexed_method(address);
-		return enclosing.empty() ? module_location(address) : enclosing;
+		if (!enclosing.empty())
+			return enclosing;
+		// A frame the index cannot name because the address has unwind data and
+		// its function is not a managed method: IL2CPP's own runtime, reached
+		// through reflection, a delegate or a UI binding. Saying so stops the
+		// panel from advising an index rebuild that cannot help.
+		// Only once the whole index is in can a missing entry mean the enclosing
+		// function is not managed at all - IL2CPP dispatches reflection,
+		// delegates and UI bindings through its own code, and no index will ever
+		// name those. Saying it earlier mislabels methods that are still being
+		// indexed, which then appear to fix themselves.
+		if (function && managed_caller_index().complete)
+			return module_location(address) + " (native runtime code)";
+		return module_location(address);
 	}
 
 } // namespace Explorer

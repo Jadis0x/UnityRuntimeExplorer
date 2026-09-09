@@ -1,6 +1,8 @@
 // Copyright (c) 2026 Jadis0x. All rights reserved.
 #include "explorer_model.h"
+
 #include "model_shared.h"
+#include "support/mod_log.h"
 
 #include <algorithm>
 #include <string>
@@ -79,6 +81,7 @@ namespace Explorer {
 		}
 		caller_index_scan_ = std::make_unique<CallerIndexScan>();
 		caller_index_scan_->started = Clock::now();
+		ModLog::info("caller index: walking every loaded assembly for managed method addresses");
 		working_.caller_index_active = true;
 		working_.caller_index_built = false;
 		working_.caller_index_methods = 0;
@@ -124,6 +127,8 @@ namespace Explorer {
 			caller_index_scan_.reset();
 			working_.caller_index_active = false;
 			working_.caller_index_built = true;
+			mark_caller_index_complete();
+			ModLog::info("caller index: %zu method(s) across %zu class(es)", methods, classes);
 			if (methods == 0)
 				set_status("Caller name index finished with no entries; this runtime does not expose method addresses");
 			else

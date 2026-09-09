@@ -110,8 +110,11 @@ set(URK_COMMON_SOURCES
         mod/explorer/wav_writer.cpp
         mod/explorer/model_tracing.cpp
         mod/explorer/model_scene.cpp
+        mod/explorer/model_screen_pick.cpp
+        mod/explorer/screen_picker.cpp
         mod/explorer/model_camera_highlight.cpp
         mod/explorer/explorer_ui.cpp
+        mod/explorer/unity_editor_theme.cpp
         mod/explorer/ui_state.cpp
         mod/explorer/ui_members.cpp
         mod/explorer/ui_hierarchy.cpp
@@ -128,6 +131,8 @@ set(URK_COMMON_SOURCES
         mod/explorer/method_trace_format.cpp
         mod/explorer/method_trace_abi.h
         mod/explorer/method_tracer.cpp
+        mod/explorer/inline_sites.cpp
+        mod/explorer/x86_decode.cpp
         mod/explorer/watch_analysis.cpp
         mod/explorer/camera/camera_focus_controller.cpp
         mod/ui/highlight.cpp
@@ -177,6 +182,10 @@ set(URK_COMMON_HEADERS
         mod/explorer/explorer_commands.h
         mod/explorer/explorer_model.h
         mod/explorer/explorer_ui.h
+        mod/explorer/unity_editor_theme.h
+        sdk/unity/unity_euler.h
+        mod/explorer/pick_geometry.h
+        mod/explorer/screen_picker.h
         mod/explorer/byte_data_decoder.h
         mod/explorer/diagnostic_bundle.h
         mod/explorer/reference_graph_layout.h
@@ -391,6 +400,89 @@ if(URK_BUILD_TESTS)
     endif()
     urk_disable_vs_vcpkg_integration(urk_method_trace_value_tests)
     add_test(NAME method_trace_value_contract COMMAND urk_method_trace_value_tests)
+
+    add_executable(urk_camera_math_tests
+        tests/camera_math_tests.cpp
+    )
+    target_include_directories(urk_camera_math_tests PRIVATE .)
+    target_compile_features(urk_camera_math_tests PRIVATE cxx_std_20)
+    target_compile_definitions(urk_camera_math_tests PRIVATE
+        WIN32_LEAN_AND_MEAN
+        NOMINMAX
+        URK_BACKEND_IL2CPP
+    )
+    if(MSVC)
+        target_compile_options(urk_camera_math_tests PRIVATE /W4 /permissive- /EHsc /utf-8)
+    endif()
+    urk_disable_vs_vcpkg_integration(urk_camera_math_tests)
+    add_test(NAME camera_math_contract COMMAND urk_camera_math_tests)
+
+    add_executable(urk_unity_euler_tests
+        tests/unity_euler_tests.cpp
+    )
+    target_include_directories(urk_unity_euler_tests PRIVATE .)
+    target_compile_features(urk_unity_euler_tests PRIVATE cxx_std_20)
+    target_compile_definitions(urk_unity_euler_tests PRIVATE
+        WIN32_LEAN_AND_MEAN
+        NOMINMAX
+        URK_BACKEND_IL2CPP
+    )
+    if(MSVC)
+        target_compile_options(urk_unity_euler_tests PRIVATE /W4 /permissive- /EHsc /utf-8)
+    endif()
+    urk_disable_vs_vcpkg_integration(urk_unity_euler_tests)
+    add_test(NAME unity_euler_contract COMMAND urk_unity_euler_tests)
+
+    add_executable(urk_pick_geometry_tests
+        tests/pick_geometry_tests.cpp
+    )
+    target_include_directories(urk_pick_geometry_tests PRIVATE .)
+    target_compile_features(urk_pick_geometry_tests PRIVATE cxx_std_20)
+    target_compile_definitions(urk_pick_geometry_tests PRIVATE
+        WIN32_LEAN_AND_MEAN
+        NOMINMAX
+        URK_BACKEND_IL2CPP
+    )
+    if(MSVC)
+        target_compile_options(urk_pick_geometry_tests PRIVATE /W4 /permissive- /EHsc /utf-8)
+    endif()
+    urk_disable_vs_vcpkg_integration(urk_pick_geometry_tests)
+    add_test(NAME pick_geometry_contract COMMAND urk_pick_geometry_tests)
+
+    add_executable(urk_x86_decode_tests
+        tests/x86_decode_tests.cpp
+        mod/explorer/x86_decode.cpp
+    )
+    target_include_directories(urk_x86_decode_tests PRIVATE .)
+    target_compile_features(urk_x86_decode_tests PRIVATE cxx_std_20)
+    target_compile_definitions(urk_x86_decode_tests PRIVATE
+        WIN32_LEAN_AND_MEAN
+        NOMINMAX
+        URK_BACKEND_IL2CPP
+    )
+    if(MSVC)
+        target_compile_options(urk_x86_decode_tests PRIVATE /W4 /permissive- /EHsc /utf-8)
+    endif()
+    urk_disable_vs_vcpkg_integration(urk_x86_decode_tests)
+    add_test(NAME x86_decode_contract COMMAND urk_x86_decode_tests)
+
+    add_executable(urk_inline_site_tests
+        tests/inline_site_tests.cpp
+        mod/explorer/inline_sites.cpp
+        mod/explorer/x86_decode.cpp
+    )
+    target_include_directories(urk_inline_site_tests PRIVATE .)
+    target_compile_features(urk_inline_site_tests PRIVATE cxx_std_20)
+    target_compile_definitions(urk_inline_site_tests PRIVATE
+        WIN32_LEAN_AND_MEAN
+        NOMINMAX
+        URK_BACKEND_IL2CPP
+    )
+    if(MSVC)
+        target_compile_options(urk_inline_site_tests PRIVATE /W4 /permissive- /EHsc /utf-8)
+    endif()
+    urk_disable_vs_vcpkg_integration(urk_inline_site_tests)
+    add_test(NAME inline_site_resolution_contract COMMAND urk_inline_site_tests)
 
     add_executable(urk_method_trace_format_tests
         tests/method_trace_format_tests.cpp

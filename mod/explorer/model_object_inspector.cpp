@@ -222,7 +222,7 @@ namespace Explorer {
 		info.camera_distance_valid = false;
 		if (transform) {
 			info.local_position = transform.localPosition();
-			info.local_rotation = transform.GetProperty<Vector3>("localEulerAngles");
+			info.local_rotation = transform.localEulerAngles();
 			info.local_scale = transform.localScale();
 			Camera distance_camera = Camera::main();
 			if (!safe_object_alive(distance_camera) || !distance_camera.enabled())
@@ -904,13 +904,27 @@ namespace Explorer {
 					values->fields[index]);
 			capture_reference(values->fields[index], 0x4000000000000000ull | index, values->field_references[index]);
 		}
+		// A property whose getter this build stripped can still be read through
+		// the backing field the compiler left behind.
+		const auto read_property_backing_field = [&](Object target, const ComponentInfo::Property &property,
+			bool sampled) -> Inspect::ValueInfo {
+			const Inspect::FieldInfo *backing = backing_field_for(
+				object_inspector_reflection_.fields, property.name, property.declaring_type);
+			if (!backing)
+				return Inspect::unavailable_value(property.type_name,
+					"No getter in this build (IL2CPP stripped it)");
+			if (!sampled)
+				return Inspect::unavailable_value(property.type_name, "Not sampled");
+			return guarded_managed_read(property.type_name,
+				[&] { return Inspect::ReadField(target, *backing); });
+			};
 		for (std::size_t index = 0; index < values->properties.size(); ++index) {
 			const bool sampled = sampled_object_properties_.contains(index);
 			values->properties[index] = !metadata.properties[index].runtime_safe
 				? Inspect::unavailable_value(metadata.properties[index].type_name,
 					"Metadata only: " + metadata.properties[index].capability_reason)
 				: !metadata.properties[index].can_read
-				? Inspect::unavailable_value(metadata.properties[index].type_name, "Property is not readable")
+				? read_property_backing_field(object, metadata.properties[index], sampled)
 				: index < object_inspector_reflection_.properties.size() && sampled
 				? guarded_managed_read(
 					metadata.properties[index].type_name,

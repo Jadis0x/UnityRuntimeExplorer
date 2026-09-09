@@ -78,6 +78,100 @@ inline void LoadSceneByBuildIndex(int buildIndex) {
 inline void LoadSceneByName(std::string_view name) {
     detail::InvokeStatic<void>(type(), "LoadScene", name);
 }
+
+// Unity offers several ways to load a scene and managed stripping keeps only
+// the ones a build actually calls: a game whose own code says
+// LoadSceneAsync(name, LoadSceneMode.Single) ships without LoadScene(string)
+// entirely. Every route is tried rather than assuming the simplest one exists.
+struct LoadSceneRoute {
+    const char* method;
+    bool by_name;
+    bool takes_mode;
+};
+inline constexpr LoadSceneRoute load_scene_routes[] = {
+    {"LoadScene", true, false},      {"LoadScene", true, true},
+    {"LoadSceneAsync", true, false}, {"LoadSceneAsync", true, true},
+    {"LoadScene", false, false},     {"LoadScene", false, true},
+    {"LoadSceneAsync", false, false},{"LoadSceneAsync", false, true},
+};
+
+inline const void* find_load_scene_route(const LoadSceneRoute& route) {
+    const void* klass = type().resolve_class();
+    if (!klass)
+        return nullptr;
+    std::vector<const char*> signature;
+    signature.push_back(route.by_name ? "System.String" : "System.Int32");
+    if (route.takes_mode)
+        signature.push_back("UnityEngine.SceneManagement.LoadSceneMode");
+    return detail::Backend::find_method_exact(klass, route.method, signature);
+}
+
+inline std::string load_scene_route_text(const LoadSceneRoute& route) {
+    std::string text = std::string(route.method) + "(" + (route.by_name ? "string" : "int");
+    if (route.takes_mode)
+        text += ", LoadSceneMode";
+    return text + ")";
+}
+
+// The routes this build kept, for a message that says what was actually looked
+// for instead of naming one overload.
+inline std::string AvailableLoadSceneRoutes() {
+    std::string text;
+    for (const LoadSceneRoute& route : load_scene_routes) {
+        if (!find_load_scene_route(route))
+            continue;
+        if (!text.empty())
+            text += ", ";
+        text += load_scene_route_text(route);
+    }
+    return text;
+}
+
+inline bool HasLoadSceneRoute(bool by_name) {
+    for (const LoadSceneRoute& route : load_scene_routes) {
+        if (route.by_name == by_name && find_load_scene_route(route))
+            return true;
+    }
+    return false;
+}
+
+// LoadSceneMode.Single: replace what is loaded, which is what the panel means.
+inline constexpr int kLoadSceneModeSingle = 0;
+
+inline bool LoadSceneUsingAnyRoute(bool by_name, std::string_view name, int buildIndex) {
+    detail::clear_error();
+    for (const LoadSceneRoute& route : load_scene_routes) {
+        if (route.by_name != by_name)
+            continue;
+        const void* method = find_load_scene_route(route);
+        if (!method)
+            continue;
+        void* argv[2]{};
+        void* managed_name = nullptr;
+        int index_value = buildIndex;
+        int mode_value = kLoadSceneModeSingle;
+        if (by_name) {
+            managed_name = detail::Backend::new_string(name);
+            if (!managed_name) {
+                detail::set_error("Unity scene load failed: the scene name could not be created in the runtime");
+                return false;
+            }
+            argv[0] = managed_name;
+        } else {
+            argv[0] = &index_value;
+        }
+        if (route.takes_mode)
+            argv[1] = &mode_value;
+        void* result = nullptr;
+        void* exception = nullptr;
+        if (detail::Backend::runtime_invoke(method, nullptr, argv, &result, &exception) && !exception) {
+            detail::clear_error();
+            return true;
+        }
+        detail::set_error("Unity scene load failed: " + load_scene_route_text(route) + " raised an exception");
+    }
+    return false;
+}
 inline Scene GetActiveScene() {
     return Scene{detail::InvokeStatic<void*>(type(), "GetActiveScene")};
 }

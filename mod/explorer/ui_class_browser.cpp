@@ -5,6 +5,7 @@
 #include "config/mod_config.h"
 #include "explorer_model.h"
 #include "ui_shared.h"
+#include "unity_editor_theme.h"
 
 #include <imgui.h>
 #include <imgui_internal.h>
@@ -42,6 +43,30 @@ struct ClassBrowserUiState {
 ClassBrowserUiState &class_browser_ui_state() {
     static ClassBrowserUiState state;
     return state;
+}
+
+
+// Fields and properties found through the Class Browser are watchable the same
+// way Inspector members are, as long as a live target is selected: the watch
+// reads through that instance, so without one there is nothing to sample.
+void render_class_member_watch(const Snapshot &snapshot, std::size_t member_index, bool property,
+                               std::uint64_t target_token, bool instance_readable, const char *unavailable_reason) {
+    const Snapshot::FieldWatch *watch = field_watch_for(snapshot, 0, member_index, target_token, property);
+    const bool watching = watch && watch->active;
+    const bool available = target_token != 0 && instance_readable;
+    ImGui::SameLine();
+    ImGui::BeginDisabled(!available);
+    if (ImGui::SmallButton(watching ? "Unwatch" : "Watch"))
+        enqueue_field_watch(0, static_cast<int>(member_index), !watching, target_token, property, true);
+    ImGui::EndDisabled();
+    if (!ImGui::IsItemHovered())
+        return;
+    const char *reason = !instance_readable ? unavailable_reason
+                         : target_token == 0
+                             ? "Select a live target above: a watch reads the member through an instance"
+                         : watching ? "Stop reporting changes to this member"
+                                    : "Report every change to this member in Value Watches";
+    ImGui::SetTooltip("%s", reason);
 }
 
 } // namespace
@@ -247,11 +272,12 @@ void render_class_browser(const Snapshot &snapshot) {
         if (ImGui::BeginTabBar("##class-member-kinds", ImGuiTabBarFlags_FittingPolicyScroll)) {
         char class_tab_label[96];
         std::snprintf(class_tab_label, sizeof(class_tab_label), "Fields (%zu)###cfields", members.fields.size());
-        if (ImGui::BeginTabItem(class_tab_label)) {
-            for (const ComponentInfo::Field &field : members.fields) {
+        if (Unity::begin_member_tab(class_tab_label, Unity::Skin::action_blue)) {
+            for (std::size_t field_index = 0; field_index < members.fields.size(); ++field_index) {
+                const ComponentInfo::Field &field = members.fields[field_index];
                 if (!member_matches_filter(field.name, field.type_name, field.declaring_type, member_filter))
                     continue;
-                ImGui::PushID(&field);
+                ImGui::PushID(static_cast<int>(field_index));
                 ImGui::TextDisabled("%s%s : %s", field.is_static ? "static " : "", field.name.c_str(),
                                     field.type_name.c_str());
                 render_field_context_menu(field, class_code, {});
@@ -262,29 +288,34 @@ void render_class_browser(const Snapshot &snapshot) {
                 ImGui::SameLine();
                 if (ImGui::SmallButton("Copy addr"))
                     ImGui::SetClipboardText(field.pointer_text.c_str());
+                render_class_member_watch(snapshot, field_index, false, state.target_token, !field.is_static,
+                                          "Static fields have no instance to watch; read them from Static State above");
                 ImGui::PopID();
             }
             ImGui::EndTabItem();
         }
         std::snprintf(class_tab_label, sizeof(class_tab_label), "Properties (%zu)###cproperties",
                       members.properties.size());
-        if (ImGui::BeginTabItem(class_tab_label)) {
-            for (const ComponentInfo::Property &property : members.properties) {
+        if (Unity::begin_member_tab(class_tab_label, Unity::Skin::action_green)) {
+            for (std::size_t property_index = 0; property_index < members.properties.size(); ++property_index) {
+                const ComponentInfo::Property &property = members.properties[property_index];
                 if (!member_matches_filter(property.name, property.type_name, property.declaring_type, member_filter))
                     continue;
-                ImGui::PushID(&property);
+                ImGui::PushID(static_cast<int>(property_index));
                 ImGui::TextDisabled("%s : %s  %s%s", property.name.c_str(), property.type_name.c_str(),
                                     property.can_read ? "get" : "", property.can_write ? "/set" : "");
                 render_property_context_menu(property, class_code, {});
                 ImGui::SameLine();
                 if (ImGui::SmallButton("Copy addr"))
                     ImGui::SetClipboardText(property.pointer_text.c_str());
+                render_class_member_watch(snapshot, property_index, true, state.target_token, property.can_read,
+                                          "This property has no getter, so its value cannot be sampled");
                 ImGui::PopID();
             }
             ImGui::EndTabItem();
         }
         std::snprintf(class_tab_label, sizeof(class_tab_label), "Methods (%zu)###cmethods", members.methods.size());
-        if (ImGui::BeginTabItem(class_tab_label)) {
+        if (Unity::begin_member_tab(class_tab_label, Unity::Skin::action_amber)) {
             for (std::size_t method_index = 0; method_index < members.methods.size(); ++method_index) {
                 const ComponentInfo::Method &method = members.methods[method_index];
                 if (!method_matches_filter(method, member_filter))
@@ -302,6 +333,23 @@ void render_class_browser(const Snapshot &snapshot) {
                                               parameters + ") : " + method.return_type;
                 const bool method_open = ImGui::TreeNode("##class-method", "%s", signature.c_str());
                 render_method_context_menu(method, class_code);
+                const MethodTracer::Snapshot *row_trace = trace_for_method(snapshot.method_traces, method);
+                const bool row_tracing = row_trace && row_trace->active;
+                ImGui::SameLine();
+                if (ImGui::SmallButton(row_tracing ? "Stop tracing" : "Trace")) {
+                    Command command{};
+                    command.kind = CommandKind::SetMethodTrace;
+                    command.member_index = static_cast<int>(method_index);
+                    command.class_browser_target = true;
+                    command.image = state.selected.image;
+                    command.namespc = state.selected.namespc;
+                    command.class_name = state.selected.class_name;
+                    command.bool_value = !row_tracing;
+                    RuntimeModel::instance().enqueue(std::move(command));
+                }
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("%s", row_tracing ? "Stop recording calls to this method"
+                                                        : "Record every call to this method in Method Calls");
                 ImGui::SameLine();
                 if (ImGui::SmallButton("Copy addr"))
                     ImGui::SetClipboardText(method.pointer_text.c_str());
@@ -328,24 +376,6 @@ void render_class_browser(const Snapshot &snapshot) {
                                                execution_scope, &snapshot.managed_references);
                         ImGui::PopID();
                     }
-                    const MethodTracer::Snapshot *trace = trace_for_method(snapshot.method_traces, method);
-                    Command trace_command{};
-                    trace_command.kind = CommandKind::SetMethodTrace;
-                    trace_command.member_index = static_cast<int>(method_index);
-                    trace_command.class_browser_target = true;
-                    trace_command.image = state.selected.image;
-                    trace_command.namespc = state.selected.namespc;
-                    trace_command.class_name = state.selected.class_name;
-                    if (trace && trace->active) {
-                        if (ImGui::SmallButton("Stop tracing")) {
-                            trace_command.bool_value = false;
-                            RuntimeModel::instance().enqueue(std::move(trace_command));
-                        }
-                    } else if (ImGui::SmallButton("Trace")) {
-                        trace_command.bool_value = true;
-                        RuntimeModel::instance().enqueue(std::move(trace_command));
-                    }
-                    ImGui::SameLine();
                     const bool constructor = method.name == ".ctor" && !method.is_static;
                     const bool has_target = constructor || method.is_static || state.target_token != 0;
                     ImGui::BeginDisabled(!has_target || !invokable_method(method));

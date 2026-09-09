@@ -393,7 +393,15 @@ std::string json(const MethodTracer::Snapshot& trace) {
         append_json_value(out, record.caller_display);
         out += ", \"address\": ";
         append_json_value(out, address(record.caller_address));
-        out += "},\n      \"target\": {\"display\": ";
+        out += "}";
+        // Says the call was seen inside a copy of the body the compiler pasted
+        // into its caller, which is also why the arguments read as uncaptured.
+        if (record.inline_site_address != 0) {
+            out += ",\n      \"inlinedCopy\": {\"address\": ";
+            append_json_value(out, address(record.inline_site_address));
+            out += "}";
+        }
+        out += ",\n      \"target\": {\"display\": ";
         append_json_value(out, record.target_display);
         out += ", \"address\": ";
         append_json_value(out, address(record.target_address));

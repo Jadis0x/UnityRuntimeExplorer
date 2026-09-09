@@ -54,6 +54,12 @@ struct RuntimeModel::HierarchyCensus {
 	std::unordered_map<int, std::size_t> loaded_scene_indices;
 	std::size_t ddol_index = 0;
 	std::size_t hidden_index = 0;
+	// Scene node that receives roots when GameObject.scene cannot be read,
+	// which happens in IL2CPP builds whose managed stripping dropped the
+	// getter. Points at the active scene, or the DontDestroyOnLoad node when
+	// no scene is loaded.
+	std::size_t fallback_scene_index = 0;
+	bool scene_lookup_available = true;
 	URK::Unity::detail::RootedObjectArray<URK::Unity::GameObject> candidates;
 	std::size_t candidate_count = 0;
 	std::size_t candidate_index = 0;
@@ -119,6 +125,14 @@ bool readable_address(std::uintptr_t address);
 
 // Destroyed Unity wrappers can keep a valid address and instance ID.
 // UnityEngine.Object.op_Implicit is the backend-neutral Unity lifetime check.
+// A property whose getter IL2CPP stripped is still readable when the compiler
+// left its backing field behind, which it does for every auto-property. Returns
+// null for hand-written properties and for engine types like AudioSource, whose
+// values live in native code with no managed field to fall back on.
+const URK::Unity::Inspect::FieldInfo *backing_field_for(
+	const std::vector<URK::Unity::Inspect::FieldInfo> &fields, std::string_view property_name,
+	std::string_view declaring_type);
+
 bool safe_object_alive(URK::Unity::Object object);
 std::string safe_runtime_class_name(URK::Unity::Object object);
 URK::Unity::Inspect::TypeInfo safe_type_of(URK::Unity::Object object);
@@ -147,6 +161,12 @@ bool is_expected_empty_container_error(std::string_view message);
 // explorer_model.cpp reads the same index back when publishing trace records.
 void remember_managed_method(const URK::Unity::Inspect::MethodInfo& method);
 std::string managed_caller_location(std::uintptr_t address);
+// Marks the caller index as covering every assembly, which is what lets an
+// address with no entry be reported as native rather than as not yet indexed.
+void mark_caller_index_complete();
+// Names an address whose enclosing method is already known, instead of guessing
+// from the nearest indexed entry below it.
+std::string managed_method_location(std::uintptr_t function_start, std::uintptr_t address);
 
 // Isolate broken managed references from the host callback.
 //

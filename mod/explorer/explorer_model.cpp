@@ -524,6 +524,8 @@ namespace Explorer {
 			command.kind == CommandKind::ClearFieldWatch || command.kind == CommandKind::CloseFieldWatch ||
 			command.kind == CommandKind::InspectReference || command.kind == CommandKind::InspectRawReference ||
 			command.kind == CommandKind::CloseObjectInspectorTab ||
+			command.kind == CommandKind::PickAtScreenPoint ||
+			command.kind == CommandKind::ClearScreenPick ||
 			command.kind == CommandKind::SetLiveData ||
 			command.kind == CommandKind::SetHighlightDistance ||
 			command.kind == CommandKind::SetHighlightEnabled ||
@@ -626,6 +628,14 @@ namespace Explorer {
 			return;
 		case CommandKind::SetFieldWatch:
 			set_field_watch(command);
+			publish();
+			return;
+		case CommandKind::PickAtScreenPoint:
+			pick_at_screen_point(command);
+			publish();
+			return;
+		case CommandKind::ClearScreenPick:
+			clear_screen_pick();
 			publish();
 			return;
 		case CommandKind::ExportDiagnosticBundle: {
@@ -777,7 +787,7 @@ namespace Explorer {
 			capture_last_error("Set position");
 			break;
 		case CommandKind::SetLocalRotation:
-			object.transform().SetProperty("localEulerAngles", command.vector_value);
+			object.transform().set_localEulerAngles(command.vector_value);
 			capture_last_error("Set rotation");
 			break;
 		case CommandKind::SetLocalScale:
@@ -791,7 +801,7 @@ namespace Explorer {
 				capture_last_error("Paste transform position");
 				break;
 			}
-			transform.SetProperty("localEulerAngles", command.vector_value_secondary);
+			transform.set_localEulerAngles(command.vector_value_secondary);
 			if (const char* error = last_error(); error && error[0]) {
 				capture_last_error("Paste transform rotation");
 				break;
@@ -813,7 +823,7 @@ namespace Explorer {
 				capture_last_error("Copy transform position");
 				break;
 			}
-			working_.transform_clipboard.local_rotation = transform.GetProperty<Vector3>("localEulerAngles");
+			working_.transform_clipboard.local_rotation = transform.localEulerAngles();
 			if (const char* error = last_error(); error && error[0]) {
 				capture_last_error("Copy transform rotation");
 				break;
@@ -1305,8 +1315,19 @@ namespace Explorer {
         for (MethodTracer::Snapshot& trace : working_.method_traces) {
             // Decode ABI captures on the Explorer thread, outside the detour.
             MethodTraceValueDecoder::resolve_displays(trace);
+            for (MethodTracer::Snapshot::InlineSite& site : trace.inline_sites)
+                site.display = managed_method_location(site.function_start, site.address);
             for (MethodTracer::Record& record : trace.records) {
-                record.caller_display = managed_caller_location(record.caller_address);
+                // A record from an inlined copy already knows which method
+                // carries it, so name it from there rather than from whichever
+                // indexed entry happens to sit below the address.
+                const auto site = std::find_if(trace.inline_sites.begin(), trace.inline_sites.end(),
+                                               [&record](const MethodTracer::Snapshot::InlineSite& entry) {
+                                                   return entry.address == record.inline_site_address;
+                                               });
+                record.caller_display = record.inline_site_address != 0 && site != trace.inline_sites.end()
+                                            ? managed_method_location(site->function_start, record.caller_address)
+                                            : managed_caller_location(record.caller_address);
                 // A bare module offset is the shape an unindexed caller takes.
                 if (record.caller_address != 0 && record.caller_display.find("+0x") != std::string::npos &&
                     record.caller_display.find(".dll+0x") != std::string::npos)
@@ -1344,8 +1365,14 @@ namespace Explorer {
 					const auto handle = reference_handles_.find(existing->second);
 					if (handle != reference_handles_.end()) {
 						const Object value = Inspect::ResolveObjectHandle(handle->second);
-						if (!value) {
+						// A decoded value type already reads as its value; only a
+						// reference needs the runtime type spelled out.
+						if (!value && boxed_value_return) {
+							// Leave the decoded value in place.
+						} else if (!value) {
 							record.return_display = "retained trace result was released";
+						} else if (boxed_value_return) {
+							record.return_readable = true;
 						} else if (trace.return_type != "System.String" && trace.return_type != "String" &&
 							trace.return_type != "string") {
 							record.return_display = describe_traced_reference(
@@ -1417,8 +1444,13 @@ namespace Explorer {
 				reference_handles_[token] = root;
 				traced_return_references_.emplace(key, token);
 				record.return_reference_token = token;
-				record.return_display = describe_traced_reference(
-					static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(value.handle())), trace.return_type);
+				// Boxing a value-type result only exists so the row can offer
+				// Inspect. The decoded value is what the return actually was, so
+				// it stays: describing the box instead turned every bool return
+				// into the words "System.Boolean".
+				if (record.return_display.empty())
+					record.return_display = describe_traced_reference(
+						static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(value.handle())), trace.return_type);
 			}
 		}
 		for (auto it = traced_return_references_.begin(); it != traced_return_references_.end();) {

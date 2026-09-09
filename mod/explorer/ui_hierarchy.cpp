@@ -5,6 +5,7 @@
 #include "config/mod_config.h"
 #include "explorer_model.h"
 #include "ui_shared.h"
+#include "unity_editor_theme.h"
 
 #include <imgui.h>
 #include <imgui_internal.h>
@@ -38,6 +39,33 @@ enum class HierarchyFilterMode {
 NodeMatchSet &hierarchy_filter_matches() {
     static NodeMatchSet matches;
     return matches;
+}
+
+// The object the tree should unfold to and scroll to on the next frame, and the
+// ancestors it has to open along the way. Cleared once the scroll has happened,
+// so the user can fold the branch back up again afterwards.
+struct RevealRequest {
+    int target = 0;
+    bool pending = false;
+    NodeMatchSet ancestors;
+};
+
+RevealRequest &reveal_request() {
+    static RevealRequest request;
+    return request;
+}
+
+// Depth-first walk that records the chain of parents leading to `target`.
+bool collect_ancestors(const HierarchyNode &node, int target, NodeMatchSet &ancestors) {
+    if (node.instance_id == target)
+        return true;
+    for (const HierarchyNode &child : node.children) {
+        if (collect_ancestors(child, target, ancestors)) {
+            ancestors.insert(node.instance_id);
+            return true;
+        }
+    }
+    return false;
 }
 
 bool hierarchy_node_matches(const HierarchyNode &node, std::string_view filter, HierarchyFilterMode mode) {
@@ -133,8 +161,8 @@ void render_node(const HierarchyNode &node, int selected_instance_id, const Node
         return;
 
     ImGui::PushID(node.instance_id);
-    ImGuiTreeNodeFlags flags =
-        ImGuiTreeNodeFlags_OpenOnArrow | ImGuiTreeNodeFlags_OpenOnDoubleClick | ImGuiTreeNodeFlags_SpanAvailWidth;
+    ImGuiTreeNodeFlags flags = ImGuiTreeNodeFlags_OpenOnArrow | ImGuiTreeNodeFlags_OpenOnDoubleClick |
+                               ImGuiTreeNodeFlags_SpanFullWidth;
     if (node.children.empty())
         flags |= ImGuiTreeNodeFlags_Leaf | ImGuiTreeNodeFlags_NoTreePushOnOpen;
     if (node.instance_id == selected_instance_id)
@@ -142,11 +170,22 @@ void render_node(const HierarchyNode &node, int selected_instance_id, const Node
     if (matches)
         flags |= ImGuiTreeNodeFlags_DefaultOpen;
 
+    RevealRequest &reveal = reveal_request();
+    const bool revealing = reveal.pending && reveal.target != 0;
+    if (revealing && reveal.ancestors.contains(node.instance_id))
+        ImGui::SetNextItemOpen(true, ImGuiCond_Always);
+
     if (!node.active)
         ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
     const bool open = ImGui::TreeNodeEx("##node", flags, "%s", node.name.c_str());
     if (!node.active)
         ImGui::PopStyleColor();
+
+    if (revealing && node.instance_id == reveal.target) {
+        ImGui::SetScrollHereY(0.5f);
+        reveal.pending = false;
+        reveal.ancestors.clear();
+    }
 
     if (ImGui::IsItemHovered() && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
         enqueue_hierarchy_command(CommandKind::FocusSelected, node, revision);
@@ -165,55 +204,42 @@ void render_node(const HierarchyNode &node, int selected_instance_id, const Node
 }
 
 } // namespace
+void reveal_in_hierarchy(int instance_id) {
+    RevealRequest &request = reveal_request();
+    request.target = instance_id;
+    request.pending = instance_id != 0;
+    request.ancestors.clear();
+}
+namespace {
+} // namespace
 void render_hierarchy(const HierarchyInfo &hierarchy, int selected_instance_id,
                       const Snapshot::TransformClipboard& clipboard) {
     static int filter_mode_index = 0;
     constexpr const char *filter_modes[] = {"Name, tag or instance ID", "Name", "Tag", "Instance ID"};
     static bool include_inactive = true;
-    if (ImGui::SmallButton("+##hierarchy-actions"))
+    {
+        ImDrawList *draw_list = ImGui::GetWindowDrawList();
+        const ImVec2 strip_min(ImGui::GetWindowPos().x, ImGui::GetCursorScreenPos().y - ImGui::GetStyle().WindowPadding.y);
+        const ImVec2 strip_max(strip_min.x + ImGui::GetWindowSize().x,
+                               ImGui::GetCursorScreenPos().y + ImGui::GetFrameHeight() + ImGui::GetStyle().WindowPadding.y);
+        if (draw_list) {
+            draw_list->AddRectFilled(strip_min, strip_max, ImGui::GetColorU32(Unity::Skin::toolbar));
+            draw_list->AddLine(ImVec2(strip_min.x, strip_max.y - 1.0f), ImVec2(strip_max.x, strip_max.y - 1.0f),
+                               ImGui::GetColorU32(Unity::Skin::rule), 1.0f);
+        }
+    }
+    // Scene loading used to hide in here, three clicks deep behind a "+"; it now
+    // has its own menu on the toolbar. What is left is the one option that only
+    // makes sense next to the tree.
+    if (ImGui::SmallButton("Options##hierarchy-actions"))
         ImGui::OpenPopup("##hierarchy-actions-popup");
     if (ImGui::IsItemHovered())
-        ImGui::SetTooltip("Scene actions and Hierarchy options");
+        ImGui::SetTooltip("Hierarchy display options. Scenes load from the toolbar's Scene menu.");
     if (ImGui::BeginPopup("##hierarchy-actions-popup")) {
         ImGui::Checkbox("Show inactive objects", &include_inactive);
-        ImGui::SeparatorText("Scenes in Build Settings");
-        if (hierarchy.available_scenes.empty()) {
-            ImGui::TextDisabled("No build scenes are available.");
-        } else {
-            for (const SceneLoadInfo &scene : hierarchy.available_scenes) {
-                ImGui::PushID(scene.build_index);
-                const std::string label = "Load [" + std::to_string(scene.build_index) + "] " + scene.name;
-                if (ImGui::MenuItem(label.c_str(), nullptr, false, !scene.active)) {
-                    Command command{.kind = CommandKind::LoadScene};
-                    command.int_value = scene.build_index;
-                    command.text = scene.path;
-                    RuntimeModel::instance().enqueue(std::move(command));
-                }
-                if (ImGui::IsItemHovered() && !scene.path.empty())
-                    ImGui::SetTooltip("%s%s", scene.path.c_str(), scene.loaded ? "\nLoaded" : "");
-                ImGui::PopID();
-            }
-        }
-        ImGui::SeparatorText("Load by path or name");
-        static std::vector<char> manual_scene_key;
-        ImGui::SetNextItemWidth(320.0f);
-        input_text_dynamic("##manual-scene-key", "Assets/.../Scene.unity or scene name", manual_scene_key);
-        ImGui::BeginDisabled(manual_scene_key.empty() || manual_scene_key.front() == '\0');
-        if (ImGui::Button("Load Scene", ImVec2(-1.0f, 0.0f))) {
-            Command command{.kind = CommandKind::LoadScene};
-            command.int_value = -1;
-            command.text = std::string(manual_scene_key.data());
-            RuntimeModel::instance().enqueue(std::move(command));
-            ImGui::CloseCurrentPopup();
-        }
-        ImGui::EndDisabled();
         ImGui::EndPopup();
     }
-    ImGui::SameLine();
-    if (ImGui::SmallButton("Refresh"))
-        enqueue_simple(CommandKind::Refresh, 0);
-    if (ImGui::IsItemHovered())
-        ImGui::SetTooltip("Re-read the scene hierarchy from the running game");
+    // Refresh lives on the toolbar, where every other panel reaches it too.
     ImGui::SameLine();
     const float mode_width = std::min(155.0f, ImGui::GetContentRegionAvail().x * 0.38f);
     ImGui::SetNextItemWidth(std::max(100.0f, ImGui::GetContentRegionAvail().x - mode_width -
@@ -248,12 +274,30 @@ void render_hierarchy(const HierarchyInfo &hierarchy, int selected_instance_id,
         }
         matches = &cached_matches;
     }
+    RevealRequest &reveal = reveal_request();
+    if (reveal.pending && reveal.ancestors.empty() && reveal.target != 0) {
+        for (const SceneNode &scene : hierarchy.scenes)
+            for (const HierarchyNode &root : scene.roots)
+                if (collect_ancestors(root, reveal.target, reveal.ancestors))
+                    break;
+        // An object the current tree does not contain would leave the request
+        // pending forever, forcing every branch open on every frame.
+        if (reveal.ancestors.empty()) {
+            const auto is_root = [&](const HierarchyNode &root) { return root.instance_id == reveal.target; };
+            bool found = false;
+            for (const SceneNode &scene : hierarchy.scenes)
+                found = found || std::any_of(scene.roots.begin(), scene.roots.end(), is_root);
+            if (!found)
+                reveal.pending = false;
+        }
+    }
+
     const float status_height = ImGui::GetTextLineHeightWithSpacing();
     ImGui::BeginChild("##hierarchy-results", ImVec2(0.0f, -status_height), false);
     for (const SceneNode &scene : hierarchy.scenes) {
         const int group_id = scene.dont_destroy_on_load ? -1 : scene.hide_and_dont_save ? -2 : scene.handle;
         ImGui::PushID(group_id);
-        ImGuiTreeNodeFlags scene_flags = ImGuiTreeNodeFlags_DefaultOpen | ImGuiTreeNodeFlags_SpanAvailWidth;
+        ImGuiTreeNodeFlags scene_flags = ImGuiTreeNodeFlags_DefaultOpen | ImGuiTreeNodeFlags_SpanFullWidth;
         const char *marker = scene.dont_destroy_on_load ? "DontDestroyOnLoad"
                              : scene.hide_and_dont_save ? "Hidden / Dont Save"
                                                         : scene.name.c_str();
@@ -277,6 +321,11 @@ void render_hierarchy(const HierarchyInfo &hierarchy, int selected_instance_id,
         enqueue_simple(CommandKind::ClearSelection, 0);
     }
     ImGui::EndChild();
+    // The tree has had its frame. If the target never rendered - it is inactive
+    // while inactive objects are hidden, or the search filter excludes it - the
+    // request must still end here, or every ancestor would be forced open on
+    // every frame from now on.
+    reveal.pending = false;
     ImGui::TextDisabled("%zu GameObjects  |  %zu roots", hierarchy.objects, hierarchy.roots);
 }
 

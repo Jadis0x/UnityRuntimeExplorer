@@ -1048,8 +1048,18 @@ namespace ModRenderHook {
 		queue_release_all_mouse(hwnd);
 	}
 
+	// A panel dragged out of the game window becomes a top-level window of its
+	// own and takes the foreground with it. Treating that as "not our window"
+	// stops the position feed mid-drag, and the panel jumps when it resumes.
+	inline bool menu_owns_foreground(HWND hwnd) {
+		const HWND foreground = GetForegroundWindow();
+		if (!foreground)
+			return false;
+		return foreground == hwnd || is_imgui_platform_window(foreground);
+	}
+
 	inline void poll_window_mouse_state(HWND hwnd) {
-		if (!hwnd || !IsWindow(hwnd) || GetForegroundWindow() != hwnd ||
+		if (!hwnd || !IsWindow(hwnd) || !menu_owns_foreground(hwnd) ||
 			!g_menu_visible.load(std::memory_order_acquire))
 			return;
 

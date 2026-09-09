@@ -1,5 +1,6 @@
 #pragma once
 #include "unity_types.h"
+#include "unity_euler.h"
 
 namespace URK::Unity {
 // URK_UNITY_COMPONENTS_BEGIN
@@ -62,8 +63,14 @@ struct Transform : Component {
     void set_localPosition(Vector3 v) const { SetProperty("localPosition", v); }
     Quaternion localRotation() const { return GetProperty<Quaternion>("localRotation"); }
     void set_localRotation(Quaternion q) const { SetProperty("localRotation", q); }
-    Vector3 eulerAngles() const { return GetProperty<Vector3>("eulerAngles"); }
-    void set_eulerAngles(Vector3 v) const { SetProperty("eulerAngles", v); }
+    // The euler accessors are the ones IL2CPP strips most often - a build that
+    // only ever assigns rotation loses set_localEulerAngles outright. The
+    // quaternion properties always survive because the engine itself uses them,
+    // so the angles convert natively and travel through those instead.
+    Vector3 localEulerAngles() const { return has_property(TransformType, "localEulerAngles") ? GetProperty<Vector3>("localEulerAngles") : quaternion_to_euler(localRotation()); }
+    void set_localEulerAngles(Vector3 v) const { if (has_method(TransformType, "set_localEulerAngles", 1)) SetProperty("localEulerAngles", v); else set_localRotation(euler_to_quaternion(v)); }
+    Vector3 eulerAngles() const { return has_property(TransformType, "eulerAngles") ? GetProperty<Vector3>("eulerAngles") : quaternion_to_euler(rotation()); }
+    void set_eulerAngles(Vector3 v) const { if (has_method(TransformType, "set_eulerAngles", 1)) SetProperty("eulerAngles", v); else set_rotation(euler_to_quaternion(v)); }
     Quaternion rotation() const { return GetProperty<Quaternion>("rotation"); }
     void set_rotation(Quaternion q) const { SetProperty("rotation", q); }
     Vector3 localScale() const { return GetProperty<Vector3>("localScale"); }
@@ -990,6 +997,10 @@ struct GameObject : Object {
     // a metadata spelling mismatch.
     void SetActive(bool value) const { Call<void>("SetActive", value); }
     Scene scene() const { return Scene{Call<void*>("get_scene")}; }
+    // Managed stripping drops GameObject.scene from builds whose own code
+    // never reads it, and then every object looks scene-less. Check this
+    // before treating an unreadable scene as "prefab or asset".
+    static bool scene_available() { return has_method(GameObjectType, "get_scene", 0); }
     std::string tag() const;
     template<class T> T GetComponent() const { return T{GetComponent(T::unity_type().image, T::unity_type().namespc, T::unity_type().name).handle()}; }
     template<class T>

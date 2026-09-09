@@ -117,6 +117,9 @@ class RuntimeModel {
     void refresh_object_inspector_values(bool force = false);
     void release_reference_handle(std::uint64_t token);
     void update_highlight();
+    // Screen picking, in model_screen_pick.cpp.
+    void pick_at_screen_point(const Command &command);
+    void clear_screen_pick();
     void update_camera_focus();
     void focus_selected_camera(URK::Unity::GameObject object);
     void restore_focused_camera();

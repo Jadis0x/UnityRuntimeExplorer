@@ -7,6 +7,7 @@
 #include "explorer_model.h"
 #include "method_tracer.h"
 #include "ui_shared.h"
+#include "unity_editor_theme.h"
 
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -680,9 +681,7 @@ void render_identity(const InspectorInfo &info) {
         ImGui::EndPopup();
     }
 
-    if (ImGui::BeginTable("##identity", 2, ImGuiTableFlags_SizingStretchProp)) {
-        ImGui::TableSetupColumn("label", ImGuiTableColumnFlags_WidthFixed, 72.0f);
-        ImGui::TableSetupColumn("value", ImGuiTableColumnFlags_WidthStretch);
+    if (Unity::begin_property_rows("##identity")) {
 
         property_label("Tag");
         ImGui::InputText("##tag", buffers.tag.data(), buffers.tag.size());
@@ -704,13 +703,15 @@ void render_identity(const InspectorInfo &info) {
             command.bool_value = is_static;
             RuntimeModel::instance().enqueue(std::move(command));
         }
-        ImGui::EndTable();
+        Unity::end_property_rows();
     }
+    Unity::rule_line(2.0f, 2.0f);
 }
 namespace {
 } // namespace
 void render_transform(const InspectorInfo &info, const Snapshot::TransformClipboard& clipboard) {
-    const bool open = ImGui::CollapsingHeader("Transform", ImGuiTreeNodeFlags_DefaultOpen);
+    ImGui::SetNextItemOpen(true, ImGuiCond_FirstUseEver);
+    const bool open = Unity::component_header("##transform", "Transform", nullptr, nullptr, "UnityEngine");
     if (ImGui::BeginPopupContextItem("##transform-context")) {
         if (ImGui::MenuItem("Copy Component"))
             send_transform_copy(info);
@@ -733,27 +734,25 @@ void render_transform(const InspectorInfo &info, const Snapshot::TransformClipbo
         ImGui::SetTooltip("Right-click for component actions");
     if (!open)
         return;
-    if (!ImGui::BeginTable("##transform", 2, ImGuiTableFlags_SizingStretchProp))
-        return;
-    ImGui::TableSetupColumn("label", ImGuiTableColumnFlags_WidthFixed, 72.0f);
-    ImGui::TableSetupColumn("value", ImGuiTableColumnFlags_WidthStretch);
+    if (Unity::begin_property_rows("##transform")) {
+        float position[3]{info.local_position.x, info.local_position.y, info.local_position.z};
+        property_label("Position");
+        if (Unity::vector3_row("position", position, 0.05f, "%.3f"))
+            send_vector_command(CommandKind::SetLocalPosition, info, position);
 
-    float position[3]{info.local_position.x, info.local_position.y, info.local_position.z};
-    property_label("Position");
-    if (ImGui::DragFloat3("##position", position, 0.05f, 0.0f, 0.0f, "%.3f"))
-        send_vector_command(CommandKind::SetLocalPosition, info, position);
+        float rotation[3]{info.local_rotation.x, info.local_rotation.y, info.local_rotation.z};
+        property_label("Rotation");
+        if (Unity::vector3_row("rotation", rotation, 0.25f, "%.2f"))
+            send_vector_command(CommandKind::SetLocalRotation, info, rotation);
 
-    float rotation[3]{info.local_rotation.x, info.local_rotation.y, info.local_rotation.z};
-    property_label("Rotation");
-    if (ImGui::DragFloat3("##rotation", rotation, 0.25f, 0.0f, 0.0f, "%.2f"))
-        send_vector_command(CommandKind::SetLocalRotation, info, rotation);
+        float scale[3]{info.local_scale.x, info.local_scale.y, info.local_scale.z};
+        property_label("Scale");
+        if (Unity::vector3_row("scale", scale, 0.02f, "%.3f"))
+            send_vector_command(CommandKind::SetLocalScale, info, scale);
 
-    float scale[3]{info.local_scale.x, info.local_scale.y, info.local_scale.z};
-    property_label("Scale");
-    if (ImGui::DragFloat3("##scale", scale, 0.02f, 0.0f, 0.0f, "%.3f"))
-        send_vector_command(CommandKind::SetLocalScale, info, scale);
-
-    ImGui::EndTable();
+        Unity::end_property_rows();
+    }
+    ImGui::TreePop();
 }
 namespace {
 } // namespace
@@ -1201,8 +1200,15 @@ void render_live_value(CommandKind kind, int component_id, int member_index,
             }
         } else {
             buffer.sample_requested = false;
-            ImGui::TextColored(ImVec4(0.78f, 0.42f, 0.38f, 1.0f), "%s",
-                               value->display.empty() ? "Unavailable" : value->display.c_str());
+            const std::string reason = value->display.empty() ? "Unavailable" : value->display;
+            // A member that simply was not built into this game is not a fault,
+            // so it is stated quietly; a real read failure keeps the alarm.
+            const bool stripped = reason.find("stripped") != std::string::npos;
+            const std::string shown = reason.size() > 48 ? reason.substr(0, 47) + "..." : reason;
+            ImGui::TextColored(stripped ? ImVec4(0.55f, 0.55f, 0.55f, 1.0f) : ImVec4(0.78f, 0.42f, 0.38f, 1.0f),
+                               "%s", shown.c_str());
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("%s", reason.c_str());
         }
         render_reference_context_menu(reference);
         return;
@@ -1702,13 +1708,14 @@ const Snapshot::FieldWatch *field_watch_for(const Snapshot &snapshot, int compon
 namespace {
 } // namespace
 void enqueue_field_watch(int component_id, int field_index, bool enabled,
-                         std::uint64_t object_inspector_token, bool property) {
+                         std::uint64_t object_inspector_token, bool property, bool class_browser_target) {
     Command command{};
     command.kind = CommandKind::SetFieldWatch;
     command.instance_id = component_id;
     command.member_index = field_index;
     command.bool_value = enabled;
-    command.object_inspector_target = object_inspector_token != 0;
+    command.object_inspector_target = !class_browser_target && object_inspector_token != 0;
+    command.class_browser_target = class_browser_target;
     command.object_inspector_token = object_inspector_token;
     command.member_is_property = property;
     RuntimeModel::instance().enqueue(std::move(command));

@@ -1,5 +1,8 @@
 // Copyright (c) 2026 Jadis0x. All rights reserved.
 #include "method_tracer.h"
+
+#include "support/mod_log.h"
+#include "inline_sites.h"
 #include "method_trace_abi.h"
 
 #include "sdk/hook_api.h"
@@ -35,7 +38,30 @@ struct RingRecord {
     std::atomic<std::uintptr_t> caller_address{0}, target_address{0};
     std::atomic<std::uint64_t> return_rax{0}, return_xmm_low{0}, return_xmm_high{0};
     std::atomic<std::uintptr_t> return_buffer_address{0};
+    // Non-zero when the call was observed inside an inlined copy of the body
+    // rather than at the method's own entry point.
+    std::atomic<std::uintptr_t> inline_site{0};
     std::atomic<bool> return_published{false};
+};
+
+struct HookSession;
+
+// One hook somewhere other than the method's own entry point. The loader hands
+// the callback a single pointer, so each site owns the pair it needs.
+struct InlineSiteHook {
+    // InlinedCopy: the compiler pasted the body here, and the arguments are
+    // long gone by this point. CallSite: the instruction that calls the method,
+    // where the arguments are still in the registers the ABI puts them in.
+    enum class Kind { InlinedCopy, CallSite };
+
+    HookSession *session = nullptr;
+    URK::MidHookHandle *hook = nullptr;
+    Kind kind = Kind::InlinedCopy;
+    std::uintptr_t address = 0;
+    std::uintptr_t function_start = 0;
+    std::size_t matched_instructions = 0;
+    std::size_t patch_bytes = 0;
+    std::uint8_t instance_register = Explorer::X86::no_register;
 };
 
 struct HookSession {
@@ -47,6 +73,18 @@ struct HookSession {
     // trace has no stub and cannot observe the return value.
     URK::MidHookHandle *mid_hook = nullptr;
     void *mid_target = nullptr;
+    // Native entry point, and whether a hook fits inside it. IL2CPP emits a
+    // property getter as a few bytes padded out to the next method; a branch
+    // written over one of those lands in the neighbour.
+    void *entry_point = nullptr;
+    bool entry_hookable = true;
+    bool call_site_scan_done = false;
+    std::size_t direct_call_sites = 0;
+    std::size_t address_references = 0;
+    // Copies of the body the compiler left inside other functions. Hooking
+    // these is the only way to see calls the game makes to a method whose own
+    // entry point nothing branches to.
+    std::vector<std::unique_ptr<InlineSiteHook>> inline_hooks;
     bool captures_return = false;
     // Non-null restricts the trace to calls whose `this` matches.
     const void *instance_filter = nullptr;
@@ -121,6 +159,20 @@ struct State {
     std::string diagnostic;
 };
 State g_state;
+
+// True when an inlined-copy hook already covers any of these bytes. Callers
+// hold the control mutex, so the session list is stable here.
+bool inline_site_is_occupied(std::uintptr_t address, std::size_t patch_bytes) {
+    const std::uintptr_t end = address + std::max<std::size_t>(patch_bytes, 1);
+    for (const std::unique_ptr<HookSession> &session : g_state.sessions) {
+        for (const std::unique_ptr<InlineSiteHook> &site : session->inline_hooks) {
+            const std::uintptr_t site_end = site->address + std::max<std::size_t>(site->patch_bytes, 1);
+            if (address < site_end && site->address < end)
+                return true;
+        }
+    }
+    return false;
+}
 
 bool is_floating(std::string_view type) {
     return type == "System.Single" || type == "Single" || type == "float" || type == "System.Double" ||
@@ -377,7 +429,7 @@ void leave_flight(HookSession& session);
 // install_return_hook is false for mid-function hooks, which record the entry
 // and then let the callee return normally.
 static std::uintptr_t trace_record_entry(const RegisterFrame *frame, HookSession *session,
-                                         bool install_return_hook) {
+                                         bool install_return_hook, const InlineSiteHook *site = nullptr) {
     if (!frame || !session)
         return 0;
     if (!enter_flight(*session))
@@ -438,6 +490,7 @@ static std::uintptr_t trace_record_entry(const RegisterFrame *frame, HookSession
             }
         }
     }
+    record.inline_site.store(site ? site->address : 0, std::memory_order_relaxed);
     record.return_published.store(false, std::memory_order_relaxed);
     record.published_sequence.store(sequence + 1, std::memory_order_release);
     if (install_return_hook)
@@ -505,6 +558,84 @@ void trace_mid_entry(URK_HookRegisters *registers, void *user_data) {
     // trace_record_entry closes the flight gate itself when no return context
     // is installed, which is always the case here.
     trace_record_entry(&frame, session, false);
+}
+
+// Register file order used by the loader's mid-hook, indexed the way the
+// instruction encoding numbers registers.
+std::uint64_t register_by_index(const URK_HookRegisters &registers, std::uint8_t index) {
+    switch (index) {
+    case 0: return registers.rax;
+    case 1: return registers.rcx;
+    case 2: return registers.rdx;
+    case 3: return registers.rbx;
+    case 4: return registers.rsp;
+    case 5: return registers.rbp;
+    case 6: return registers.rsi;
+    case 7: return registers.rdi;
+    case 8: return registers.r8;
+    case 9: return registers.r9;
+    case 10: return registers.r10;
+    case 11: return registers.r11;
+    case 12: return registers.r12;
+    case 13: return registers.r13;
+    case 14: return registers.r14;
+    case 15: return registers.r15;
+    default: return 0;
+    }
+}
+
+// Fires inside a copy of the body the compiler pasted into a caller. There is
+// no call frame of its own here: no return address, and the arguments were
+// consumed by the surrounding code long before this point. What survives is
+// that the body was entered, where from, and - when the match identified the
+// register - the instance it runs on.
+void trace_inline_site_entry(URK_HookRegisters *registers, void *user_data) {
+    auto *site = static_cast<InlineSiteHook *>(user_data);
+    if (!site || !site->session || !registers || registers->size < sizeof(URK_HookRegisters))
+        return;
+    RegisterFrame frame{};
+    // The caller column reads this as an address inside the enclosing method,
+    // which is exactly where the call happens.
+    frame.return_address = site->address;
+    if (site->kind == InlineSiteHook::Kind::CallSite) {
+        // Stopped on the call instruction: the arguments are in the registers
+        // the ABI passes them in, and the caller's home space is already
+        // allocated, so the fifth argument onwards is readable too. The only
+        // thing missing is the return value, which does not exist yet.
+        frame.rcx = registers->rcx;
+        frame.rdx = registers->rdx;
+        frame.r8 = registers->r8;
+        frame.r9 = registers->r9;
+        frame.rax = registers->rax;
+        for (std::size_t lane = 0; lane < frame.xmm.size(); ++lane)
+            std::memcpy(frame.xmm[lane].data(), registers->xmm[lane].u8, frame.xmm[lane].size());
+        const auto *stack = reinterpret_cast<const std::uint64_t *>(registers->rsp);
+        if (stack) {
+            const std::size_t stack_words =
+                std::min<std::size_t>(site->session->argument_count + 2, URK::Unity::Inspect::kMaxMethodParameters);
+#if defined(_WIN32)
+            __try {
+#endif
+                // No return address has been pushed yet, so the home space
+                // starts at rsp and the stack arguments follow it.
+                for (std::size_t index = 0; index < frame.shadow_space.size(); ++index)
+                    frame.shadow_space[index] = stack[index];
+                for (std::size_t index = 0; index < stack_words; ++index)
+                    frame.stack_arguments[index] = stack[4 + index];
+#if defined(_WIN32)
+            }
+            __except (trace_exception_filter(GetExceptionCode())) {
+                site->session->native_faults.fetch_add(1, std::memory_order_relaxed);
+                return;
+            }
+#endif
+        }
+        trace_record_entry(&frame, site->session, false, site);
+        return;
+    }
+    if (site->instance_register != Explorer::X86::no_register)
+        frame.rcx = register_by_index(*registers, site->instance_register);
+    trace_record_entry(&frame, site->session, false, site);
 }
 
 extern "C" std::uintptr_t trace_record_return_from_stub(HookSession* session, std::uint64_t rax,
@@ -628,7 +759,48 @@ void tracer_diagnostic(const char *message) { if (message && message[0]) g_state
 
 // Installs whichever hook the session was configured for. The mid-function
 // entry hook is the default; the stub path exists only for return capture.
+bool attach_inline_hooks(HookSession &session) {
+    bool all_installed = true;
+    for (std::unique_ptr<InlineSiteHook> &site : session.inline_hooks) {
+        if (site->hook)
+            continue;
+        site->hook = URK::hooks::mid_attach(reinterpret_cast<void *>(site->address), &trace_inline_site_entry,
+                                            site.get());
+        if (!site->hook) {
+            all_installed = false;
+            ModLog::warn("trace %s.%s: the copy at %p could not be hooked", session.declaring_type.c_str(),
+                         session.method_name.c_str(), reinterpret_cast<void *>(site->address));
+        }
+    }
+    return all_installed;
+}
+
+bool detach_inline_hooks(HookSession &session) {
+    bool all_removed = true;
+    for (std::unique_ptr<InlineSiteHook> &site : session.inline_hooks) {
+        if (!site->hook)
+            continue;
+        if (URK::hooks::mid_detach(site->hook))
+            site->hook = nullptr;
+        else
+            all_removed = false;
+    }
+    return all_removed;
+}
+
 bool attach_session(HookSession &session, const char *method_name) {
+    // A trace of an inlined method lives or dies by these; the entry hook it
+    // installs next only catches reflective and engine dispatch.
+    const bool sites_installed = attach_inline_hooks(session);
+    if (!session.entry_hookable) {
+        // Refusing here is the point: writing the branch anyway corrupts the
+        // method that follows, and the game crashes the next time that one runs.
+        if (!session.inline_hooks.empty() && sites_installed)
+            return true;
+        g_state.diagnostic = "This method is too small to hook: its code is shorter than the branch a hook "
+                             "writes, and nothing calls it from a place that can be watched instead.";
+        return false;
+    }
     if (!session.captures_return) {
         session.mid_hook = URK::hooks::mid_attach(session.mid_target, &trace_mid_entry, &session);
         return session.mid_hook != nullptr;
@@ -639,15 +811,17 @@ bool attach_session(HookSession &session, const char *method_name) {
 }
 
 bool detach_session(HookSession &session) {
+    const bool sites_removed = detach_inline_hooks(session);
     if (!session.captures_return) {
         if (!session.mid_hook)
-            return true;
+            return sites_removed;
         if (!URK::hooks::mid_detach(session.mid_hook))
             return false;
         session.mid_hook = nullptr;
-        return true;
+        return sites_removed;
     }
-    return !session.original || !session.stub || URK::hooks::detach_ex(&session.original, session.stub);
+    return sites_removed &&
+           (!session.original || !session.stub || URK::hooks::detach_ex(&session.original, session.stub));
 }
 
 bool enter_flight(HookSession& session) {
@@ -732,6 +906,20 @@ Snapshot copy_snapshot(const HookSession &session) {
     out.active = session.active.load(std::memory_order_acquire);
     out.is_static = session.is_static;
     out.captures_return = session.captures_return;
+    out.call_site_scan_done = session.call_site_scan_done;
+    out.direct_call_sites = session.direct_call_sites;
+    out.address_references = session.address_references;
+    for (const std::unique_ptr<InlineSiteHook> &site : session.inline_hooks) {
+        Snapshot::InlineSite copy{};
+        copy.address = site->address;
+        copy.function_start = site->function_start;
+        copy.matched_instructions = site->matched_instructions;
+        copy.hooked = site->hook != nullptr;
+        copy.instance_captured = site->kind == InlineSiteHook::Kind::CallSite ||
+                                 site->instance_register != Explorer::X86::no_register;
+        copy.call_site = site->kind == InlineSiteHook::Kind::CallSite;
+        out.inline_sites.push_back(copy);
+    }
     out.method_name = session.method_name;
     out.declaring_type = session.declaring_type;
     out.return_type = session.return_type;
@@ -886,6 +1074,11 @@ bool start(const URK::Unity::Inspect::MethodInfo &method, bool capture_return, c
             error = g_state.diagnostic.empty() ? "The runtime refused to re-enable this method trace" : g_state.diagnostic;
             return false;
         }
+        // deactivate() clears flight_accepting to drain calls that already
+        // entered the detour, and nothing else reopens it. Without this the
+        // re-attached hook fires normally and enter_flight() rejects every
+        // call, so a restarted trace reports itself active and stays empty.
+        existing->flight_state.store(HookSession::flight_accepting, std::memory_order_release);
         existing->active.store(true, std::memory_order_release);
         // A watch re-attaching to a method must not take away a trace tab the
         // user opened on it earlier.
@@ -1055,12 +1248,122 @@ bool start(const URK::Unity::Inspect::MethodInfo &method, bool capture_return, c
         }
     }
     HookSession *const raw = session.get();
+    // Scan before attaching: the hook backend rewrites `original` to point at
+    // its trampoline, and counting branches to the trampoline would report
+    // every reachable method as unreachable.
+    g_state.diagnostic.clear();
+    // Only for traces a person started. A field watch installs setter traces on
+    // its own, and a full module scan per watch would stall the frame.
+    void *const entry =
+        raw->mid_target ? raw->mid_target : URK::managed_hooks::try_resolve_method_pointer(method_handle);
+    raw->entry_point = entry;
+    if (entry) {
+        // Five bytes is what the hook backend writes for its branch.
+        const Explorer::InlineSites::PatchFit fit = Explorer::InlineSites::patch_fit_in_process(entry, 5);
+        raw->entry_hookable = !fit.decoded || fit.safe;
+        if (!raw->entry_hookable) {
+            // Nothing returns through a call instruction, so drop the promise
+            // rather than leaving every row waiting for a result.
+            raw->captures_return = false;
+            ModLog::warn("trace %s.%s: entry=%p holds only %zu byte(s) of code, less than the %zu a hook displaces; "
+                         "watching its call sites instead",
+                         raw->declaring_type.c_str(), raw->method_name.c_str(), entry, fit.function_bytes,
+                         fit.patch_bytes);
+        }
+    }
+    if (user_visible && entry) {
+        const Explorer::InlineSites::Result resolved =
+            Explorer::InlineSites::resolve_in_process(entry, max_inline_sites);
+        if (resolved.scanned) {
+            raw->call_site_scan_done = true;
+            raw->direct_call_sites = resolved.direct_call_sites;
+            raw->address_references = resolved.address_references;
+        }
+        // A method the compiler kept whole is traced at its entry point, where
+        // the arguments are still in their registers. The copies only matter
+        // when nothing branches to that entry point any more.
+        // A method whose own entry cannot host a hook is watched from the
+        // instructions that call it, where the arguments are still in their
+        // registers. That is a better vantage point than the entry anyway; it
+        // just cannot see the return value.
+        if (!raw->entry_hookable) {
+            for (const std::uintptr_t call_site : resolved.call_site_addresses) {
+                if (raw->inline_hooks.size() >= max_inline_sites)
+                    break;
+                if (inline_site_is_occupied(call_site, 5))
+                    continue;
+                auto hook = std::make_unique<InlineSiteHook>();
+                hook->session = raw;
+                hook->kind = InlineSiteHook::Kind::CallSite;
+                hook->address = call_site;
+                // A call instruction is five bytes, which is exactly what the
+                // hook displaces, so the site needs no further measurement.
+                hook->patch_bytes = 5;
+                hook->function_start = call_site;
+                raw->inline_hooks.push_back(std::move(hook));
+            }
+        }
+        if (resolved.direct_call_sites == 0) {
+            for (const Explorer::InlineSites::Site &site : resolved.sites) {
+                // Two traces can land in the same caller - a method and the one
+                // it inlines both live there. Overlapping patches would corrupt
+                // each other's trampolines, so the second one is dropped.
+                if (inline_site_is_occupied(site.address, site.patch_bytes)) {
+                    ModLog::warn("trace %s.%s: the copy at %p overlaps a hook another trace already installed",
+                                 raw->declaring_type.c_str(), raw->method_name.c_str(),
+                                 reinterpret_cast<void *>(site.address));
+                    continue;
+                }
+                auto hook = std::make_unique<InlineSiteHook>();
+                hook->session = raw;
+                hook->address = site.address;
+                hook->function_start = site.function_start;
+                hook->matched_instructions = site.matched_instructions;
+                hook->patch_bytes = site.patch_bytes;
+                hook->instance_register = site.instance_register;
+                raw->inline_hooks.push_back(std::move(hook));
+            }
+        }
+    }
+    std::array<std::uint8_t, 8> before{};
+    if (entry)
+        std::memcpy(before.data(), entry, before.size());
+    if (user_visible) {
+        ModLog::info("trace install: %s.%s entry=%p call_sites=%s address_refs=%zu capture_return=%s",
+                     raw->declaring_type.c_str(), raw->method_name.c_str(), entry,
+                     raw->call_site_scan_done ? std::to_string(raw->direct_call_sites).c_str() : "unscanned",
+                     raw->address_references, capture_return ? "yes" : "no");
+        for (const std::unique_ptr<InlineSiteHook> &site : raw->inline_hooks) {
+            ModLog::info("trace %s.%s: body inlined into %p, hooking the copy at %p (%zu instructions matched)",
+                         raw->declaring_type.c_str(), raw->method_name.c_str(),
+                         reinterpret_cast<void *>(site->function_start), reinterpret_cast<void *>(site->address),
+                         site->matched_instructions);
+        }
+    }
     g_state.diagnostic.clear();
     if (!attach_session(*raw, method.name.c_str())) {
         error = g_state.diagnostic.empty() ? "The runtime refused to hook this method" : g_state.diagnostic;
         if (raw->stub)
             VirtualFree(raw->stub, 0, MEM_RELEASE);
         return false;
+    }
+    // A hook backend that reports success without writing the branch leaves a
+    // trace that looks armed and records nothing. Reading the entry back is the
+    // only way to tell, so keep the check permanently and only speak up when it
+    // fails. A method too small to hold a branch is never patched at its entry
+    // in the first place - it is watched at its call sites instead - so an
+    // unchanged entry there is the plan working, not a backend fault.
+    if (entry && raw->entry_hookable) {
+        std::array<std::uint8_t, 8> after{};
+        std::memcpy(after.data(), entry, after.size());
+        if (after == before) {
+            char bytes[32]{};
+            for (std::size_t i = 0; i < before.size(); ++i)
+                std::snprintf(bytes + i * 3, 4, "%02X ", before[i]);
+            ModLog::error("trace install failed silently: %s entry=%p is unchanged [%s]; the hook backend reported "
+                          "success but wrote no branch",
+                          raw->method_name.c_str(), entry, bytes);
+        }
     }
     raw->active.store(true, std::memory_order_release);
     g_state.last_started_id = raw->id;

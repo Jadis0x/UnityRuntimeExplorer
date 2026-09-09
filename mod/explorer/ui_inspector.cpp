@@ -5,6 +5,7 @@
 #include "config/mod_config.h"
 #include "explorer_model.h"
 #include "ui_shared.h"
+#include "unity_editor_theme.h"
 
 #include <imgui.h>
 #include <imgui_internal.h>
@@ -73,29 +74,6 @@ void render_components(const InspectorInfo &info, const Snapshot &snapshot, int 
                 continue;
             }
         }
-        if (component.enabled_supported) {
-            bool enabled = component.enabled;
-            if (ImGui::Checkbox("##enabled", &enabled)) {
-                Command command{};
-                command.kind = CommandKind::SetComponentEnabled;
-                command.instance_id = component.instance_id;
-                command.bool_value = enabled;
-                RuntimeModel::instance().enqueue(std::move(command));
-            }
-            if (ImGui::IsItemHovered())
-                ImGui::SetTooltip("Enable / disable component");
-        } else
-            ImGui::Dummy(ImVec2(ImGui::GetFrameHeight(), ImGui::GetFrameHeight()));
-        ImGui::SameLine();
-        // The expanded component wears a lit header; the closed ones stay a flat
-        // slab. That is the whole "which component am I in" cue, and it beats
-        // drawing a marker line next to the body.
-        const bool was_open = ImGui::TreeNodeGetOpen(ImGui::GetID("##component"));
-        ImGui::PushStyleColor(ImGuiCol_Header, was_open ? ImVec4(0.157f, 0.294f, 0.451f, 1.0f)
-                                                        : ImVec4(0.145f, 0.157f, 0.180f, 1.0f));
-        ImGui::PushStyleColor(ImGuiCol_HeaderHovered, was_open ? ImVec4(0.196f, 0.361f, 0.545f, 1.0f)
-                                                               : ImVec4(0.196f, 0.212f, 0.243f, 1.0f));
-        ImGui::PushStyleColor(ImGuiCol_HeaderActive, ImVec4(0.220f, 0.412f, 0.616f, 1.0f));
         // Components start closed: a GameObject with a dozen of them used to
         // open as one undifferentiated wall of members. A search still needs to
         // reach inside, so it forces its matches open.
@@ -105,24 +83,23 @@ void render_components(const InspectorInfo &info, const Snapshot &snapshot, int 
             ImGui::SetNextItemOpen(bulk_toggle > 0, ImGuiCond_Always);
         else if (only_component_id != 0)
             ImGui::SetNextItemOpen(true, ImGuiCond_FirstUseEver);
-        const bool open = ImGui::TreeNodeEx("##component",
-                                            ImGuiTreeNodeFlags_OpenOnArrow | ImGuiTreeNodeFlags_OpenOnDoubleClick |
-                                                ImGuiTreeNodeFlags_SpanAvailWidth | ImGuiTreeNodeFlags_Framed |
-                                                ImGuiTreeNodeFlags_FramePadding,
-                                            "%s", display_type.c_str());
-        ImGui::PopStyleColor(3);
+        // Unity's component band: one strip carrying the disclosure triangle,
+        // the enable checkbox and the type, with the namespace dimmed on the
+        // right so two components with colliding short names stay distinct.
+        bool enabled = component.enabled;
+        bool enabled_changed = false;
+        const bool open = Unity::component_header("##component", display_type.c_str(),
+                                                  component.enabled_supported ? &enabled : nullptr, &enabled_changed,
+                                                  component.namespace_name.c_str());
+        if (enabled_changed) {
+            Command command{};
+            command.kind = CommandKind::SetComponentEnabled;
+            command.instance_id = component.instance_id;
+            command.bool_value = enabled;
+            RuntimeModel::instance().enqueue(std::move(command));
+        }
         if (ImGui::IsItemHovered())
             ImGui::SetTooltip("%s\nRight-click for component actions", component.type_name.c_str());
-        // The namespace rides on the right of the header so two components whose
-        // short names collide stay distinguishable while collapsed.
-        if (!component.namespace_name.empty()) {
-            const float label_width = ImGui::CalcTextSize(component.namespace_name.c_str()).x;
-            const float right_edge = ImGui::GetContentRegionMax().x - label_width - ImGui::GetStyle().FramePadding.x;
-            if (right_edge > ImGui::GetCursorPosX() + 40.0f) {
-                ImGui::SameLine(right_edge);
-                ImGui::TextDisabled("%s", component.namespace_name.c_str());
-            }
-        }
         if (ImGui::BeginPopupContextItem("##component-context")) {
             if (ImGui::MenuItem("Copy Component Pointer"))
                 ImGui::SetClipboardText(component.pointer_text.c_str());
@@ -399,7 +376,7 @@ void render_components(const InspectorInfo &info, const Snapshot &snapshot, int 
                 if (ImGui::BeginTabBar("##member-kinds", ImGuiTabBarFlags_FittingPolicyScroll)) {
                 std::snprintf(member_tab_label, sizeof(member_tab_label), "Fields (%zu / %zu)###fields",
                               visible_fields, metadata.fields.size());
-                if (ImGui::BeginTabItem(member_tab_label, nullptr, member_tab_flags(0))) {
+                if (Unity::begin_member_tab(member_tab_label, Unity::Skin::action_blue, member_tab_flags(0))) {
                     active_member_tab = 0;
                     member_table("##fields", metadata.fields, live ? &live->fields : nullptr,
                                  CommandKind::SetFieldValue, false);
@@ -407,7 +384,7 @@ void render_components(const InspectorInfo &info, const Snapshot &snapshot, int 
                 }
                 std::snprintf(member_tab_label, sizeof(member_tab_label), "Properties (%zu / %zu)###properties",
                               visible_properties, metadata.properties.size());
-                if (ImGui::BeginTabItem(member_tab_label, nullptr, member_tab_flags(1))) {
+                if (Unity::begin_member_tab(member_tab_label, Unity::Skin::action_green, member_tab_flags(1))) {
                     active_member_tab = 1;
                     member_table("##properties", metadata.properties, live ? &live->properties : nullptr,
                                  CommandKind::SetPropertyValue, true);
@@ -415,7 +392,7 @@ void render_components(const InspectorInfo &info, const Snapshot &snapshot, int 
                 }
                 std::snprintf(member_tab_label, sizeof(member_tab_label), "Methods (%zu / %zu)###methods",
                               visible_methods, metadata.methods.size());
-                if (ImGui::BeginTabItem(member_tab_label, nullptr, member_tab_flags(2))) {
+                if (Unity::begin_member_tab(member_tab_label, Unity::Skin::action_amber, member_tab_flags(2))) {
                     active_member_tab = 2;
                     for (std::size_t index = 0; index < metadata.methods.size(); ++index) {
                         const auto &method = metadata.methods[index];

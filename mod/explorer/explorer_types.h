@@ -267,6 +267,33 @@ struct InspectorInfo {
     std::string component_query_error;
 };
 
+// One object found under a screen click, and the ranked list of them. The rect
+// is in overlay pixels so the UI can outline the hit without re-projecting it.
+struct ScreenPickHit {
+    int instance_id = 0;
+    std::string name;
+    std::string path;
+    std::string source_type;
+    bool ui = false;
+    float distance = 0.0f;
+    float min_x = 0.0f;
+    float min_y = 0.0f;
+    float max_x = 0.0f;
+    float max_y = 0.0f;
+};
+
+struct ScreenPickResult {
+    bool valid = false;
+    float point_x = 0.0f;
+    float point_y = 0.0f;
+    std::string camera_name;
+    std::string status;
+    std::vector<ScreenPickHit> hits;
+    std::size_t scanned_ui = 0;
+    std::size_t scanned_world = 0;
+    std::uint64_t revision = 0;
+};
+
 struct Snapshot {
     struct ReferenceGraph {
         struct Node {
@@ -448,6 +475,7 @@ struct Snapshot {
     std::size_t hierarchy_census_candidates = 0;
     std::int64_t managed_used_bytes = 0;
     std::int64_t managed_heap_bytes = 0;
+    ScreenPickResult screen_pick;
     std::uint64_t revision = 0;
 };
 

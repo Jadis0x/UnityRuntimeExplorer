@@ -113,12 +113,29 @@ namespace Explorer {
 			return;
 		}
 
-		const bool nested = command.object_inspector_target;
+		// Three places can own the member being watched: a Class Browser class
+		// pointed at a live target, an Object Inspector tab, or a component on
+		// the selected GameObject. Each keeps its own metadata and reflection,
+		// and the member index is only meaningful against its own pair.
+		const bool class_browser = command.class_browser_target;
+		const bool nested = !class_browser && command.object_inspector_target;
 		const ComponentInfo::Metadata* metadata = nullptr;
 		const ComponentReflection* reflection = nullptr;
 		Object target{};
 		std::string component_type;
-		if (nested) {
+		if (class_browser) {
+			const auto handle = class_browser_handles_.find(command.object_inspector_token);
+			if (!working_.class_browser_members || command.object_inspector_token == 0 ||
+				handle == class_browser_handles_.end()) {
+				set_status("Select a live target in the Class Browser before watching its members");
+				return;
+			}
+			metadata = working_.class_browser_members.get();
+			reflection = &class_browser_reflection_;
+			target = Inspect::ResolveObjectHandle(handle->second);
+			component_type = working_.class_browser_members_query.full_name;
+		}
+		else if (nested) {
 			if (!working_.object_inspector.valid || command.object_inspector_token == 0 ||
 				command.object_inspector_token != working_.object_inspector.token ||
 				!working_.object_inspector.component.metadata) {
@@ -161,7 +178,7 @@ namespace Explorer {
 			FieldWatchState created{};
 			created.snapshot.id = next_field_watch_id_++;
 			created.snapshot.component_instance_id = command.instance_id;
-			created.snapshot.object_inspector_token = nested ? command.object_inspector_token : 0;
+			created.snapshot.object_inspector_token = (nested || class_browser) ? command.object_inspector_token : 0;
 			created.snapshot.field_index = field_index;
 			created.snapshot.property = property;
 			created.snapshot.component_type = component_type;
@@ -214,9 +231,11 @@ namespace Explorer {
 		state->snapshot.value_available = value.readable;
 		state->snapshot.current_value = watched_value_display(value);
 		state->snapshot.current_reference = watch_reference_for(value);
+		// Those two sets drive the panels' own refresh; a Class Browser watch
+		// re-reads through its own retained target and needs neither.
 		if (nested)
 			(property ? sampled_object_properties_ : sampled_object_fields_).insert(field_index);
-		else
+		else if (!class_browser)
 			sampled_component_members_.insert(component_sample_token(command.instance_id, property, field_index));
 		// A property with a setter can report writes exactly; a raw field has no
 		// managed setter to hook and stays on sampling.

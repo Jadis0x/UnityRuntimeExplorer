@@ -76,6 +76,11 @@ enum class CommandKind {
     CloseTexturePreview = 67,
     ExportTexturePreview = 68,
     ExportAudioPreview = 69,
+    // Screen picking: select whatever the player clicked on, the way the
+    // editor's scene view does. vector_value carries the click in overlay
+    // pixels; float_value carries the overlay's height for the Y flip.
+    PickAtScreenPoint = 70,
+    ClearScreenPick = 71,
 };
 
 struct Command {

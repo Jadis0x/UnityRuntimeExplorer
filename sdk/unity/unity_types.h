@@ -420,6 +420,49 @@ struct TypeRef {
     }
 };
 
+namespace detail {
+inline std::unordered_map<std::string, bool>& member_presence_cache() {
+    static std::unordered_map<std::string, bool> cache;
+    return cache;
+}
+}
+
+// IL2CPP and Mono builds strip UnityEngine members the game itself never
+// calls, so a wrapper cannot tell "removed from this build" from "the call
+// returned a default". These probes answer that without invoking anything, so
+// a caller can degrade instead of misreading a default as real data.
+// Presence is cached in both directions: Backend::find_method deliberately
+// caches only hits, and a miss re-walks every method of the class and its
+// bases, which is far too costly to repeat per object. An unresolved class is
+// not cached because that usually means the runtime is not ready yet.
+// argc is required, not defaulted: the backend's lookup rejects a name that
+// matches more than one arity as ambiguous and answers null, so an "any arity"
+// probe would report a perfectly present overloaded member as missing.
+inline bool has_method(TypeRef type, std::string_view methodName, int argc) {
+    const void* klass = type.resolve_class();
+    if (!klass) {
+        detail::clear_error();
+        return false;
+    }
+    const std::string key = detail::member_cache_key(klass, methodName, argc);
+    {
+        std::lock_guard<std::mutex> lock(detail::cache_mutex());
+        const auto found = detail::member_presence_cache().find(key);
+        if (found != detail::member_presence_cache().end())
+            return found->second;
+    }
+    const bool present = detail::Backend::find_method(klass, methodName, argc) != nullptr;
+    detail::clear_error();
+    {
+        std::lock_guard<std::mutex> lock(detail::cache_mutex());
+        detail::member_presence_cache()[key] = present;
+    }
+    return present;
+}
+inline bool has_property(TypeRef type, std::string_view propertyName) {
+    return has_method(type, std::string("get_") + std::string(propertyName), 0);
+}
+
 inline constexpr TypeRef UnityObjectType{"", "UnityEngine", "Object"};
 inline constexpr TypeRef GameObjectType{"", "UnityEngine", "GameObject"};
 inline constexpr TypeRef ComponentType{"", "UnityEngine", "Component"};

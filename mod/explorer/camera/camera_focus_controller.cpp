@@ -1,6 +1,8 @@
 // Copyright (c) 2026 Jadis0x. All rights reserved.
 #include "camera_focus_controller.h"
 
+#include "camera_math.h"
+
 #include "sdk/unity/unity.h"
 #include "sdk/unity/unity_inspect.h"
 #include "support/mod_log.h"
@@ -436,9 +438,13 @@ bool Controller::update(std::string& error) {
     const float smooth = linear * linear * (3.0f - 2.0f * linear);
     const Vector3 position = impl_->transition_start * (1.0f - smooth) + desired * smooth;
 
+    // Aim by writing the rotation rather than calling Transform.LookAt(Vector3):
+    // managed stripping drops that overload in builds whose own code never uses
+    // it, and the rotation setter is what LookAt would end up calling anyway.
+    const Quaternion aim = CameraMath::look_rotation(center - position);
     if (!guarded("camera pose update", error, [&] {
         camera_transform.set_position(position);
-        camera_transform.LookAt(center);
+        camera_transform.set_rotation(aim);
     }))
         return end_session(std::move(error));
     return true;

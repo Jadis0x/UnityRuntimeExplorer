@@ -794,7 +794,7 @@ Response RuntimeTools::execute(RuntimeModel& model, const Request& request) {
             result["hierarchy_active"] = node->active;
         if (transform) {
             result["local_position"] = vector_json(transform.localPosition());
-            result["local_rotation"] = vector_json(transform.GetProperty<Vector3>("localEulerAngles"));
+            result["local_rotation"] = vector_json(transform.localEulerAngles());
             result["local_scale"] = vector_json(transform.localScale());
         }
         if (const char* error = last_error(); error && error[0]) {

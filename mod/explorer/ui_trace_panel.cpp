@@ -50,6 +50,11 @@ std::string short_trace_type_name(std::string_view type_name) {
 }
 
 bool caller_is_unnamed(std::string_view caller) {
+    // A frame inside the runtime is already named as precisely as it can be;
+    // counting it as unnamed asks the user to rebuild an index that will never
+    // contain it.
+    if (caller.find("(native runtime code)") != std::string_view::npos)
+        return false;
     return caller.empty() || caller.find(".dll+0x") != std::string_view::npos ||
            caller.find("<module>+0x") != std::string_view::npos;
 }
@@ -58,6 +63,8 @@ std::string friendly_trace_caller(std::string_view caller) {
     if (caller.empty())
         return "caller address was not captured";
     // Keep the cell terse; the full explanation goes in a tooltip.
+    if (caller.find("(native runtime code)") != std::string_view::npos)
+        return std::string(caller) + " - reflection, a delegate or a UI binding, not a managed caller";
     if (caller.find("GameAssembly.dll+") != std::string_view::npos)
         return std::string(caller) + " (unnamed - build the caller index)";
     if (caller == "<shared managed generic code>")
@@ -123,6 +130,44 @@ void render_return_capture_notice(const MethodTracer::Snapshot &trace) {
     if (ImGui::IsItemHovered())
         ImGui::SetTooltip("Re-hooks the method so calls return through the tracer.\n"
                           "Clears the calls recorded so far, and is unsafe on methods that throw.");
+}
+
+// The compiler copies a small method's body into its callers and leaves the
+// entry point behind as dead code. The trace then records at those copies, so
+// say where they are: the caller column points into them, and the arguments
+// cannot be read there.
+void render_inlined_body_notice(const MethodTracer::Snapshot &trace) {
+    if (trace.inline_sites.empty())
+        return;
+    const bool call_sites = std::all_of(trace.inline_sites.begin(), trace.inline_sites.end(),
+                                        [](const MethodTracer::Snapshot::InlineSite &site) { return site.call_site; });
+    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.60f, 0.78f, 0.62f, 1.0f));
+    if (call_sites)
+        ImGui::TextWrapped("This method is a few bytes long - too short to hold a hook without overwriting the "
+                           "method after it. Recording at the %zu instruction(s) that call it instead, where the "
+                           "arguments are still in their registers:",
+                           trace.inline_sites.size());
+    else
+        ImGui::TextWrapped("The compiler inlined this body, so nothing calls the method's own entry point. "
+                           "Recording at %zu copy(ies) of it instead:",
+                           trace.inline_sites.size());
+    ImGui::PopStyleColor();
+    for (const MethodTracer::Snapshot::InlineSite &site : trace.inline_sites) {
+        char address[32]{};
+        std::snprintf(address, sizeof(address), "0x%llX", static_cast<unsigned long long>(site.address));
+        ImGui::BulletText("%s%s", site.display.empty() ? address : site.display.c_str(),
+                          site.hooked ? "" : "  (hook could not be installed)");
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("%s\n%zu instructions matched the method body.%s", address,
+                              site.matched_instructions,
+                              site.instance_captured ? "" : "\nThe instance register was not identified here.");
+    }
+    if (call_sites)
+        ImGui::TextDisabled("A call instruction has no return value yet, so this trace records arguments and "
+                            "callers only.");
+    else if (!trace.parameter_types.empty())
+        ImGui::TextDisabled("Arguments are not readable at a copy: the surrounding code has already reused the "
+                            "registers they arrived in.");
 }
 
 // Hue derived from the value/type text so it stays stable across frames.
@@ -245,6 +290,7 @@ void render_method_trace(const Snapshot &snapshot, const MethodTracer::Snapshot 
     ImGui::Checkbox("Addresses", &state.show_addresses);
     const std::string_view filter = state.filter.data();
 
+    render_inlined_body_notice(trace);
     if (!trace.captures_return)
         render_return_capture_notice(trace);
     render_caller_index_notice(snapshot, trace);
@@ -262,32 +308,37 @@ void render_method_trace(const Snapshot &snapshot, const MethodTracer::Snapshot 
                            "Recent returned references are rooted for Object Inspector access.");
     }
 
-    std::unordered_map<std::string, std::size_t> caller_counts;
-    std::unordered_map<std::uint32_t, std::size_t> thread_counts;
-    std::uint64_t collapsed_calls = 0;
-    double latest_elapsed = 0.0;
-    for (const MethodTracer::Record &record : trace.records) {
-        const std::uint64_t repeat_count = std::max<std::uint64_t>(1, record.repeat_count);
-        caller_counts[record.caller_display.empty() ? "<unresolved native caller>" : record.caller_display] +=
-            static_cast<std::size_t>(repeat_count);
-        thread_counts[record.thread_id] += static_cast<std::size_t>(repeat_count);
-        collapsed_calls += repeat_count - 1;
-        if (trace.timestamp_frequency && record.timestamp_ticks >= trace.start_timestamp_ticks)
-            latest_elapsed = std::max(latest_elapsed, static_cast<double>(record.timestamp_ticks - trace.start_timestamp_ticks) /
-                                                          static_cast<double>(trace.timestamp_frequency));
-    }
     if (ImGui::CollapsingHeader("Trace statistics", ImGuiTreeNodeFlags_DefaultOpen)) {
+        // Views into the snapshot, which outlives this frame: counting callers
+        // by value would copy every caller name on every frame.
+        std::unordered_map<std::string_view, std::size_t> caller_counts;
+        std::unordered_map<std::uint32_t, std::size_t> thread_counts;
+        std::uint64_t collapsed_calls = 0;
+        double latest_elapsed = 0.0;
+        for (const MethodTracer::Record &record : trace.records) {
+            const std::uint64_t repeat_count = std::max<std::uint64_t>(1, record.repeat_count);
+            caller_counts[record.caller_display.empty() ? std::string_view("<unresolved native caller>")
+                                                        : std::string_view(record.caller_display)] +=
+                static_cast<std::size_t>(repeat_count);
+            thread_counts[record.thread_id] += static_cast<std::size_t>(repeat_count);
+            collapsed_calls += repeat_count - 1;
+            if (trace.timestamp_frequency && record.timestamp_ticks >= trace.start_timestamp_ticks)
+                latest_elapsed =
+                    std::max(latest_elapsed, static_cast<double>(record.timestamp_ticks - trace.start_timestamp_ticks) /
+                                                 static_cast<double>(trace.timestamp_frequency));
+        }
         ImGui::Text("Recorded calls: %llu  |  Shown groups: %zu  |  Rate: %.2f/s  |  Callers: %zu  |  Threads: %zu",
                     static_cast<unsigned long long>(trace.total_calls), trace.records.size(),
                     latest_elapsed > 0.0 ? trace.total_calls / latest_elapsed : 0.0, caller_counts.size(), thread_counts.size());
         if (collapsed_calls != 0)
             ImGui::TextDisabled("%llu consecutive duplicate calls collapsed; expand a group to see its range.",
                                 static_cast<unsigned long long>(collapsed_calls));
-        std::vector<std::pair<std::string, std::size_t>> callers(caller_counts.begin(), caller_counts.end());
+        std::vector<std::pair<std::string_view, std::size_t>> callers(caller_counts.begin(), caller_counts.end());
         std::sort(callers.begin(), callers.end(), [](const auto &left, const auto &right) { return left.second > right.second; });
         const std::size_t shown = std::min<std::size_t>(callers.size(), 6);
         for (std::size_t index = 0; index < shown; ++index)
-            ImGui::BulletText("%zu x %s", callers[index].second, callers[index].first.c_str());
+            ImGui::BulletText("%zu x %.*s", callers[index].second, static_cast<int>(callers[index].first.size()),
+                              callers[index].first.data());
         if (callers.size() > shown)
             ImGui::TextDisabled("%zu additional caller sites", callers.size() - shown);
     }
@@ -299,16 +350,39 @@ void render_method_trace(const Snapshot &snapshot, const MethodTracer::Snapshot 
     ImGui::BeginChild("##method-trace-calls", ImVec2(0.0f, std::max(180.0f, ImGui::GetContentRegionAvail().y)),
                       true);
     {
-        for (std::size_t displayed = 0; displayed < trace.records.size(); ++displayed) {
+        // Pick the rows first, then build strings only for those. Each row costs
+        // a tree node, a two-column table and a dozen std::strings; a method
+        // called every frame fills the ring, and drawing all of it would cost
+        // more time per frame than the game has.
+        std::vector<std::size_t> visible;
+        const std::size_t budget = static_cast<std::size_t>(std::max(state.visible_rows, 1));
+        visible.reserve(std::min(budget, trace.records.size()));
+        for (std::size_t displayed = 0; displayed < trace.records.size() && visible.size() < budget; ++displayed) {
             const std::size_t record_index = state.newest_first ? trace.records.size() - 1 - displayed : displayed;
+            const MethodTracer::Record &record = trace.records[record_index];
+            if (!filter.empty() &&
+                !contains_case_insensitive(record.caller_display, filter) &&
+                !contains_case_insensitive(record.target_display, filter) &&
+                !contains_case_insensitive(MethodTraceFormat::argument_summary(trace, record), filter) &&
+                !contains_case_insensitive(MethodTraceFormat::result(trace, record), filter))
+                continue;
+            visible.push_back(record_index);
+        }
+        if (visible.size() < trace.records.size()) {
+            ImGui::TextDisabled("Showing %zu of %zu recorded calls%s.", visible.size(), trace.records.size(),
+                                filter.empty() ? (state.newest_first ? " (newest first)" : " (oldest first)")
+                                               : " that match the filter");
+            ImGui::SameLine();
+            if (ImGui::SmallButton("Show more"))
+                state.visible_rows = std::min(state.visible_rows * 2, static_cast<int>(MethodTracer::max_records));
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Every drawn row costs frame time in the game. Raise this only as far as you need;\n"
+                                  "Copy CSV and Copy JSON always export every recorded call.");
+        }
+        for (const std::size_t record_index : visible) {
             const MethodTracer::Record &record = trace.records[record_index];
             const std::string argument_summary = MethodTraceFormat::argument_summary(trace, record);
             const std::string result = MethodTraceFormat::result(trace, record);
-            if (!filter.empty() && !contains_case_insensitive(record.caller_display, filter) &&
-                !contains_case_insensitive(record.target_display, filter) &&
-                !contains_case_insensitive(argument_summary, filter) &&
-                !contains_case_insensitive(result, filter))
-                continue;
             const double elapsed = MethodTraceFormat::elapsed_seconds(trace, record);
             const std::string elapsed_text = MethodTraceFormat::elapsed_text(elapsed);
             const std::uint64_t repeat_count = std::max<std::uint64_t>(1, record.repeat_count);
@@ -518,7 +592,8 @@ void render_method_traces(const Snapshot &snapshot) {
         if (trace_list_filter[0] != '\0' &&
             !contains_case_insensitive(display_name, trace_list_filter.data()))
             continue;
-        const std::string label = std::string(trace.active ? "[REC] " : "[STOP] ") + display_name +
+        const std::string label = std::string(trace.active ? "[REC] " : "[STOP] ") +
+                                  (trace.inline_sites.empty() ? "" : "[INLINED] ") + display_name +
                                   "  (" + std::to_string(trace.total_calls) + ")";
         // Scope by trace id, not name: overloads share a method name.
         const std::string trace_id = "trace-" + std::to_string(trace.id);

@@ -120,6 +120,61 @@ namespace Explorer {
 			return (flags & kHideAndDontSaveMask) == kHideAndDontSaveMask;
 		}
 
+		// Managed stripping removes UnityEngine members the game itself never
+		// calls, which silently turns a census into an empty tree. Report the
+		// members the hierarchy depends on once per process so the next
+		// stripped build is one log line instead of a blind investigation.
+		void log_stripped_members_once() {
+			static bool logged = false;
+			if (logged)
+				return;
+			logged = true;
+
+			constexpr TypeRef kResourcesType{ "", "UnityEngine", "Resources" };
+			constexpr TypeRef kSceneManagerType{ "", "UnityEngine.SceneManagement", "SceneManager" };
+			constexpr TypeRef kSceneUtilityType{ "", "UnityEngine.SceneManagement", "SceneUtility" };
+			const struct {
+				TypeRef type;
+				const char* member;
+				int argc;
+			} probes[] = {
+				{ GameObjectType, "get_scene", 0 },
+				{ GameObjectType, "get_tag", 0 },
+				{ GameObjectType, "get_name", 0 },
+				{ GameObjectType, "get_transform", 0 },
+				{ GameObjectType, "get_hideFlags", 0 },
+				{ GameObjectType, "get_activeSelf", 0 },
+				{ GameObjectType, "GetInstanceID", 0 },
+				{ TransformType, "get_parent", 0 },
+				{ TransformType, "get_gameObject", 0 },
+				{ kResourcesType, "FindObjectsOfTypeAll", 1 },
+				{ kSceneManagerType, "get_sceneCount", 0 },
+				{ kSceneManagerType, "GetSceneAt", 1 },
+				{ kSceneManagerType, "GetActiveScene", 0 },
+				{ kSceneManagerType, "get_sceneCountInBuildSettings", 0 },
+				{ kSceneType, "GetNameInternal", 1 },
+				{ kSceneType, "GetRootGameObjects", 0 },
+				{ kSceneUtilityType, "GetScenePathByBuildIndex", 1 },
+			};
+
+			std::string missing;
+			for (const auto& probe : probes) {
+				if (has_method(probe.type, probe.member, probe.argc))
+					continue;
+				if (!missing.empty())
+					missing += ", ";
+				missing += std::string(probe.type.name) + "." + probe.member;
+			}
+			clear_error();
+			if (missing.empty()) {
+				ModLog::info("hierarchy capability probe: all required UnityEngine members present");
+				return;
+			}
+			ModLog::warn("hierarchy capability probe: managed stripping removed %s; "
+				"affected panels degrade instead of failing",
+				missing.c_str());
+		}
+
 	} // namespace
 
 	bool RuntimeModel::refresh_hierarchy() {
@@ -199,6 +254,22 @@ namespace Explorer {
 				state.loaded_scene_indices.clear();
 				for (std::size_t index = 0; index < next.scenes.size(); ++index)
 					state.loaded_scene_indices[next.scenes[index].handle] = index;
+			}
+
+			log_stripped_members_once();
+			state.scene_lookup_available = has_method(GameObjectType, "get_scene", 0);
+			if (!state.scene_lookup_available)
+				next.source += " (GameObject.scene stripped; scene grouping approximated)";
+
+			// Scenes still hold only the loaded ones here, so an index past the
+			// end is impossible; index 0 becomes the DontDestroyOnLoad node when
+			// nothing is loaded, which is the best available bucket.
+			state.fallback_scene_index = 0;
+			for (std::size_t index = 0; index < next.scenes.size(); ++index) {
+				if (next.scenes[index].active) {
+					state.fallback_scene_index = index;
+					break;
+				}
 			}
 
 			state.ddol_index = next.scenes.size();
@@ -331,6 +402,12 @@ namespace Explorer {
 			std::size_t group_index = ddol_index;
 			if (is_hide_and_dont_save(root.object)) {
 				group_index = hidden_index;
+			}
+			else if (!state.scene_lookup_available) {
+				// Scene membership is unreadable, so keep the root visible under
+				// the active scene. Prefab/asset GameObjects are no longer
+				// separable and appear alongside live ones.
+				group_index = state.fallback_scene_index;
 			}
 			else {
 				const int scene_handle = boxed_scene_handle(root.object.scene());

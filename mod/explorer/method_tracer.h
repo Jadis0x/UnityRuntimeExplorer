@@ -13,6 +13,9 @@ namespace Explorer::MethodTracer {
 constexpr std::size_t max_parameters = URK::Unity::Inspect::kMaxMethodParameters;
 constexpr std::size_t max_records = 1024;
 constexpr std::size_t max_sessions = 12;
+// Copies of one body a trace will hook. A method inlined into more places than
+// this is traced at the ones the resolver is most confident about.
+constexpr std::size_t max_inline_sites = 8;
 using TraceId = std::uint64_t;
 
 // A decoded value plus, recursively, the fields/elements inside it.
@@ -38,6 +41,9 @@ struct Record {
     std::uint32_t thread_id = 0;
     std::uintptr_t caller_address = 0;
     std::uintptr_t target_address = 0;
+    // Set when the call was seen inside an inlined copy of the body instead of
+    // at the method's own entry point.
+    std::uintptr_t inline_site_address = 0;
     std::uint64_t return_rax = 0;
     std::uint64_t return_xmm_low = 0;
     std::uint64_t return_xmm_high = 0;
@@ -99,6 +105,29 @@ struct Snapshot {
     // False for a mid-function entry hook, which cannot see the return value.
     bool captures_return = false;
     std::uint64_t total_calls = 0;
+    // Result of scanning the owning module for references to the hooked entry
+    // point. An IL2CPP method whose body was inlined into its callers keeps a
+    // valid entry point that nothing branches to; direct_call_sites == 0 is
+    // what that looks like, and the copies below are where its calls are
+    // actually recorded.
+    bool call_site_scan_done = false;
+    std::size_t direct_call_sites = 0;
+    std::size_t address_references = 0;
+    // Where the compiler put copies of this body, and whether each copy is
+    // hooked. A trace with copies records the game's own calls through them.
+    struct InlineSite {
+        std::uintptr_t address = 0;
+        std::uintptr_t function_start = 0;
+        std::size_t matched_instructions = 0;
+        bool hooked = false;
+        bool instance_captured = false;
+        // True when the hook sits on the instruction that calls the method
+        // rather than on a copy of its body.
+        bool call_site = false;
+        // Enclosing method and offset, resolved for display.
+        std::string display;
+    };
+    std::vector<InlineSite> inline_sites;
     std::uint64_t overwritten_records = 0;
     std::uint64_t native_faults = 0;
     std::uint64_t start_timestamp_ticks = 0;

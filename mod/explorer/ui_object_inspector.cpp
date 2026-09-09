@@ -6,6 +6,7 @@
 #include "config/mod_config.h"
 #include "explorer_model.h"
 #include "ui_shared.h"
+#include "unity_editor_theme.h"
 
 #include <imgui.h>
 #include <imgui_internal.h>
@@ -324,7 +325,7 @@ void render_current_object_inspector(const Snapshot &snapshot) {
     if (ImGui::BeginTabBar("##object-member-kinds", ImGuiTabBarFlags_FittingPolicyScroll)) {
     std::snprintf(object_tab_label, sizeof(object_tab_label), "Fields (%zu / %zu)###ofields",
                   visible_fields, metadata.fields.size());
-    if (ImGui::BeginTabItem(object_tab_label, nullptr, object_tab_flags(0))) {
+    if (Unity::begin_member_tab(object_tab_label, Unity::Skin::action_blue, object_tab_flags(0))) {
         object_member_tab = 0;
         render_members("##object-field-table", metadata.fields, live ? &live->fields : nullptr,
                        live ? &live->field_references : nullptr, false);
@@ -332,7 +333,7 @@ void render_current_object_inspector(const Snapshot &snapshot) {
     }
     std::snprintf(object_tab_label, sizeof(object_tab_label), "Properties (%zu / %zu)###oproperties",
                   visible_properties, metadata.properties.size());
-    if (ImGui::BeginTabItem(object_tab_label, nullptr, object_tab_flags(1))) {
+    if (Unity::begin_member_tab(object_tab_label, Unity::Skin::action_green, object_tab_flags(1))) {
         object_member_tab = 1;
         render_members("##object-property-table", metadata.properties, live ? &live->properties : nullptr,
                        live ? &live->property_references : nullptr, true);
@@ -340,7 +341,7 @@ void render_current_object_inspector(const Snapshot &snapshot) {
     }
     std::snprintf(object_tab_label, sizeof(object_tab_label), "Methods (%zu / %zu)###omethods",
                   visible_methods, metadata.methods.size());
-    if (ImGui::BeginTabItem(object_tab_label, nullptr, object_tab_flags(2))) {
+    if (Unity::begin_member_tab(object_tab_label, Unity::Skin::action_amber, object_tab_flags(2))) {
         object_member_tab = 2;
         for (std::size_t index = 0; index < metadata.methods.size(); ++index) {
             const ComponentInfo::Method &method = metadata.methods[index];

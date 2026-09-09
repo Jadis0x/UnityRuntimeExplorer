@@ -73,6 +73,10 @@ struct TraceViewState {
     bool newest_first = true;
     bool show_raw_abi = false;
     bool show_addresses = false;
+    // Calls drawn at once. A hot method fills the ring in seconds, and drawing
+    // every row costs a table and a dozen strings each, which is enough to stall
+    // the game the panel is supposed to be observing.
+    int visible_rows = 60;
 };
 
 // Which member kind a member browser is showing.

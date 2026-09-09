@@ -503,6 +503,23 @@ DecodedRecord decode_record(const MethodTracer::Snapshot& trace, const MethodTra
     if (trace.target_is_reference) {
         bool target_readable = false;
         decoded.target = decode_reference(record.target_address, trace.declaring_type, target_readable);
+        if (record.inline_site_address != 0 && record.target_address == 0)
+            decoded.target = "<instance not identified in the inlined copy>";
+    }
+
+    // A hook inside an inlined copy sees the body, not a call frame: by then the
+    // arguments live wherever the surrounding code put them, so reporting the
+    // registers would be reporting someone else's values.
+    if (record.inline_site_address != 0) {
+        decoded.arguments.assign(record.arguments.size(), "<not captured at an inlined copy>");
+        decoded.argument_readable.assign(record.arguments.size(), false);
+        decoded.argument_nodes.resize(record.arguments.size());
+        for (std::size_t index = 0; index < decoded.argument_nodes.size(); ++index) {
+            decoded.argument_nodes[index].display = decoded.arguments[index];
+            if (index < trace.parameter_types.size())
+                decoded.argument_nodes[index].type = trace.parameter_types[index];
+        }
+        return decoded;
     }
 
     decoded.arguments.resize(record.arguments.size());
