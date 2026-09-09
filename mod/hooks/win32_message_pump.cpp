@@ -1,6 +1,8 @@
 #include "win32_message_pump.h"
 
 #include <algorithm>
+#include <cwchar>
+#include <iterator>
 #include <vector>
 
 namespace ModRenderHook {
@@ -73,8 +75,15 @@ namespace ModRenderHook {
 			return false;
 		DWORD process_id = 0;
 		GetWindowThreadProcessId(window, &process_id);
-		return process_id == GetCurrentProcessId() &&
-			GetPropA(window, "IMGUI_CONTEXT") != nullptr;
+		if (process_id != GetCurrentProcessId())
+			return false;
+		// The window class, not the IMGUI_CONTEXT property:
+		// ImGui_ImplWin32_Init() stamps that property on the game's *main*
+		// window too, so testing it would report the game window as an ImGui
+		// viewport as soon as any mod in the process initializes its backend.
+		wchar_t class_name[32]{};
+		const int length = GetClassNameW(window, class_name, static_cast<int>(std::size(class_name)));
+		return length > 0 && std::wcscmp(class_name, L"ImGui Platform") == 0;
 	}
 
 }

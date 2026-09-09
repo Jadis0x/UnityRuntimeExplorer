@@ -101,6 +101,13 @@ struct RuntimeModel::CallerIndexScan {
 	std::size_t indexed_methods = 0;
 	std::size_t scanned_classes = 0;
 	Clock::time_point started{};
+	// Wall time is frame-bound -- one slice per tick -- so the completion log
+	// separates the two: how much CPU the walk actually cost, and how many
+	// ticks it was spread over. Without both, a slow index looks the same
+	// whether the metadata walk is expensive or the game is rendering few
+	// frames.
+	std::chrono::microseconds slice_time{};
+	std::size_t ticks = 0;
 };
 
 // Command queue processing debounces destroy-triggered refreshes so a burst
@@ -160,6 +167,13 @@ bool is_expected_empty_container_error(std::string_view message);
 // remember a method the first time they see it, and the flight recorder in
 // explorer_model.cpp reads the same index back when publishing trace records.
 void remember_managed_method(const URK::Unity::Inspect::MethodInfo& method);
+// Indexes every declared method of a class straight from the metadata, without
+// building the full signature description a MethodInfo carries. This is what
+// the whole-domain caller index walks: it is an order of magnitude cheaper per
+// method, and unlike Inspect::methods_from_class() it never drops a method
+// whose parameter or return types cannot be described. Returns how many
+// methods it recorded.
+std::size_t remember_managed_class_methods(const URK::managed::Class* klass);
 std::string managed_caller_location(std::uintptr_t address);
 // Marks the caller index as covering every assembly, which is what lets an
 // address with no entry be reported as native rather than as not yet indexed.

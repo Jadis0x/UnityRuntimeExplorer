@@ -71,7 +71,10 @@ add_library(imgui STATIC
     ${imgui_SOURCE_DIR}/imgui_draw.cpp
     ${imgui_SOURCE_DIR}/imgui_tables.cpp
     ${imgui_SOURCE_DIR}/imgui_widgets.cpp
-    ${imgui_SOURCE_DIR}/backends/imgui_impl_win32.cpp
+    # The Win32 backend is compiled through a shim that binds its viewport
+    # window class to this module instead of to the game executable, so two
+    # injected mods do not contend for a single window class atom.
+    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/imgui_win32_module_scope.cpp
     ${imgui_SOURCE_DIR}/backends/imgui_impl_dx11.cpp
     ${imgui_SOURCE_DIR}/backends/imgui_impl_dx12.cpp
     ${imgui_SOURCE_DIR}/backends/imgui_impl_opengl3.cpp

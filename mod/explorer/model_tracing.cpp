@@ -59,6 +59,15 @@ namespace Explorer {
 			set_status("Method tracing failed: " + error);
 			return;
 		}
+		// Naming a caller needs the whole-domain method address index, and it
+		// is only useful once it is complete. Start it with the trace rather
+		// than waiting for the first raw address to reach the panel, so the
+		// rows the user is about to watch are named from the outset.
+		if (!caller_index_auto_requested_ && !caller_index_scan_ && !working_.caller_index_built &&
+			working_.caller_index_supported) {
+			caller_index_auto_requested_ = true;
+			build_managed_caller_index();
+		}
 		set_status("Tracing " + method.declaring_type.full_name + "." + method.name +
 			(command.capture_return ? " (all calls, with return values)" : " (all calls)"));
 	}
@@ -89,13 +98,19 @@ namespace Explorer {
 		set_status("Indexing managed method addresses for caller names...");
 	}
 
+	// The same 3 ms slice the instance scan uses: enough to make progress
+	// within a frame, small enough that the game keeps its frame rate. The walk
+	// costs tens of milliseconds for a whole domain, so this finishes within a
+	// handful of frames rather than being the thing the user waits on.
+	inline constexpr auto kCallerIndexSliceBudget = std::chrono::milliseconds(3);
+
 	void RuntimeModel::continue_managed_caller_index() {
 		if (!caller_index_scan_)
 			return;
 		CallerIndexScan& scan = *caller_index_scan_;
-		// Same 3 ms slice the instance scan uses: enough to make progress within
-		// a frame, small enough that the game keeps its frame rate.
-		const Clock::time_point deadline = Clock::now() + std::chrono::milliseconds(3);
+		const Clock::time_point slice_started = Clock::now();
+		const Clock::time_point deadline = slice_started + kCallerIndexSliceBudget;
+		++scan.ticks;
 		const std::size_t assembly_count = std::min<std::size_t>(URK::managed::domain_get_assembly_count(), 4096);
 		while (scan.assembly_index < assembly_count && Clock::now() < deadline) {
 			const URK::managed::Assembly* assembly = URK::managed::domain_get_assembly(scan.assembly_index);
@@ -113,22 +128,27 @@ namespace Explorer {
 			++scan.scanned_classes;
 			// Declared methods only: an inherited method is indexed once, by the
 			// type that actually owns its code.
-			for (const Inspect::MethodInfo& method : Inspect::methods_from_class(klass, false)) {
-				remember_managed_method(method);
-				++scan.indexed_methods;
-			}
+			scan.indexed_methods += remember_managed_class_methods(klass);
 		}
+		scan.slice_time += std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - slice_started);
 		working_.caller_index_methods = scan.indexed_methods;
 		working_.caller_index_classes = scan.scanned_classes;
 		const bool complete = scan.assembly_index >= assembly_count;
 		if (complete) {
 			const std::size_t methods = scan.indexed_methods;
 			const std::size_t classes = scan.scanned_classes;
+			const std::chrono::microseconds slice_time = scan.slice_time;
+			const std::size_t ticks = scan.ticks;
+			const Clock::time_point started = scan.started;
 			caller_index_scan_.reset();
 			working_.caller_index_active = false;
 			working_.caller_index_built = true;
 			mark_caller_index_complete();
-			ModLog::info("caller index: %zu method(s) across %zu class(es)", methods, classes);
+			ModLog::info("caller index: %zu method(s) across %zu class(es) in %lld ms of walk time over %zu tick(s), "
+				"%lld ms elapsed",
+				methods, classes, static_cast<long long>(slice_time.count() / 1000), ticks,
+				static_cast<long long>(
+					std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - started).count()));
 			if (methods == 0)
 				set_status("Caller name index finished with no entries; this runtime does not expose method addresses");
 			else

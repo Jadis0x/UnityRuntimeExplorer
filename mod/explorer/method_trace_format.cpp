@@ -132,7 +132,7 @@ ArgumentView argument_view(const MethodTracer::Snapshot& trace,
     } else if (reference) {
         argument.inspectable_reference = value != 0;
         placeholder = value != 0;
-        argument.value = value == 0 ? "null" : "object - its value could not be read";
+        argument.value = value == 0 ? "null" : "object - not decoded yet, see Raw ABI";
     } else if (is_enum) {
         const std::string_view underlying =
             index < trace.parameter_enum_underlying_types.size()
@@ -314,7 +314,7 @@ std::string result(const MethodTracer::Snapshot& trace, const MethodTracer::Reco
         return "struct return - this runtime does not expose its fields";
     const std::uint64_t raw = trace.return_is_floating ? record.return_xmm_low : record.return_rax;
     if (trace.return_is_reference)
-        return raw == 0 ? "null" : "object - its value could not be read";
+        return raw == 0 ? "null" : "object - not decoded yet, see Raw ABI";
     const std::string decoded = scalar_value(trace.return_type, raw);
     return decoded.empty() ? "unrecognised numeric type - see Raw ABI" : decoded;
 }

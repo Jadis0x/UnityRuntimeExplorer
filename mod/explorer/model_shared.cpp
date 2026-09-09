@@ -554,6 +554,102 @@ bool safe_object_alive(Object object) {
 	} // namespace
 #endif
 
+	namespace {
+		// The caller index only ever needs an address and a name, so the walk
+		// reads both straight off the metadata instead of going through
+		// Inspect::methods_from_class(). That matters twice over: building a
+		// full MethodInfo per method (return type, every parameter type and
+		// parameter name) is what made a whole-domain index take tens of
+		// seconds, and method_info() *drops* any method whose signature it
+		// cannot fully describe -- an opaque parameter type, a stripped return
+		// type -- which left those methods permanently unnamed no matter how
+		// often the index was rebuilt.
+		//
+		// Raw pointers only, so the structured handler is allowed here (C2712);
+		// the caller builds the std::string names.
+		struct RawIndexedMethod {
+			const void* pointer = nullptr;
+			const char* name = nullptr;
+		};
+
+#if defined(_WIN32) && !defined(URK_BACKEND_MONO)
+		bool class_method_addresses_guarded(const URK::managed::Class* klass, RawIndexedMethod* out,
+			std::size_t capacity, std::size_t& count) {
+			count = 0;
+			__try {
+				void* iterator = nullptr;
+				std::size_t seen = 0;
+				while (const URK::managed::Method* method =
+					URK::managed::class_get_methods(klass, &iterator)) {
+					// The same ceiling Inspect uses against a corrupt iterator.
+					if (++seen > Inspect::kMaxMetadataMembersPerClass || count >= capacity)
+						break;
+					void* pointer = URK::managed::method_pointer(method);
+					const char* name = URK::managed::method_get_name(method);
+					if (!pointer || !name || !name[0])
+						continue;
+					out[count].pointer = pointer;
+					out[count].name = name;
+					++count;
+				}
+				return true;
+			}
+			__except (capture_native_fault(_exception_info())) {
+				// Caller names do not justify a domain-wide fallback scan.
+				return false;
+			}
+		}
+#endif
+	} // namespace
+
+	std::size_t remember_managed_class_methods(const URK::managed::Class* klass) {
+#if defined(URK_BACKEND_MONO)
+		// Avoid JIT-compiling arbitrary metadata methods; that can raise native exceptions.
+		(void)klass;
+		return 0;
+#else
+		if (!klass)
+			return 0;
+		const Inspect::TypeInfo declaring = Inspect::DescribeClass(klass);
+		if (!declaring.handle)
+			return 0;
+		// One buffer for the whole scan; the walk truncates rather than grows.
+		constexpr std::size_t kMethodsPerClassCeiling = 4096;
+		thread_local std::vector<RawIndexedMethod> entries(kMethodsPerClassCeiling);
+		std::size_t count = 0;
+#if defined(_WIN32)
+		if (!class_method_addresses_guarded(klass, entries.data(), entries.size(), count))
+			return 0;
+#else
+		void* iterator = nullptr;
+		while (const URK::managed::Method* method = URK::managed::class_get_methods(klass, &iterator)) {
+			if (count >= entries.size())
+				break;
+			void* pointer = URK::managed::method_pointer(method);
+			const char* name = URK::managed::method_get_name(method);
+			if (!pointer || !name || !name[0])
+				continue;
+			entries[count] = RawIndexedMethod{ pointer, name };
+			++count;
+		}
+#endif
+		auto& index = managed_caller_index();
+		for (std::size_t entry = 0; entry < count; ++entry) {
+			const std::string name = declaring.full_name.empty()
+				? std::string(entries[entry].name)
+				: declaring.full_name + "." + entries[entry].name;
+			const auto [found, inserted] =
+				index.methods.emplace(reinterpret_cast<std::uintptr_t>(entries[entry].pointer), name);
+			if (inserted)
+				index.sorted_stale = true;
+			else if (found->second != name)
+				// IL2CPP shares one body between methods that compile alike.
+				found->second = "<shared managed generic code>";
+		}
+		return count;
+#endif
+	}
+
 	void remember_managed_method(const Inspect::MethodInfo& method) {
 		if (!method.handle || method.name.empty())
 			return;
@@ -618,7 +714,10 @@ bool safe_object_alive(Object object) {
 				return {};
 			const auto next = std::upper_bound(entries.begin(), entries.end(), address,
 				[](std::uintptr_t value, const auto& entry) { return value < entry.first; });
-			if (next == entries.begin() || next == entries.end())
+			// upper_bound() lands on end() for an address above every indexed
+			// entry, and the entry below it is still the candidate; only an
+			// address below the first entry has nothing to attribute it to.
+			if (next == entries.begin())
 				return {};
 			const auto entry = std::prev(next);
 			const std::uintptr_t offset = address - entry->first;

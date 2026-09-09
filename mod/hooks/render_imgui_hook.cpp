@@ -26,6 +26,8 @@
 #include <cmath>
 #include <cstddef>
 #include <cstring>
+#include <cwchar>
+#include <iterator>
 #include <cstdio>
 #include <cstdint>
 #include <deque>
@@ -364,11 +366,52 @@ namespace ModRenderHook {
 		return SUCCEEDED(swap_chain->GetDesc(desc));
 	}
 
+	// Dear ImGui registers exactly one window class for its secondary Win32
+	// viewports, and every viewport window it creates uses it. That class is
+	// the only reliable way to tell another mod's viewport apart from the
+	// game's own window: the IMGUI_CONTEXT property cannot do it, because
+	// ImGui_ImplWin32_Init() also stamps it on the *main* window, so the first
+	// mod in the process to initialize its backend would hide the game window
+	// from every mod that installs later.
+	inline bool is_imgui_viewport_window(HWND hwnd) {
+		if (!hwnd) return false;
+		wchar_t class_name[32]{};
+		const int length = GetClassNameW(hwnd, class_name, static_cast<int>(std::size(class_name)));
+		return length > 0 && std::wcscmp(class_name, L"ImGui Platform") == 0;
+	}
+
+	// Multi-viewport support registers a window class, and a class atom is keyed
+	// on (name, module). A mod whose backend named the executable would share
+	// that atom with every other mod in the process and have its viewport
+	// windows dispatched by whichever mod registered first. The Win32 backend is
+	// compiled through third_party/imgui_win32_module_scope.cpp so the class
+	// belongs to this DLL; report the result once so a regression there shows up
+	// in the log rather than only as a crash in someone else's ImGui.
+	inline void log_viewport_class_ownership() {
+		static bool logged = false;
+		if (logged) return;
+		logged = true;
+		static char anchor = 0;
+		HMODULE self = nullptr;
+		GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+			&anchor, &self);
+		WNDCLASSEXW existing{};
+		existing.cbSize = sizeof(existing);
+		const bool owned = self != nullptr && GetClassInfoExW(self, L"ImGui Platform", &existing) != FALSE;
+		log(owned ? "Detached viewport window class is owned by this module."
+			: "Detached viewport window class is not owned by this module; viewport windows would be "
+			  "dispatched by another mod's ImGui.");
+	}
+
 	inline bool is_process_main_window(HWND hwnd) {
 		if (!hwnd || !IsWindow(hwnd) || GetAncestor(hwnd, GA_ROOT) != hwnd ||
 			GetWindow(hwnd, GW_OWNER) != nullptr) {
 			return false;
 		}
+		// An injected process can contain several independent ImGui contexts,
+		// so a late-installed hook must not adopt another mod's viewport.
+		if (is_imgui_viewport_window(hwnd))
+			return false;
 		DWORD process_id = 0;
 		GetWindowThreadProcessId(hwnd, &process_id);
 		return process_id == GetCurrentProcessId();
@@ -389,8 +432,16 @@ namespace ModRenderHook {
 	}
 
 	inline bool is_active_game_swap_chain(IDXGISwapChain* swap_chain) {
-		return swap_chain && g_active_swap_chain &&
-			(swap_chain == g_active_swap_chain || same_com_identity(swap_chain, g_active_swap_chain));
+		if (!swap_chain || !g_active_swap_chain) return false;
+		if (swap_chain == g_active_swap_chain) return true;
+		// Another mod's viewport swap chain is the common hot path when several
+		// mods coexist. Reject it by its window class before paying for two COM
+		// identity queries on every detached-window Present.
+		DXGI_SWAP_CHAIN_DESC desc{};
+		if (query_swap_chain_desc(swap_chain, &desc) && desc.OutputWindow &&
+			is_imgui_viewport_window(desc.OutputWindow))
+			return false;
+		return same_com_identity(swap_chain, g_active_swap_chain);
 	}
 
 	// A monitor/adapter change is a real-world trigger for device removal;
@@ -1756,6 +1807,7 @@ namespace ModRenderHook {
 			release_device_objects();
 			return false;
 		}
+		log_viewport_class_ownership();
 
 		if (!ImGui_ImplDX11_Init(g_device, g_context)) {
 			log("ImGui DX11 backend initialization failed; UI disabled.");
@@ -1932,6 +1984,7 @@ namespace ModRenderHook {
 			release_dx12_objects();
 			return false;
 		}
+		log_viewport_class_ownership();
 		if (!install_platform_renderer_isolation()) {
 			log("DX12 multi-monitor callback isolation failed; UI disabled to avoid an unsafe render path.");
 			ImGui_ImplDX12_Shutdown(); ImGui_ImplWin32_Shutdown(); ImGui::DestroyContext();
@@ -1964,11 +2017,17 @@ namespace ModRenderHook {
 		return is_dx11 ? init_dx11_imgui(swap_chain) : init_dx12_imgui(swap_chain);
 	}
 
+	// UpdatePlatformWindows() stamps the frame it ran for *before* it consults
+	// the viewport flag, and the next NewFrame() asserts that the stamp is
+	// current. So it has to run for every frame NewFrame() started, even while
+	// detached viewports are off -- skipping it leaves the stamp stale, and
+	// turning the toggle back on then trips that assert on the very next frame.
+	// Only the detached-window bookkeeping below is conditional.
 	inline void render_platform_windows() {
-		if ((ImGui::GetIO().ConfigFlags & ImGuiConfigFlags_ViewportsEnable) == 0)
-			return;
 		PlatformRendererGuard platform_guard{};
 		ImGui::UpdatePlatformWindows();
+		if ((ImGui::GetIO().ConfigFlags & ImGuiConfigFlags_ViewportsEnable) == 0)
+			return;
 		// A newly-created detached workspace receives its first non-client and
 		// cursor messages during UpdatePlatformWindows(). Dispatch them now rather
 		// than making the user's first drag wait for the following Present frame.
@@ -2023,7 +2082,14 @@ namespace ModRenderHook {
 		barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
 		barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
 		g_dx12_command_list->ResourceBarrier(1, &barrier);
-		if (FAILED(g_dx12_command_list->Close())) { log("DX12 command-list close failed; UI frame skipped."); return; }
+		if (FAILED(g_dx12_command_list->Close())) {
+			log("DX12 command-list close failed; UI frame skipped.");
+			// The only early return past NewFrame(). ImGui still expects the
+			// platform-window update for the frame it started, so give it one
+			// before leaving rather than stranding the frame stamp.
+			render_platform_windows();
+			return;
+		}
 		ID3D12CommandList* command_lists[] = { g_dx12_command_list };
 		g_dx12_command_queue->ExecuteCommandLists(1, command_lists);
 		frame.fence_value = g_dx12_next_fence_value++;
@@ -2234,6 +2300,7 @@ namespace ModRenderHook {
 			ImGui_ImplWin32_Shutdown(); ImGui::DestroyContext(); g_hwnd = nullptr;
 			return false;
 		}
+		log_viewport_class_ownership();
 		if (!install_window_message_handler()) {
 			log("Window-message handler installation failed; UI disabled.");
 			ImGui_ImplOpenGL3_Shutdown(); ImGui_ImplWin32_Shutdown(); ImGui::DestroyContext(); g_hwnd = nullptr;
