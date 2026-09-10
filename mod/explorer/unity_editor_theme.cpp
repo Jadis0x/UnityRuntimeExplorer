@@ -195,8 +195,7 @@ bool toolbar_control(const char *label, const ImVec4 &background, const char *to
 } // namespace
 
 float toolbar_control_width(const char *label) {
-    // The same size toolbar_control() gives the button, so a caller can decide
-    // whether a row of them fits before it commits to drawing any.
+    // Must match the size toolbar_control() uses below.
     return ImGui::CalcTextSize(label).x + ImGui::GetStyle().FramePadding.x * 4.0f;
 }
 

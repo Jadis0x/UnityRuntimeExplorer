@@ -20,6 +20,8 @@ inline constexpr bool is_il2cpp_backend = true;
 inline constexpr const char *mod_id = "URK_Il2cpp_UnityRuntimeExplorer_24859613";
 #endif
 // Stable namespace for this mod's deployed resources. Do not change it after release.
+// Short form for the toolbar strip; display_name repeats the backend.
+inline constexpr const char *short_name = "Runtime Explorer";
 inline constexpr const char *author = "Jadis0x";
 inline constexpr const char *version = URK::project_version;
 inline constexpr const char *url = "https://github.com/Jadis0x/UnityRuntimeExplorer";

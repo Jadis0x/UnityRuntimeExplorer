@@ -535,8 +535,8 @@ void render() {
                 ImGui::EndMenu();
             }
 
-            char byline[96];
-            std::snprintf(byline, sizeof(byline), "by %s", ModConfig::author);
+            // Kept out of the toolbar row, which grows with the panel count and
+            // used to draw straight over this.
             char version[32];
             std::snprintf(version, sizeof(version), "v%s", ModConfig::version);
             const std::string status = snapshot->status.empty() ? "Ready" : snapshot->status;
@@ -544,18 +544,17 @@ void render() {
             const auto segment_width = [&menu_style](const char *text) {
                 return ImGui::CalcTextSize(text).x + menu_style.ItemSpacing.x;
             };
-            const float identity_width = segment_width(ModConfig::display_name) +
-                                         segment_width(ModConfig::backend_name) + segment_width(byline) +
-                                         segment_width(version) + segment_width(status.c_str());
+            const float identity_width = segment_width(ModConfig::short_name) +
+                                         segment_width(ModConfig::backend_name) + segment_width(version) +
+                                         segment_width(ModConfig::author) + segment_width(status.c_str());
             const float identity_x = ImGui::GetContentRegionMax().x - identity_width;
             if (identity_x > ImGui::GetCursorPosX() + 12.0f) {
                 ImGui::SetCursorPosX(identity_x);
-                ImGui::TextColored(ImVec4(0.92f, 0.92f, 0.92f, 1.0f), "%s", ModConfig::display_name);
+                ImGui::TextColored(ImVec4(0.92f, 0.92f, 0.92f, 1.0f), "%s", ModConfig::short_name);
                 ImGui::TextColored(Unity::Skin::accent, "%s", ModConfig::backend_name);
-                ImGui::TextColored(ImVec4(0.82f, 0.66f, 0.36f, 1.0f), "%s", byline);
                 ImGui::TextDisabled("%s", version);
-                // Green while nothing needs reading, amber the moment something
-                // does - the strip doubles as the status light.
+                ImGui::TextColored(ImVec4(0.82f, 0.66f, 0.36f, 1.0f), "%s", ModConfig::author);
+                // Green when idle, amber when the last command left something to read.
                 ImGui::TextColored(status == "Ready" ? ImVec4(0.48f, 0.74f, 0.52f, 1.0f) : Unity::Skin::warning,
                                    "%s", status.c_str());
                 if (ImGui::IsItemHovered())
@@ -605,11 +604,8 @@ void render() {
             {"Reference Graph", &show_reference_graph},
             {"Console", &show_diagnostics},
         };
-        // Measure the row before drawing it. The window is a fixed-height strip
-        // that neither scrolls nor wraps, so a row wider than the strip does not
-        // clip visibly - it draws past the edge, where the buttons are still
-        // clickable but nobody can read them. Below that width the whole set
-        // collapses into one dropdown that says the same thing.
+        // The strip does not scroll or wrap, so a row too wide for it runs off the
+        // edge rather than clipping. Measure first, collapse to a dropdown if needed.
         constexpr float kToggleSpacing = 2.0f;
         float toggles_width = 0.0f;
         for (const PanelToggle &toggle : toggles)

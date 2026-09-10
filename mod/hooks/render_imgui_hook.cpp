@@ -2576,6 +2576,10 @@ namespace ModRenderHook {
 				}
 			}
 
+			// Flip-model swap chains present through Present1, bitblt ones through
+			// Present, and a process can use both. Half the pair means the overlay
+			// draws on only some frames. Attaching can fail just because another
+			// thread was starting or ending, so drop it and let the retry try again.
 			const bool wanted_present = targets.present != nullptr;
 			const bool wanted_present1 = targets.present1 && targets.present1 != targets.present;
 			if ((wanted_present && !g_present_hooked) || (wanted_present1 && !g_present1_hooked)) {
