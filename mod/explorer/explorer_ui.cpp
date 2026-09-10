@@ -398,21 +398,6 @@ void render() {
                     ImGui::SetTooltip("Opens Method Calls and Value Watches together");
                 ImGui::EndMenu();
             }
-            if (ImGui::BeginMenu("Runtime")) {
-                bool live_data = snapshot->live_data;
-                if (ImGui::MenuItem("Live data", nullptr, &live_data)) {
-                    Command command{.kind = CommandKind::SetLiveData};
-                    command.bool_value = live_data;
-                    RuntimeModel::instance().enqueue(std::move(command));
-                }
-                if (ImGui::IsItemHovered())
-                    ImGui::SetTooltip("Re-read inspected values from the running game every tick");
-                ImGui::BeginDisabled(!snapshot->camera_focus_active);
-                if (ImGui::MenuItem("Return camera"))
-                    enqueue_simple(CommandKind::RestoreCamera, 0);
-                ImGui::EndDisabled();
-                ImGui::EndMenu();
-            }
             if (ImGui::BeginMenu("Scene")) {
                 ImGui::SeparatorText("Scenes in Build Settings");
                 if (hierarchy->available_scenes.empty()) {
@@ -539,9 +524,6 @@ void render() {
                 ImGui::EndMenu();
             }
             if (ImGui::BeginMenu("Help")) {
-                if (ImGui::MenuItem("Diagnostics"))
-                    show_diagnostics = true;
-                ImGui::Separator();
                 if (ImGui::MenuItem("GitHub"))
                     ShellExecuteA(nullptr, "open", ModConfig::url, nullptr, nullptr, SW_SHOWNORMAL);
                 if (ImGui::IsItemHovered())
@@ -551,6 +533,33 @@ void render() {
                 if (ImGui::IsItemHovered())
                     ImGui::SetTooltip("%s", ModConfig::social);
                 ImGui::EndMenu();
+            }
+
+            char byline[96];
+            std::snprintf(byline, sizeof(byline), "by %s", ModConfig::author);
+            char version[32];
+            std::snprintf(version, sizeof(version), "v%s", ModConfig::version);
+            const std::string status = snapshot->status.empty() ? "Ready" : snapshot->status;
+            const ImGuiStyle &menu_style = ImGui::GetStyle();
+            const auto segment_width = [&menu_style](const char *text) {
+                return ImGui::CalcTextSize(text).x + menu_style.ItemSpacing.x;
+            };
+            const float identity_width = segment_width(ModConfig::display_name) +
+                                         segment_width(ModConfig::backend_name) + segment_width(byline) +
+                                         segment_width(version) + segment_width(status.c_str());
+            const float identity_x = ImGui::GetContentRegionMax().x - identity_width;
+            if (identity_x > ImGui::GetCursorPosX() + 12.0f) {
+                ImGui::SetCursorPosX(identity_x);
+                ImGui::TextColored(ImVec4(0.92f, 0.92f, 0.92f, 1.0f), "%s", ModConfig::display_name);
+                ImGui::TextColored(Unity::Skin::accent, "%s", ModConfig::backend_name);
+                ImGui::TextColored(ImVec4(0.82f, 0.66f, 0.36f, 1.0f), "%s", byline);
+                ImGui::TextDisabled("%s", version);
+                // Green while nothing needs reading, amber the moment something
+                // does - the strip doubles as the status light.
+                ImGui::TextColored(status == "Ready" ? ImVec4(0.48f, 0.74f, 0.52f, 1.0f) : Unity::Skin::warning,
+                                   "%s", status.c_str());
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("%s", status.c_str());
             }
             ImGui::EndMenuBar();
         }
@@ -596,48 +605,36 @@ void render() {
             {"Reference Graph", &show_reference_graph},
             {"Console", &show_diagnostics},
         };
-        for (std::size_t index = 0; index < static_cast<std::size_t>(IM_ARRAYSIZE(toggles)); ++index) {
-            if (index > 0)
-                ImGui::SameLine(0.0f, 2.0f);
-            if (Unity::toolbar_toggle(toggles[index].label, *toggles[index].visible))
-                *toggles[index].visible = !*toggles[index].visible;
-        }
-
-        // Unity keeps its identity and status readouts on the right of the
-        // toolbar; the last command's result rides along so a rejected trace or
-        // write never looks like the button did nothing. Drawn as coloured
-        // segments rather than one grey run, which read as switched off.
-        const std::string status = snapshot->status.empty() ? "Ready" : snapshot->status;
-        char byline[96];
-        std::snprintf(byline, sizeof(byline), "by %s", ModConfig::author);
-        char version[32];
-        std::snprintf(version, sizeof(version), "v%s", ModConfig::version);
-        const ImGuiStyle &toolbar_style = ImGui::GetStyle();
-        const auto segment_width = [&toolbar_style](const char *text) {
-            return ImGui::CalcTextSize(text).x + toolbar_style.ItemSpacing.x;
-        };
-        const float identity_width = segment_width(ModConfig::display_name) +
-                                     segment_width(ModConfig::backend_name) + segment_width(byline) +
-                                     segment_width(version) + segment_width(status.c_str());
-        const float right_edge = ImGui::GetWindowContentRegionMax().x - identity_width;
-        if (right_edge > ImGui::GetCursorPosX() + 16.0f) {
-            ImGui::SameLine(right_edge);
-            ImGui::AlignTextToFramePadding();
-            ImGui::TextColored(ImVec4(0.92f, 0.92f, 0.92f, 1.0f), "%s", ModConfig::display_name);
-            ImGui::SameLine();
-            ImGui::TextColored(Unity::Skin::accent, "%s", ModConfig::backend_name);
-            ImGui::SameLine();
-            ImGui::TextColored(ImVec4(0.82f, 0.66f, 0.36f, 1.0f), "%s", byline);
-            ImGui::SameLine();
-            ImGui::TextDisabled("%s", version);
-            ImGui::SameLine();
-            // Green while nothing needs reading, amber the moment something
-            // does - the strip doubles as the status light.
-            const bool idle = status == "Ready";
-            ImGui::TextColored(idle ? ImVec4(0.48f, 0.74f, 0.52f, 1.0f) : Unity::Skin::warning, "%s",
-                               status.c_str());
-            if (ImGui::IsItemHovered())
-                ImGui::SetTooltip("%s", status.c_str());
+        // Measure the row before drawing it. The window is a fixed-height strip
+        // that neither scrolls nor wraps, so a row wider than the strip does not
+        // clip visibly - it draws past the edge, where the buttons are still
+        // clickable but nobody can read them. Below that width the whole set
+        // collapses into one dropdown that says the same thing.
+        constexpr float kToggleSpacing = 2.0f;
+        float toggles_width = 0.0f;
+        for (const PanelToggle &toggle : toggles)
+            toggles_width += Unity::toolbar_control_width(toggle.label) + kToggleSpacing;
+        const float toggles_space = ImGui::GetWindowContentRegionMax().x - ImGui::GetCursorPosX();
+        if (toggles_width <= toggles_space) {
+            for (std::size_t index = 0; index < static_cast<std::size_t>(IM_ARRAYSIZE(toggles)); ++index) {
+                if (index > 0)
+                    ImGui::SameLine(0.0f, kToggleSpacing);
+                if (Unity::toolbar_toggle(toggles[index].label, *toggles[index].visible))
+                    *toggles[index].visible = !*toggles[index].visible;
+            }
+        } else {
+            std::size_t open_panels = 0;
+            for (const PanelToggle &toggle : toggles)
+                open_panels += *toggle.visible ? 1u : 0u;
+            char label[48];
+            std::snprintf(label, sizeof(label), "Panels (%zu/%d)", open_panels, IM_ARRAYSIZE(toggles));
+            if (Unity::toolbar_toggle(label, open_panels != 0, "Show or hide Explorer panels"))
+                ImGui::OpenPopup("##urk-panel-toggles");
+            if (ImGui::BeginPopup("##urk-panel-toggles")) {
+                for (const PanelToggle &toggle : toggles)
+                    ImGui::MenuItem(toggle.label, nullptr, toggle.visible);
+                ImGui::EndPopup();
+            }
         }
     }
     ImGui::End();

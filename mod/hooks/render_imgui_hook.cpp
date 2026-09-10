@@ -2551,6 +2551,7 @@ namespace ModRenderHook {
 			g_dxgi_targets_discovered = true;
 		}
 		const DxgiVTableTargets targets = g_cached_dxgi_targets;
+		bool dxgi_install_incomplete = false;
 		if ((want_dx11 || want_dx12) && (targets.present || targets.present1) && targets.resize_buffers) {
 			if (targets.present) {
 				g_present = reinterpret_cast<PresentFn>(targets.present);
@@ -2568,11 +2569,30 @@ namespace ModRenderHook {
 				if (!URK::hooks::attach_ex(reinterpret_cast<void**>(&g_present1), reinterpret_cast<void*>(&detour_present1),
 					URK::hook_backend_auto)) {
 					g_present1 = nullptr;
-					log("DXGI Present1 hook attach failed; D3D12 overlay may be unavailable.");
+					log("DXGI Present1 hook attach failed.");
 				}
 				else {
 					g_present1_hooked = true;
 				}
+			}
+
+			const bool wanted_present = targets.present != nullptr;
+			const bool wanted_present1 = targets.present1 && targets.present1 != targets.present;
+			if ((wanted_present && !g_present_hooked) || (wanted_present1 && !g_present1_hooked)) {
+				log("DXGI presentation hooks installed only partially; unwinding for a full retry.");
+				if (g_present1_hooked) {
+					URK::hooks::detach_ex(reinterpret_cast<void**>(&g_present1),
+						reinterpret_cast<void*>(&detour_present1));
+					g_present1_hooked = false;
+				}
+				if (g_present_hooked) {
+					URK::hooks::detach_ex(reinterpret_cast<void**>(&g_present),
+						reinterpret_cast<void*>(&detour_present));
+					g_present_hooked = false;
+				}
+				g_present = nullptr;
+				g_present1 = nullptr;
+				dxgi_install_incomplete = true;
 			}
 		}
 
@@ -2662,7 +2682,8 @@ namespace ModRenderHook {
 		}
 
 		if (!g_present_hooked && !g_present1_hooked && !g_wgl_swap_buffers_hooked) {
-			log("No supported render presentation hook could be installed.");
+			if (!dxgi_install_incomplete)
+				log("No supported render presentation hook could be installed.");
 			return false;
 		}
 		if (probe_native_presentation)

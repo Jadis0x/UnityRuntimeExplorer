@@ -75,6 +75,9 @@ void rule_line(float top_padding = 0.0f, float bottom_padding = 0.0f);
 // Toolbar controls: square, full toolbar height. The accent overloads colour
 // the control by what it does; hover and pressed states are derived from that
 // colour, so a caller never has to supply three of them.
+// Width of the button toolbar_button()/toolbar_toggle() would draw for `label`,
+// so a row can be measured against the space left before it is drawn.
+float toolbar_control_width(const char *label);
 bool toolbar_button(const char *label, const char *tooltip = nullptr);
 bool toolbar_button(const char *label, const ImVec4 &accent, const char *tooltip = nullptr);
 // A toggle is `accent` while on and neutral grey while off, so its state reads

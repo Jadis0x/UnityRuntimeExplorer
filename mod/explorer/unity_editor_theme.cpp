@@ -194,6 +194,12 @@ bool toolbar_control(const char *label, const ImVec4 &background, const char *to
 
 } // namespace
 
+float toolbar_control_width(const char *label) {
+    // The same size toolbar_control() gives the button, so a caller can decide
+    // whether a row of them fits before it commits to drawing any.
+    return ImGui::CalcTextSize(label).x + ImGui::GetStyle().FramePadding.x * 4.0f;
+}
+
 bool toolbar_button(const char *label, const char *tooltip) {
     return toolbar_control(label, Skin::button, tooltip);
 }
