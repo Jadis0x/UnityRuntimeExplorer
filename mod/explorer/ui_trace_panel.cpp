@@ -251,6 +251,18 @@ void trace_card_row(std::string_view label, std::string_view color_key,
     }
 }
 
+void render_caller_inspect_button(const MethodTracer::CallerMethod &method, const char *label) {
+    if (!method.inspectable())
+        return;
+    ImGui::SameLine();
+    ImGui::PushID("caller-method");
+    if (ImGui::SmallButton(label))
+        inspect_class_browser_method(method);
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Opens the caller's declaring type and method in the Class Browser.");
+    ImGui::PopID();
+}
+
 void render_method_trace(const Snapshot &snapshot, const MethodTracer::Snapshot &trace) {
     TraceViewState &state = trace_view_state(trace.id);
     if (trace.active) {
@@ -420,6 +432,7 @@ void render_method_trace(const Snapshot &snapshot, const MethodTracer::Snapshot 
                     trace_card_row("Repeated", repeats, repeats, false);
                 }
                 trace_card_row("Who", caller, caller, false);
+                render_caller_inspect_button(record.caller_method, "Inspect");
                 trace_card_row("What", what, what, false);
                 if (!trace.is_static)
                     trace_card_row("Target", record.target_display, record.target_display.empty()
@@ -441,6 +454,7 @@ void render_method_trace(const Snapshot &snapshot, const MethodTracer::Snapshot 
                 ImGui::Spacing();
                 ImGui::SeparatorText("Call site");
                 ImGui::TextWrapped("%s", caller.c_str());
+                render_caller_inspect_button(record.caller_method, "Inspect caller");
 
                 if (!trace.is_static) {
                     ImGui::SeparatorText("Target object");

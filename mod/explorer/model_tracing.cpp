@@ -29,7 +29,9 @@ namespace Explorer {
 		if (browser &&
 			(working_.class_browser_members_query.image != command.image ||
 			 working_.class_browser_members_query.namespc != command.namespc ||
-			 working_.class_browser_members_query.class_name != command.class_name)) {
+			 working_.class_browser_members_query.class_name != command.class_name ||
+			 (command.metadata_address != 0 &&
+			  working_.class_browser_members_query.metadata_address != command.metadata_address))) {
 			set_status("Class Browser selection changed before tracing could start");
 			return;
 		}
@@ -115,6 +117,7 @@ namespace Explorer {
 		while (scan.assembly_index < assembly_count && Clock::now() < deadline) {
 			const URK::managed::Assembly* assembly = URK::managed::domain_get_assembly(scan.assembly_index);
 			const URK::managed::Image* image = assembly ? URK::managed::assembly_get_image(assembly) : nullptr;
+			const char* image_name = image ? URK::managed::image_get_name(image) : nullptr;
 			const std::size_t class_count =
 				image ? std::min<std::size_t>(URK::managed::image_get_class_count(image), 1000000) : 0;
 			if (!image || scan.class_index >= class_count) {
@@ -128,7 +131,7 @@ namespace Explorer {
 			++scan.scanned_classes;
 			// Declared methods only: an inherited method is indexed once, by the
 			// type that actually owns its code.
-			scan.indexed_methods += remember_managed_class_methods(klass);
+			scan.indexed_methods += remember_managed_class_methods(klass, image_name ? image_name : "");
 		}
 		scan.slice_time += std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - slice_started);
 		working_.caller_index_methods = scan.indexed_methods;

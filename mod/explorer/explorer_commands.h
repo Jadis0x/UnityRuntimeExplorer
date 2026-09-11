@@ -96,6 +96,9 @@ struct Command {
     std::uint64_t scene_generation = 0;
     std::uint64_t hierarchy_revision = 0;
     std::uintptr_t expected_object_address = 0;
+    // Exact class metadata identity for Class Browser operations. This keeps
+    // nested/compiler-generated types distinct when namespace + name collide.
+    std::uintptr_t metadata_address = 0;
     std::uint64_t sequence = 0;
     bool bool_value = false;
     // SetMethodTrace: opt in to the legacy stub that also captures the return

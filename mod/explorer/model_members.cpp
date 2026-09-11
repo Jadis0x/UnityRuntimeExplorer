@@ -539,7 +539,9 @@ namespace Explorer {
 		if (browser &&
 			(working_.class_browser_members_query.image != command.image ||
 			 working_.class_browser_members_query.namespc != command.namespc ||
-			 working_.class_browser_members_query.class_name != command.class_name)) {
+			 working_.class_browser_members_query.class_name != command.class_name ||
+			 (command.metadata_address != 0 &&
+			  working_.class_browser_members_query.metadata_address != command.metadata_address))) {
 			set_status("Class Browser selection changed before the method could be invoked");
 			return;
 		}

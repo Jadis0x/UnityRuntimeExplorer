@@ -13,6 +13,29 @@
 using namespace URK::Unity;
 
 namespace Explorer {
+	namespace {
+
+		bool browser_entry_matches(const BrowserClassInfo& entry, const Command& command) {
+			if (command.metadata_address != 0)
+				return entry.metadata_address == command.metadata_address;
+			return entry.image == command.image && entry.namespc == command.namespc &&
+				entry.class_name == command.class_name;
+		}
+
+		const URK::managed::Class* browser_command_class(const Command& command) {
+			if (command.metadata_address == 0)
+				return URK::managed::find_class(
+					command.image.c_str(), command.namespc.c_str(), command.class_name.c_str());
+			if (!readable_address(command.metadata_address))
+				return nullptr;
+			const auto* klass = reinterpret_cast<const URK::managed::Class*>(command.metadata_address);
+			const Inspect::TypeInfo type = Inspect::DescribeClass(klass);
+			if (type.name != command.class_name || type.namespc != command.namespc)
+				return nullptr;
+			return klass;
+		}
+
+	} // namespace
 
 	// RuntimeModel::ClassInstanceScan is defined in model_shared.h: explorer_model.cpp's
 	// destructor and unique_ptr<ClassInstanceScan> resets also need the complete type.
@@ -147,6 +170,7 @@ namespace Explorer {
 				if (type.name.empty() || type.name == "<Module>")
 					continue;
 				BrowserClassInfo entry{};
+				entry.metadata_address = reinterpret_cast<std::uintptr_t>(klass);
 				entry.image = image_name;
 				entry.namespc = type.namespc;
 				entry.class_name = type.name;
@@ -173,7 +197,7 @@ namespace Explorer {
 					if (!interface_info.full_name.empty())
 						entry.interfaces.push_back(interface_info.full_name);
 				}
-				const std::string key = entry.image + "\n" + entry.full_name;
+				const std::string key = entry.image + "\n" + entry.full_name + "\n" + entry.pointer_text;
 				if (!seen.insert(key).second)
 					continue;
 				catalog->classes.push_back(std::move(entry));
@@ -230,6 +254,7 @@ namespace Explorer {
 		working_.class_browser_scene_roots = 0;
 		working_.class_browser_scan_truncated = false;
 		working_.class_browser_query = {};
+		working_.class_browser_query.metadata_address = command.metadata_address;
 		working_.class_browser_query.image = command.image;
 		working_.class_browser_query.namespc = command.namespc;
 		working_.class_browser_query.class_name = command.class_name;
@@ -239,10 +264,7 @@ namespace Explorer {
 		working_.class_browser_query.is_unity_object = command.class_is_unity_object;
 		if (class_browser_catalog_) {
 			const auto selected = std::find_if(class_browser_catalog_->classes.begin(), class_browser_catalog_->classes.end(),
-				[&](const BrowserClassInfo& entry) {
-					return entry.image == command.image && entry.namespc == command.namespc &&
-						entry.class_name == command.class_name;
-				});
+				[&](const BrowserClassInfo& entry) { return browser_entry_matches(entry, command); });
 			if (selected != class_browser_catalog_->classes.end())
 				working_.class_browser_query = *selected;
 		}
@@ -251,8 +273,7 @@ namespace Explorer {
 			return;
 		}
 
-		const URK::managed::Class* target =
-			URK::managed::find_class(command.image.c_str(), command.namespc.c_str(), command.class_name.c_str());
+		const URK::managed::Class* target = browser_command_class(command);
 		if (!target) {
 			set_status("Selected type could no longer be resolved");
 			return;
@@ -503,6 +524,7 @@ namespace Explorer {
 		class_browser_static_handles_.clear();
 		working_.class_browser_static_fields.clear();
 		working_.class_browser_static_query = {};
+		working_.class_browser_static_query.metadata_address = command.metadata_address;
 		working_.class_browser_static_query.image = command.image;
 		working_.class_browser_static_query.namespc = command.namespc;
 		working_.class_browser_static_query.class_name = command.class_name;
@@ -510,15 +532,11 @@ namespace Explorer {
 			command.namespc.empty() ? command.class_name : command.namespc + "." + command.class_name;
 		if (class_browser_catalog_) {
 			const auto match = std::find_if(class_browser_catalog_->classes.begin(), class_browser_catalog_->classes.end(),
-				[&command](const BrowserClassInfo& entry) {
-					return entry.image == command.image && entry.namespc == command.namespc &&
-						entry.class_name == command.class_name;
-				});
+				[&command](const BrowserClassInfo& entry) { return browser_entry_matches(entry, command); });
 			if (match != class_browser_catalog_->classes.end())
 				working_.class_browser_static_query = *match;
 		}
-		const URK::managed::Class* klass =
-			URK::managed::find_class(command.image.c_str(), command.namespc.c_str(), command.class_name.c_str());
+		const URK::managed::Class* klass = browser_command_class(command);
 		if (!klass) {
 			set_status("Selected type could no longer be resolved");
 			return;
@@ -586,8 +604,7 @@ namespace Explorer {
 	}
 
 	void RuntimeModel::set_class_browser_static_field(const Command& command) {
-		const URK::managed::Class* klass =
-			URK::managed::find_class(command.image.c_str(), command.namespc.c_str(), command.class_name.c_str());
+		const URK::managed::Class* klass = browser_command_class(command);
 		if (!klass) {
 			set_status("Static field write failed: selected type could no longer be resolved");
 			return;
@@ -666,7 +683,9 @@ namespace Explorer {
 	void RuntimeModel::create_class_instance(const Command& command) {
 		if (working_.class_browser_members_query.image != command.image ||
 			working_.class_browser_members_query.namespc != command.namespc ||
-			working_.class_browser_members_query.class_name != command.class_name) {
+			working_.class_browser_members_query.class_name != command.class_name ||
+			(command.metadata_address != 0 &&
+			 working_.class_browser_members_query.metadata_address != command.metadata_address)) {
 			set_status("Create instance failed: Class Browser selection changed");
 			return;
 		}
@@ -683,7 +702,7 @@ namespace Explorer {
 			set_status("Create instance failed: argument count does not match the constructor");
 			return;
 		}
-		const URK::managed::Class* klass = URK::managed::find_class(command.image.c_str(), command.namespc.c_str(), command.class_name.c_str());
+		const URK::managed::Class* klass = browser_command_class(command);
 		const URK::managed::Class* component_base = URK::managed::find_class("", "UnityEngine", "Component");
 		const URK::managed::Class* scriptable_base = URK::managed::find_class("", "UnityEngine", "ScriptableObject");
 		const URK::managed::Class* object_base = URK::managed::find_class("", "UnityEngine", "Object");
@@ -777,6 +796,7 @@ namespace Explorer {
 		class_browser_reflection_ = {};
 		working_.class_browser_members = {};
 		working_.class_browser_members_query = {};
+		working_.class_browser_members_query.metadata_address = command.metadata_address;
 		working_.class_browser_members_query.image = command.image;
 		working_.class_browser_members_query.namespc = command.namespc;
 		working_.class_browser_members_query.class_name = command.class_name;
@@ -784,15 +804,11 @@ namespace Explorer {
 			command.namespc.empty() ? command.class_name : command.namespc + "." + command.class_name;
 		if (class_browser_catalog_) {
 			const auto match = std::find_if(class_browser_catalog_->classes.begin(), class_browser_catalog_->classes.end(),
-				[&command](const BrowserClassInfo& entry) {
-					return entry.image == command.image && entry.namespc == command.namespc &&
-						entry.class_name == command.class_name;
-				});
+				[&command](const BrowserClassInfo& entry) { return browser_entry_matches(entry, command); });
 			if (match != class_browser_catalog_->classes.end())
 				working_.class_browser_members_query = *match;
 		}
-		const URK::managed::Class* klass =
-			URK::managed::find_class(command.image.c_str(), command.namespc.c_str(), command.class_name.c_str());
+		const URK::managed::Class* klass = browser_command_class(command);
 		if (!klass) {
 			set_status("Selected type could no longer be resolved");
 			return;

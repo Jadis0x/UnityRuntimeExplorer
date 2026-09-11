@@ -32,6 +32,23 @@ struct ValueNode {
     bool truncated = false;
 };
 
+// Metadata identity of the managed method containing a captured call site.
+// The detour records only a return address; RuntimeModel fills this from the
+// caller index while publishing a snapshot. Keeping the identity alongside
+// the display text lets the UI navigate without parsing generated method or
+// nested type names out of a formatted string.
+struct CallerMethod {
+    std::uintptr_t class_address = 0;
+    std::string image;
+    std::string namespc;
+    std::string class_name;
+    std::string method_name;
+
+    bool inspectable() const {
+        return class_address != 0 && !class_name.empty() && !method_name.empty();
+    }
+};
+
 struct Record {
     std::uint64_t sequence = 0;
     std::uint64_t sequence_start = 0;
@@ -61,6 +78,7 @@ struct Record {
     // Value-type arguments copied at entry, before the callee can mutate them.
     std::vector<std::vector<std::uint8_t>> argument_value_bytes;
     std::string caller_display;
+    CallerMethod caller_method;
     std::string target_display;
     std::vector<std::string> argument_displays;
     std::vector<bool> argument_readable;

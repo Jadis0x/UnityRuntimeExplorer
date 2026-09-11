@@ -45,11 +45,20 @@ namespace Explorer {
 			return text;
 		}
 
+		struct IndexedManagedMethod {
+			std::uintptr_t class_address = 0;
+			std::string display;
+			std::string image;
+			std::string namespc;
+			std::string class_name;
+			std::string method_name;
+		};
+
 		struct ManagedCallerIndex {
 			// unordered_map keeps element addresses stable across rehash, so the
-			// sorted view can borrow the names instead of copying them.
-			std::unordered_map<std::uintptr_t, std::string> methods;
-			std::vector<std::pair<std::uintptr_t, const std::string*>> sorted;
+			// sorted view can borrow the metadata instead of copying it.
+			std::unordered_map<std::uintptr_t, IndexedManagedMethod> methods;
+			std::vector<std::pair<std::uintptr_t, const IndexedManagedMethod*>> sorted;
 			bool sorted_stale = true;
 			// Set once every assembly has been walked. Until then a missing
 			// entry means "not indexed yet", not "not a managed method".
@@ -602,10 +611,11 @@ bool safe_object_alive(Object object) {
 #endif
 	} // namespace
 
-	std::size_t remember_managed_class_methods(const URK::managed::Class* klass) {
+	std::size_t remember_managed_class_methods(const URK::managed::Class* klass, std::string_view image) {
 #if defined(URK_BACKEND_MONO)
 		// Avoid JIT-compiling arbitrary metadata methods; that can raise native exceptions.
 		(void)klass;
+		(void)image;
 		return 0;
 #else
 		if (!klass)
@@ -635,16 +645,24 @@ bool safe_object_alive(Object object) {
 #endif
 		auto& index = managed_caller_index();
 		for (std::size_t entry = 0; entry < count; ++entry) {
-			const std::string name = declaring.full_name.empty()
+			const std::string display = declaring.full_name.empty()
 				? std::string(entries[entry].name)
 				: declaring.full_name + "." + entries[entry].name;
+			IndexedManagedMethod indexed{};
+			indexed.class_address = reinterpret_cast<std::uintptr_t>(klass);
+			indexed.display = display;
+			indexed.image = image;
+			indexed.namespc = declaring.namespc;
+			indexed.class_name = declaring.name;
+			indexed.method_name = entries[entry].name;
 			const auto [found, inserted] =
-				index.methods.emplace(reinterpret_cast<std::uintptr_t>(entries[entry].pointer), name);
+				index.methods.emplace(reinterpret_cast<std::uintptr_t>(entries[entry].pointer), std::move(indexed));
 			if (inserted)
 				index.sorted_stale = true;
-			else if (found->second != name)
+			else if (found->second.display != display) {
 				// IL2CPP shares one body between methods that compile alike.
-				found->second = "<shared managed generic code>";
+				found->second = IndexedManagedMethod{.display = "<shared managed generic code>"};
+			}
 		}
 		return count;
 #endif
@@ -668,21 +686,31 @@ bool safe_object_alive(Object object) {
 		if (!pointer)
 			return;
 #endif
-		const std::string name = method.declaring_type.full_name.empty()
+		const std::string display = method.declaring_type.full_name.empty()
 			? method.name
 			: method.declaring_type.full_name + "." + method.name;
+		const char* image = method.declaring_type.handle
+			? URK::managed::class_get_assemblyname(method.declaring_type.handle) : nullptr;
+		IndexedManagedMethod indexed{};
+		indexed.class_address = reinterpret_cast<std::uintptr_t>(method.declaring_type.handle);
+		indexed.display = display;
+		indexed.image = image ? image : "";
+		indexed.namespc = method.declaring_type.namespc;
+		indexed.class_name = method.declaring_type.name;
+		indexed.method_name = method.name;
 		auto& index = managed_caller_index();
-		const auto [found, inserted] = index.methods.emplace(reinterpret_cast<std::uintptr_t>(pointer), name);
+		const auto [found, inserted] =
+			index.methods.emplace(reinterpret_cast<std::uintptr_t>(pointer), std::move(indexed));
 		if (inserted)
 			index.sorted_stale = true;
-		else if (found->second != name)
-			found->second = "<shared managed generic code>";
+		else if (found->second.display != display)
+			found->second = IndexedManagedMethod{.display = "<shared managed generic code>"};
 	#endif
 	}
 
 	namespace {
 
-		const std::vector<std::pair<std::uintptr_t, const std::string*>>& sorted_caller_entries() {
+		const std::vector<std::pair<std::uintptr_t, const IndexedManagedMethod*>>& sorted_caller_entries() {
 			ManagedCallerIndex& index = managed_caller_index();
 			if (!index.sorted_stale)
 				return index.sorted;
@@ -708,7 +736,25 @@ bool safe_object_alive(Object object) {
 		// larger has a .pdata entry and is named exactly, and guessing across the
 		// gap is how a caller inside the IL2CPP runtime ended up labelled with the
 		// name of whichever managed method happened to sit below it.
-		std::string enclosing_indexed_method(std::uintptr_t address) {
+		ManagedMethodLocation indexed_method_location(const IndexedManagedMethod& method,
+			std::uintptr_t function_start, std::uintptr_t address) {
+			ManagedMethodLocation location{};
+			location.class_address = method.class_address;
+			location.display = method.display;
+			location.image = method.image;
+			location.namespc = method.namespc;
+			location.class_name = method.class_name;
+			location.method_name = method.method_name;
+			if (address > function_start) {
+				char suffix[32]{};
+				std::snprintf(suffix, sizeof(suffix), " +0x%llX",
+					static_cast<unsigned long long>(address - function_start));
+				location.display += suffix;
+			}
+			return location;
+		}
+
+		ManagedMethodLocation enclosing_indexed_method(std::uintptr_t address) {
 			const auto& entries = sorted_caller_entries();
 			if (entries.empty())
 				return {};
@@ -730,9 +776,7 @@ bool safe_object_alive(Object object) {
 			DWORD64 unused_base = 0;
 			if (RtlLookupFunctionEntry(static_cast<DWORD64>(entry->first), &unused_base, nullptr) != nullptr)
 				return {};
-			char suffix[32]{};
-			std::snprintf(suffix, sizeof(suffix), " +0x%llX", static_cast<unsigned long long>(offset));
-			return *entry->second + suffix;
+			return indexed_method_location(*entry->second, entry->first, address);
 		}
 
 	} // namespace
@@ -773,20 +817,20 @@ bool safe_object_alive(Object object) {
 
 	void mark_caller_index_complete() { managed_caller_index().complete = true; }
 
-	std::string managed_method_location(std::uintptr_t function_start, std::uintptr_t address) {
+	ManagedMethodLocation managed_method_details(std::uintptr_t function_start, std::uintptr_t address) {
 		const auto found = managed_caller_index().methods.find(function_start);
 		if (found == managed_caller_index().methods.end())
-			return module_location(address);
-		if (address <= function_start)
-			return found->second;
-		char suffix[32]{};
-		std::snprintf(suffix, sizeof(suffix), " +0x%llX", static_cast<unsigned long long>(address - function_start));
-		return found->second + suffix;
+			return ManagedMethodLocation{.display = module_location(address)};
+		return indexed_method_location(found->second, function_start, address);
 	}
 
-	std::string managed_caller_location(std::uintptr_t address) {
+	std::string managed_method_location(std::uintptr_t function_start, std::uintptr_t address) {
+		return managed_method_details(function_start, address).display;
+	}
+
+	ManagedMethodLocation managed_caller_method(std::uintptr_t address) {
 		if (!address)
-			return module_location(address);
+			return ManagedMethodLocation{.display = module_location(address)};
 		DWORD64 image_base = 0;
 		const PRUNTIME_FUNCTION function = RtlLookupFunctionEntry(static_cast<DWORD64>(address), &image_base, nullptr);
 		if (function) {
@@ -797,12 +841,12 @@ bool safe_object_alive(Object object) {
 			for (int depth = 0; depth < 8 && fragment != 0; ++depth) {
 				const auto found = managed_caller_index().methods.find(static_cast<std::uintptr_t>(fragment));
 				if (found != managed_caller_index().methods.end())
-					return managed_method_location(static_cast<std::uintptr_t>(fragment), address);
+					return indexed_method_location(found->second, static_cast<std::uintptr_t>(fragment), address);
 				fragment = chained_fragment_start(fragment);
 			}
 		}
-		const std::string enclosing = enclosing_indexed_method(address);
-		if (!enclosing.empty())
+		ManagedMethodLocation enclosing = enclosing_indexed_method(address);
+		if (!enclosing.display.empty())
 			return enclosing;
 		// A frame the index cannot name because the address has unwind data and
 		// its function is not a managed method: IL2CPP's own runtime, reached
@@ -814,8 +858,12 @@ bool safe_object_alive(Object object) {
 		// name those. Saying it earlier mislabels methods that are still being
 		// indexed, which then appear to fix themselves.
 		if (function && managed_caller_index().complete)
-			return module_location(address) + " (native runtime code)";
-		return module_location(address);
+			return ManagedMethodLocation{.display = module_location(address) + " (native runtime code)"};
+		return ManagedMethodLocation{.display = module_location(address)};
+	}
+
+	std::string managed_caller_location(std::uintptr_t address) {
+		return managed_caller_method(address).display;
 	}
 
 } // namespace Explorer

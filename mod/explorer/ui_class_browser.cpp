@@ -15,8 +15,10 @@
 #include <cstdio>
 #include <cstring>
 #include <functional>
+#include <iterator>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 namespace Explorer::UI {
@@ -38,11 +40,21 @@ struct ClassBrowserUiState {
     const ClassBrowserCatalog *cached_catalog = nullptr;
     std::string cached_filter_key;
     std::vector<std::size_t> matching_indices;
+    MethodTracer::CallerMethod pending_caller_method;
+    std::string focused_method;
+    bool force_method_tab = false;
 };
 
 ClassBrowserUiState &class_browser_ui_state() {
     static ClassBrowserUiState state;
     return state;
+}
+
+bool same_browser_class(const BrowserClassInfo &left, const BrowserClassInfo &right) {
+    if (left.metadata_address != 0 && right.metadata_address != 0)
+        return left.metadata_address == right.metadata_address;
+    return left.image == right.image && left.namespc == right.namespc &&
+           left.class_name == right.class_name;
 }
 
 
@@ -71,6 +83,19 @@ void render_class_member_watch(const Snapshot &snapshot, std::size_t member_inde
 
 } // namespace
 
+bool &class_browser_window_requested() {
+    static bool requested = false;
+    return requested;
+}
+
+void inspect_class_browser_method(const MethodTracer::CallerMethod &method) {
+    if (!method.inspectable())
+        return;
+    ClassBrowserUiState &state = class_browser_ui_state();
+    state.pending_caller_method = method;
+    class_browser_window_requested() = true;
+}
+
 // The shell needs to know when an Object Inspector tab belongs to the browser.
 std::uint64_t class_browser_target_token() {
     return class_browser_ui_state().target_token;
@@ -91,6 +116,67 @@ void render_class_browser(const Snapshot &snapshot) {
     }
 
     const ClassBrowserCatalog &catalog = *snapshot.class_browser_catalog;
+    if (state.pending_caller_method.inspectable()) {
+        const MethodTracer::CallerMethod requested = state.pending_caller_method;
+        const auto same_type = [&requested](const BrowserClassInfo &entry) {
+            return entry.namespc == requested.namespc && entry.class_name == requested.class_name;
+        };
+        auto selected = std::find_if(catalog.classes.begin(), catalog.classes.end(),
+                                     [&requested](const BrowserClassInfo &entry) {
+                                         return requested.class_address != 0 &&
+                                                entry.metadata_address == requested.class_address;
+                                     });
+        if (selected == catalog.classes.end())
+            selected = std::find_if(catalog.classes.begin(), catalog.classes.end(),
+                                    [&requested, &same_type](const BrowserClassInfo &entry) {
+                                        return same_type(entry) && entry.image == requested.image;
+                                    });
+        // Some backends expose an assembly display name while the catalog has
+        // the image filename. The managed namespace/name pair is still exact;
+        // use it only as a fallback, and only when it identifies one type.
+        if (selected == catalog.classes.end()) {
+            const auto fallback = std::find_if(catalog.classes.begin(), catalog.classes.end(), same_type);
+            if (fallback != catalog.classes.end() &&
+                std::find_if(std::next(fallback), catalog.classes.end(), same_type) == catalog.classes.end())
+                selected = fallback;
+        }
+        BrowserClassInfo target{};
+        if (selected != catalog.classes.end()) {
+            target = *selected;
+        } else {
+            // The caller index can cover more metadata than the browser's
+            // bounded catalog. Its exact class pointer still lets members be
+            // loaded without falling back to an ambiguous name lookup.
+            target.metadata_address = requested.class_address;
+            target.image = requested.image;
+            target.namespc = requested.namespc;
+            target.class_name = requested.class_name;
+            target.full_name = requested.namespc.empty()
+                ? requested.class_name : requested.namespc + "." + requested.class_name;
+            char pointer[32]{};
+            std::snprintf(pointer, sizeof(pointer), "0x%llX",
+                          static_cast<unsigned long long>(requested.class_address));
+            target.pointer_text = pointer;
+        }
+        if (target.metadata_address != 0) {
+            state.selected = target;
+            state.target_token = 0;
+            copy_text(state.search, target.full_name);
+            copy_text(state.assembly_filter, target.image);
+            copy_text(state.member_filter, requested.method_name);
+            state.focused_method = requested.method_name;
+            state.force_method_tab = true;
+
+            Command command{};
+            command.kind = CommandKind::LoadClassBrowserMembers;
+            command.metadata_address = target.metadata_address;
+            command.image = target.image;
+            command.namespc = target.namespc;
+            command.class_name = target.class_name;
+            RuntimeModel::instance().enqueue(std::move(command));
+        }
+        state.pending_caller_method = {};
+    }
     ImGui::SetNextItemWidth(-1.0f);
     ImGui::InputTextWithHint("##class-browser-search", "Search class or namespace...", state.search.data(),
                              state.search.size());
@@ -155,8 +241,8 @@ void render_class_browser(const Snapshot &snapshot) {
     while (clipper.Step()) {
         for (int row = clipper.DisplayStart; row < clipper.DisplayEnd; ++row) {
             const BrowserClassInfo &entry = catalog.classes[state.matching_indices[static_cast<std::size_t>(row)]];
-            const bool selected = state.selected.image == entry.image && state.selected.full_name == entry.full_name;
-            const std::string label = entry.full_name + "##class-browser-" + entry.image;
+            const bool selected = same_browser_class(state.selected, entry);
+            const std::string label = entry.full_name + "##class-browser-" + entry.image + "-" + entry.pointer_text;
             if (ImGui::Selectable(label.c_str(), selected)) {
                 if (!selected)
                     state.target_token = 0;
@@ -220,6 +306,7 @@ void render_class_browser(const Snapshot &snapshot) {
     if (ImGui::SmallButton(state.selected.is_static ? "View static state" : "View static fields")) {
         Command command{};
         command.kind = CommandKind::LoadClassBrowserStaticState;
+        command.metadata_address = state.selected.metadata_address;
         command.image = state.selected.image;
         command.namespc = state.selected.namespc;
         command.class_name = state.selected.class_name;
@@ -229,6 +316,7 @@ void render_class_browser(const Snapshot &snapshot) {
     if (ImGui::SmallButton("View members")) {
         Command command{};
         command.kind = CommandKind::LoadClassBrowserMembers;
+        command.metadata_address = state.selected.metadata_address;
         command.image = state.selected.image;
         command.namespc = state.selected.namespc;
         command.class_name = state.selected.class_name;
@@ -247,6 +335,7 @@ void render_class_browser(const Snapshot &snapshot) {
         state.target_token = 0;
         Command command{};
         command.kind = CommandKind::FindClassInstances;
+        command.metadata_address = state.selected.metadata_address;
         command.image = state.selected.image;
         command.namespc = state.selected.namespc;
         command.class_name = state.selected.class_name;
@@ -256,8 +345,7 @@ void render_class_browser(const Snapshot &snapshot) {
         RuntimeModel::instance().enqueue(std::move(command));
     }
 
-    if (snapshot.class_browser_members_query.full_name == state.selected.full_name &&
-        snapshot.class_browser_members_query.image == state.selected.image && snapshot.class_browser_members) {
+    if (same_browser_class(snapshot.class_browser_members_query, state.selected) && snapshot.class_browser_members) {
         const ComponentInfo::Metadata &members = *snapshot.class_browser_members;
         const CodeContext class_code = code_context(state.selected.image, state.selected.namespc,
                                                     state.selected.class_name, state.selected.full_name);
@@ -315,7 +403,9 @@ void render_class_browser(const Snapshot &snapshot) {
             ImGui::EndTabItem();
         }
         std::snprintf(class_tab_label, sizeof(class_tab_label), "Methods (%zu)###cmethods", members.methods.size());
-        if (Unity::begin_member_tab(class_tab_label, Unity::Skin::action_amber)) {
+        const ImGuiTabItemFlags method_tab_flags =
+            state.force_method_tab ? ImGuiTabItemFlags_SetSelected : ImGuiTabItemFlags_None;
+        if (Unity::begin_member_tab(class_tab_label, Unity::Skin::action_amber, method_tab_flags)) {
             for (std::size_t method_index = 0; method_index < members.methods.size(); ++method_index) {
                 const ComponentInfo::Method &method = members.methods[method_index];
                 if (!method_matches_filter(method, member_filter))
@@ -331,7 +421,15 @@ void render_class_browser(const Snapshot &snapshot) {
                 }
                 const std::string signature = (method.is_static ? "static " : "") + method.name + "(" +
                                               parameters + ") : " + method.return_type;
+                const bool focus_method = !state.focused_method.empty() && method.name == state.focused_method;
+                if (focus_method)
+                    ImGui::SetNextItemOpen(true, ImGuiCond_Always);
                 const bool method_open = ImGui::TreeNode("##class-method", "%s", signature.c_str());
+                if (focus_method) {
+                    ImGui::SetScrollHereY(0.5f);
+                    state.focused_method.clear();
+                    state.force_method_tab = false;
+                }
                 render_method_context_menu(method, class_code);
                 const MethodTracer::Snapshot *row_trace = trace_for_method(snapshot.method_traces, method);
                 const bool row_tracing = row_trace && row_trace->active;
@@ -339,6 +437,7 @@ void render_class_browser(const Snapshot &snapshot) {
                 if (ImGui::SmallButton(row_tracing ? "Stop tracing" : "Trace")) {
                     Command command{};
                     command.kind = CommandKind::SetMethodTrace;
+                    command.metadata_address = state.selected.metadata_address;
                     command.member_index = static_cast<int>(method_index);
                     command.class_browser_target = true;
                     command.image = state.selected.image;
@@ -382,6 +481,7 @@ void render_class_browser(const Snapshot &snapshot) {
                     if (ImGui::SmallButton(constructor ? "Create instance" : "Execute")) {
                         Command command{};
                         command.kind = constructor ? CommandKind::CreateClassInstance : CommandKind::InvokeMethod;
+                        command.metadata_address = state.selected.metadata_address;
                         command.member_index = static_cast<int>(method_index);
                         command.class_browser_target = true;
                         command.reference_token = state.target_token;
@@ -419,8 +519,7 @@ void render_class_browser(const Snapshot &snapshot) {
         ImGui::EndChild();
     }
 
-    if (snapshot.class_browser_static_query.full_name == state.selected.full_name &&
-        snapshot.class_browser_static_query.image == state.selected.image) {
+    if (same_browser_class(snapshot.class_browser_static_query, state.selected)) {
         ImGui::SeparatorText("Static State");
         ImGui::TextDisabled("%zu static field/property member(s)", snapshot.class_browser_static_fields.size());
         ImGui::BeginChild("##class-browser-static-fields", ImVec2(0.0f, 145.0f), true);
@@ -483,6 +582,7 @@ void render_class_browser(const Snapshot &snapshot) {
                     command.int_value = field.is_property ? 1 : 0;
                     command.text = buffer.text.data();
                     command.bool_value = buffer.bool_value;
+                    command.metadata_address = state.selected.metadata_address;
                     command.image = state.selected.image;
                     command.namespc = state.selected.namespc;
                     command.class_name = state.selected.class_name;
@@ -497,8 +597,7 @@ void render_class_browser(const Snapshot &snapshot) {
         ImGui::EndChild();
     }
 
-    if (snapshot.class_browser_query.full_name == state.selected.full_name &&
-        snapshot.class_browser_query.image == state.selected.image) {
+    if (same_browser_class(snapshot.class_browser_query, state.selected)) {
         ImGui::SeparatorText("Instances");
         ImGui::TextDisabled("%zu result(s) | %zu reachable objects | %zu scene roots | %zu static roots%s",
                             snapshot.class_browser_instances.size(), snapshot.class_browser_scanned_objects,

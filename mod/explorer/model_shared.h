@@ -173,7 +173,22 @@ void remember_managed_method(const URK::Unity::Inspect::MethodInfo& method);
 // method, and unlike Inspect::methods_from_class() it never drops a method
 // whose parameter or return types cannot be described. Returns how many
 // methods it recorded.
-std::size_t remember_managed_class_methods(const URK::managed::Class* klass);
+std::size_t remember_managed_class_methods(const URK::managed::Class* klass, std::string_view image = {});
+
+struct ManagedMethodLocation {
+	std::uintptr_t class_address = 0;
+	std::string display;
+	std::string image;
+	std::string namespc;
+	std::string class_name;
+	std::string method_name;
+
+	bool inspectable() const {
+		return class_address != 0 && !class_name.empty() && !method_name.empty();
+	}
+};
+
+ManagedMethodLocation managed_caller_method(std::uintptr_t address);
 std::string managed_caller_location(std::uintptr_t address);
 // Marks the caller index as covering every assembly, which is what lets an
 // address with no entry be reported as native rather than as not yet indexed.
@@ -181,6 +196,7 @@ void mark_caller_index_complete();
 // Names an address whose enclosing method is already known, instead of guessing
 // from the nearest indexed entry below it.
 std::string managed_method_location(std::uintptr_t function_start, std::uintptr_t address);
+ManagedMethodLocation managed_method_details(std::uintptr_t function_start, std::uintptr_t address);
 
 // Isolate broken managed references from the host callback.
 //

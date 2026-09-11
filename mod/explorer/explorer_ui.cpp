@@ -311,6 +311,10 @@ void render() {
         show_object_inspector = true;
         object_inspector_window_requested() = false;
     }
+    if (class_browser_window_requested()) {
+        show_class_browser = true;
+        class_browser_window_requested() = false;
+    }
     previous_object_token = snapshot->object_inspector.valid ? snapshot->object_inspector.token : 0;
     if (snapshot->method_traces.size() > previous_trace_count)
         show_method_traces = true;

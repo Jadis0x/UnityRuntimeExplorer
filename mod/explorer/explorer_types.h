@@ -160,6 +160,7 @@ struct ComponentClassCatalog {
 };
 
 struct BrowserClassInfo {
+    std::uintptr_t metadata_address = 0;
     std::string image;
     std::string namespc;
     std::string class_name;

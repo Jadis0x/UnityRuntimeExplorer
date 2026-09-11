@@ -1325,9 +1325,16 @@ namespace Explorer {
                                                [&record](const MethodTracer::Snapshot::InlineSite& entry) {
                                                    return entry.address == record.inline_site_address;
                                                });
-                record.caller_display = record.inline_site_address != 0 && site != trace.inline_sites.end()
-                                            ? managed_method_location(site->function_start, record.caller_address)
-                                            : managed_caller_location(record.caller_address);
+                const ManagedMethodLocation caller =
+                    record.inline_site_address != 0 && site != trace.inline_sites.end()
+                        ? managed_method_details(site->function_start, record.caller_address)
+                        : managed_caller_method(record.caller_address);
+                record.caller_display = caller.display;
+                record.caller_method.class_address = caller.class_address;
+                record.caller_method.image = caller.image;
+                record.caller_method.namespc = caller.namespc;
+                record.caller_method.class_name = caller.class_name;
+                record.caller_method.method_name = caller.method_name;
                 // A bare module offset is the shape an unindexed caller takes.
                 if (record.caller_address != 0 && record.caller_display.find("+0x") != std::string::npos &&
                     record.caller_display.find(".dll+0x") != std::string::npos)

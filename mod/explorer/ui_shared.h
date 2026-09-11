@@ -19,6 +19,10 @@ bool contains_case_insensitive(std::string_view text, std::string_view filter);
 // Object Inspector tab state. Defined in explorer_ui.cpp, which owns the strip.
 void request_object_reference_tab(std::uint64_t token);
 bool &object_inspector_window_requested();
+bool &class_browser_window_requested();
+
+// Opens the Class Browser at the managed method containing a trace call site.
+void inspect_class_browser_method(const MethodTracer::CallerMethod &method);
 
 void enqueue_reference_inspection(std::uint64_t token, bool request_object_tab = true);
 void enqueue_raw_reference_inspection(std::uint64_t address);
