@@ -1331,9 +1331,11 @@ namespace Explorer {
                         : managed_caller_method(record.caller_address);
                 record.caller_display = caller.display;
                 record.caller_method.class_address = caller.class_address;
+                record.caller_method.method_address = caller.method_address;
                 record.caller_method.image = caller.image;
                 record.caller_method.namespc = caller.namespc;
                 record.caller_method.class_name = caller.class_name;
+                record.caller_method.class_display_name = caller.class_display_name;
                 record.caller_method.method_name = caller.method_name;
                 // A bare module offset is the shape an unindexed caller takes.
                 if (record.caller_address != 0 && record.caller_display.find("+0x") != std::string::npos &&

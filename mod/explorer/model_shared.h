@@ -175,16 +175,23 @@ void remember_managed_method(const URK::Unity::Inspect::MethodInfo& method);
 // methods it recorded.
 std::size_t remember_managed_class_methods(const URK::managed::Class* klass, std::string_view image = {});
 
+// Display identity including declaring/nested types (Outer+Nested). Runtime
+// lookup still uses the raw namespace/name pair and exact metadata address.
+std::string managed_class_display_name(const URK::managed::Class* klass);
+std::string managed_declaring_class_display_name(const URK::managed::Class* klass);
+
 struct ManagedMethodLocation {
 	std::uintptr_t class_address = 0;
+	std::uintptr_t method_address = 0;
 	std::string display;
 	std::string image;
 	std::string namespc;
 	std::string class_name;
+	std::string class_display_name;
 	std::string method_name;
 
 	bool inspectable() const {
-		return class_address != 0 && !class_name.empty() && !method_name.empty();
+		return class_address != 0 && method_address != 0 && !class_name.empty() && !method_name.empty();
 	}
 };
 

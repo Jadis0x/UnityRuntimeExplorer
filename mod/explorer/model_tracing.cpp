@@ -55,6 +55,10 @@ namespace Explorer {
 				set_status("Method trace is no longer active");
 			return;
 		}
+		if (!method.signature_complete) {
+			set_status("Method tracing blocked: the runtime exposed incomplete signature metadata");
+			return;
+		}
 		std::string error;
 		remember_managed_method(method);
 		if (!MethodTracer::start(method, command.capture_return, nullptr, true, error)) {

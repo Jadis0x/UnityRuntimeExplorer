@@ -234,6 +234,10 @@ PreparedValue prepare_value(std::string_view name, std::string_view type_name,
 Result invoke(URK::Unity::Object target, const URK::Unity::Inspect::MethodInfo& method,
               const nlohmann::json& arguments, const ReferenceResolver& resolve_reference) {
     Result result{};
+    if (!method.signature_complete) {
+        result.error = "The runtime exposed incomplete method signature metadata; invocation is unsafe.";
+        return result;
+    }
     if (!arguments.is_array() || arguments.size() != method.parameters.size()) {
         result.error = "Argument count does not match the method signature.";
         return result;

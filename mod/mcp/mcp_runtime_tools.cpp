@@ -556,6 +556,7 @@ Response RuntimeTools::execute(RuntimeModel& model, const Request& request) {
                 reference.image = type.image;
                 reference.namespc = type.namespc;
                 reference.class_name = type.class_name;
+                reference.metadata_address = type.metadata_address;
                 const std::string token = issue_reference(model, std::move(reference));
                 if (!token.empty())
                     types.push_back({{"type_reference", token}, {"full_name", type.full_name},
@@ -1035,9 +1036,11 @@ Response RuntimeTools::execute(RuntimeModel& model, const Request& request) {
         const auto type = std::find_if(model.class_browser_catalog_->classes.begin(),
                                        model.class_browser_catalog_->classes.end(),
             [&](const BrowserClassInfo& candidate) {
-                return candidate.image == type_reference->image &&
-                    candidate.namespc == type_reference->namespc &&
-                    candidate.class_name == type_reference->class_name;
+                return type_reference->metadata_address != 0
+                    ? candidate.metadata_address == type_reference->metadata_address
+                    : candidate.image == type_reference->image &&
+                        candidate.namespc == type_reference->namespc &&
+                        candidate.class_name == type_reference->class_name;
             });
         if (type == model.class_browser_catalog_->classes.end())
             return fail("type_unavailable", "The referenced managed type is no longer loaded.");
@@ -1045,6 +1048,7 @@ Response RuntimeTools::execute(RuntimeModel& model, const Request& request) {
         command.image = type->image;
         command.namespc = type->namespc;
         command.class_name = type->class_name;
+        command.metadata_address = type->metadata_address;
         command.int_value = type->is_component ? 1 : 0;
         command.class_is_unity_object = type->is_unity_object;
         command.bool_value = request.arguments.value("include_all_loaded", true);
@@ -1190,6 +1194,7 @@ Response RuntimeTools::execute(RuntimeModel& model, const Request& request) {
             reference.image = type.image;
             reference.namespc = type.namespc;
             reference.class_name = type.class_name;
+            reference.metadata_address = type.metadata_address;
             const std::string token = issue_reference(model, std::move(reference));
             if (token.empty())
                 return fail("reference_unavailable", "A secure type reference could not be generated.");
@@ -1229,6 +1234,7 @@ Response RuntimeTools::execute(RuntimeModel& model, const Request& request) {
                 continue;
             ++scanned_types;
             Command load{.kind = CommandKind::LoadClassBrowserMembers};
+            load.metadata_address = type.metadata_address;
             load.image = type.image;
             load.namespc = type.namespc;
             load.class_name = type.class_name;
@@ -1240,6 +1246,7 @@ Response RuntimeTools::execute(RuntimeModel& model, const Request& request) {
                     reference.image = type.image;
                     reference.namespc = type.namespc;
                     reference.class_name = type.class_name;
+                    reference.metadata_address = type.metadata_address;
                     type_token = issue_reference(model, std::move(reference));
                 }
                 return type_token;
@@ -1278,11 +1285,13 @@ Response RuntimeTools::execute(RuntimeModel& model, const Request& request) {
                     method_reference.namespc = type.namespc;
                     method_reference.class_name = type.class_name;
                     method_reference.member_index = static_cast<int>(index);
+                    method_reference.metadata_address = type.metadata_address;
                     const std::string method_token = issue_reference(model, std::move(method_reference));
                     matches.push_back({{"kind", "method"}, {"name", method.name}, {"return_type", method.return_type},
                                        {"declaring_type", method.declaring_type.full_name},
                                        {"type_reference", ensure_type_token()}, {"method_reference", method_token},
-                                       {"static", method.is_static}, {"parameter_count", method.parameters.size()}});
+                                       {"static", method.is_static}, {"parameter_count", method.parameters.size()},
+                                       {"signature_complete", method.signature_complete}});
                 }
             }
         }
@@ -1307,6 +1316,7 @@ Response RuntimeTools::execute(RuntimeModel& model, const Request& request) {
         if (!limit)
             return fail("invalid_arguments", "member_limit must be an integer between 1 and 250.");
         Command command{.kind = CommandKind::LoadClassBrowserMembers};
+        command.metadata_address = resolved_type.metadata_address;
         command.image = resolved_type.image;
         command.namespc = resolved_type.namespc;
         command.class_name = resolved_type.class_name;
@@ -1356,6 +1366,7 @@ Response RuntimeTools::execute(RuntimeModel& model, const Request& request) {
                 method_reference.namespc = resolved_type.namespc;
                 method_reference.class_name = resolved_type.class_name;
                 method_reference.member_index = static_cast<int>(index);
+                method_reference.metadata_address = resolved_type.metadata_address;
                 const std::string method_token = issue_reference(model, std::move(method_reference));
                 if (method_token.empty())
                     return fail("reference_unavailable", "A secure method reference could not be generated.");
@@ -1363,7 +1374,8 @@ Response RuntimeTools::execute(RuntimeModel& model, const Request& request) {
                                    {"signature", signature}, {"declaring_type", method.declaring_type},
                                    {"return_type", method.return_type}, {"parameter_types", method.parameter_types},
                                    {"parameter_names", method.parameter_names}, {"static", method.is_static},
-                                   {"trace_candidate", true},
+                                   {"signature_complete", method.signature_complete},
+                                   {"trace_candidate", method.signature_complete},
                                    {"invocation_supported_in_ui", method.runtime_callable},
                                    {"capability_reason", method.capability_reason}});
             }
@@ -1387,6 +1399,7 @@ Response RuntimeTools::execute(RuntimeModel& model, const Request& request) {
         if (!method_reference)
             return fail("invalid_reference", "The method reference is invalid or expired.");
         Command load{.kind = CommandKind::LoadClassBrowserMembers};
+        load.metadata_address = method_reference->metadata_address;
         load.image = method_reference->image;
         load.namespc = method_reference->namespc;
         load.class_name = method_reference->class_name;
@@ -1587,6 +1600,7 @@ Response RuntimeTools::execute(RuntimeModel& model, const Request& request) {
         if (!reference)
             return fail("invalid_reference", "The method reference is invalid or expired.");
         Command load{.kind = CommandKind::LoadClassBrowserMembers};
+        load.metadata_address = reference->metadata_address;
         load.image = reference->image;
         load.namespc = reference->namespc;
         load.class_name = reference->class_name;
@@ -1597,6 +1611,7 @@ Response RuntimeTools::execute(RuntimeModel& model, const Request& request) {
         const ComponentInfo::Method method = model.working_.class_browser_members->methods[reference->member_index];
         Command trace{.kind = CommandKind::SetMethodTrace};
         trace.member_index = reference->member_index;
+        trace.metadata_address = reference->metadata_address;
         trace.bool_value = true;
         trace.class_browser_target = true;
         trace.image = reference->image;

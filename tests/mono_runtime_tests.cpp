@@ -24,6 +24,7 @@ const auto image_handle = reinterpret_cast<const void*>(0x2000);
 const auto first_image_class = reinterpret_cast<const void*>(0x3000);
 const auto second_image_class = reinterpret_cast<const void*>(0x4000);
 const auto string_handle = reinterpret_cast<void*>(0x5000);
+const auto incomplete_method_handle = reinterpret_cast<const void*>(0x6000);
 
 std::uint32_t observed_class_token = 0;
 char observed_string[64]{};
@@ -65,6 +66,21 @@ const char* last_error() {
     return nullptr;
 }
 
+const char* method_get_name(const void* method) {
+    return method == incomplete_method_handle ? "<SetupOutfit>b__0" : nullptr;
+}
+
+const void* method_get_return_type(const void*) {
+    // Models stripped or otherwise unreadable generated signature metadata.
+    return nullptr;
+}
+
+std::uint32_t method_get_flags(const void*, std::uint32_t* implementation_flags) {
+    if (implementation_flags)
+        *implementation_flags = 0;
+    return 0;
+}
+
 bool require(bool condition, const char* message) {
     if (condition)
         return true;
@@ -85,6 +101,9 @@ int main() {
     mono.image_get_class = &image_get_class;
     mono.new_string = &new_string;
     mono.last_error = &last_error;
+    mono.method_get_name = &method_get_name;
+    mono.method_get_return_type = &method_get_return_type;
+    mono.method_get_flags = &method_get_flags;
 
     URK_ModContext context{};
     context.version = URK_SDK_MIN_COMPAT_VERSION;
@@ -122,6 +141,24 @@ int main() {
                   "string_new_len must fall back to the v7 new_string entry");
     ok &= require(std::strcmp(observed_string, "mono") == 0,
                   "v7 string fallback changed the UTF-8 payload");
+
+    URK::Unity::Inspect::TypeInfo generated_declaring{};
+    generated_declaring.handle = class_handle;
+    generated_declaring.namespc = "Example";
+    generated_declaring.name = "<>c__DisplayClass1_0";
+    generated_declaring.full_name = "Example.<>c__DisplayClass1_0";
+    const auto strict_method = URK::Unity::Inspect::method_info(
+        static_cast<const URK::managed::Method*>(incomplete_method_handle), generated_declaring);
+    ok &= require(strict_method.handle == nullptr,
+                  "strict method metadata reads must still reject incomplete signatures");
+    const auto navigable_method = URK::Unity::Inspect::method_info(
+        static_cast<const URK::managed::Method*>(incomplete_method_handle), generated_declaring, true);
+    ok &= require(navigable_method.handle == incomplete_method_handle,
+                  "generated methods must remain navigable when their signature is incomplete");
+    ok &= require(!navigable_method.signature_complete,
+                  "an unreadable generated return type must be marked metadata-only");
+    ok &= require(navigable_method.return_type == "<unknown>",
+                  "metadata-only methods need a stable unknown return-type label");
 
     URK::Unity::Inspect::MethodParamInfo boolean_parameter{};
     boolean_parameter.type = reinterpret_cast<const void*>(0x6000);

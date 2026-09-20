@@ -174,10 +174,13 @@ namespace Explorer {
 				entry.image = image_name;
 				entry.namespc = type.namespc;
 				entry.class_name = type.name;
-				entry.full_name = type.full_name.empty() ? type.name : type.full_name;
+				entry.full_name = managed_class_display_name(klass);
+				if (entry.full_name.empty())
+					entry.full_name = type.full_name.empty() ? type.name : type.full_name;
+				entry.declaring_type_name = managed_declaring_class_display_name(klass);
 				entry.pointer_text = pointer_text(const_cast<URK::managed::Class*>(klass));
 				const std::uint32_t flags = URK::managed::class_get_flags(klass);
-				entry.parent_name = Inspect::DescribeClass(URK::managed::class_get_parent(klass)).full_name;
+				entry.parent_name = managed_class_display_name(URK::managed::class_get_parent(klass));
 				entry.is_interface = (flags & kTypeAttributeInterface) != 0;
 				entry.is_abstract = (flags & kTypeAttributeAbstract) != 0;
 				entry.is_static = entry.is_abstract && (flags & kTypeAttributeSealed) != 0;
@@ -193,9 +196,9 @@ namespace Explorer {
 					URK::managed::class_get_interfaces(klass, &interface_iterator)) {
 					if (++interface_count > 4096 || !visited_interfaces.insert(interface_type).second)
 						break;
-					const Inspect::TypeInfo interface_info = Inspect::DescribeClass(interface_type);
-					if (!interface_info.full_name.empty())
-						entry.interfaces.push_back(interface_info.full_name);
+					const std::string interface_name = managed_class_display_name(interface_type);
+					if (!interface_name.empty())
+						entry.interfaces.push_back(interface_name);
 				}
 				const std::string key = entry.image + "\n" + entry.full_name + "\n" + entry.pointer_text;
 				if (!seen.insert(key).second)
@@ -541,6 +544,8 @@ namespace Explorer {
 			set_status("Selected type could no longer be resolved");
 			return;
 		}
+		working_.class_browser_static_query.full_name = managed_class_display_name(klass);
+		working_.class_browser_static_query.declaring_type_name = managed_declaring_class_display_name(klass);
 		const std::vector<Inspect::FieldInfo> fields = Inspect::fields_from_class(klass, true);
 		for (std::size_t index = 0; index < fields.size(); ++index) {
 			const Inspect::FieldInfo& field = fields[index];
@@ -551,7 +556,8 @@ namespace Explorer {
 			result.member_index = index;
 			result.name = field.name;
 			result.type_name = field.type_name;
-			result.declaring_type = field.declaring_type.full_name;
+			result.declaring_type = managed_class_display_name(
+				static_cast<const URK::managed::Class*>(field.declaring_type.handle));
 			result.display = value.display.empty() ? "<unavailable>" : value.display;
 			result.value = value;
 			result.readable = value.readable;
@@ -579,7 +585,8 @@ namespace Explorer {
 			result.member_index = index;
 			result.name = property.name;
 			result.type_name = property.type_name;
-			result.declaring_type = property.declaring_type.full_name;
+			result.declaring_type = managed_class_display_name(
+				static_cast<const URK::managed::Class*>(property.declaring_type.handle));
 			result.display = property.can_read
 				? (value.display.empty() ? "<unavailable>" : value.display)
 				: "<write-only>";
@@ -698,6 +705,10 @@ namespace Explorer {
 			set_status("Create instance failed: selected member is not an instance constructor");
 			return;
 		}
+		if (!constructor.signature_complete) {
+			set_status("Create instance failed: the runtime exposed incomplete constructor signature metadata");
+			return;
+		}
 		if (command.method_arguments.size() != constructor.parameters.size()) {
 			set_status("Create instance failed: argument count does not match the constructor");
 			return;
@@ -813,45 +824,56 @@ namespace Explorer {
 			set_status("Selected type could no longer be resolved");
 			return;
 		}
+		working_.class_browser_members_query.full_name = managed_class_display_name(klass);
+		working_.class_browser_members_query.declaring_type_name = managed_declaring_class_display_name(klass);
 		auto members = std::make_shared<ComponentInfo::Metadata>();
 		for (const Inspect::FieldInfo& field : Inspect::fields_from_class(klass, true)) {
 			class_browser_reflection_.fields.push_back(field);
 			ComponentInfo::Field member = field_metadata(field);
+			member.declaring_type = managed_class_display_name(
+				static_cast<const URK::managed::Class*>(field.declaring_type.handle));
 			member.pointer_text = pointer_text(const_cast<void*>(field.handle));
 			members->fields.push_back(std::move(member));
 		}
 		for (const Inspect::PropertyInfo& property : Inspect::properties_from_class(klass, true)) {
 			class_browser_reflection_.properties.push_back(property);
-			members->properties.push_back({ property.name, property.type_name, property.declaring_type.full_name,
+			members->properties.push_back({ property.name, property.type_name,
+									 managed_class_display_name(static_cast<const URK::managed::Class*>(property.declaring_type.handle)),
 									 property.can_read, property.can_write,
 									 pointer_text(const_cast<void*>(property.handle)), property.is_value_type, property.is_enum,
 									 !property.type_is_opaque,
 									 property.type_is_opaque ? "Runtime-specific type; metadata only." : "" });
 		}
-		for (const Inspect::MethodInfo& method : Inspect::methods_from_class(klass, true)) {
+		for (const Inspect::MethodInfo& method : Inspect::methods_from_class(klass, true, true)) {
 			class_browser_reflection_.methods.push_back(method);
 			// Types inspected through the Class Browser or MCP contribute names to
 			// caller resolution. IL2CPP can index existing method pointers without
 			// executing game code; Mono deliberately keeps its JIT-safe behavior.
 			remember_managed_method(method);
 			ComponentInfo::Method entry{};
+			entry.metadata_address = reinterpret_cast<std::uintptr_t>(method.handle);
 			entry.name = method.name;
 			entry.return_type = method.return_type;
-			entry.declaring_type = method.declaring_type.full_name;
+			entry.declaring_type = managed_class_display_name(
+				static_cast<const URK::managed::Class*>(method.declaring_type.handle));
 			entry.is_static = method.is_static;
 			entry.pointer_text = pointer_text(const_cast<void*>(method.handle));
 			entry.return_is_value_type = method.return_is_value_type;
 			entry.return_is_enum = method.return_is_enum;
+			entry.signature_complete = method.signature_complete;
 			entry.uses_generic_parameter = method.return_type_is_generic_parameter ||
 				std::any_of(method.parameters.begin(), method.parameters.end(), [](const Inspect::MethodParamInfo& parameter) {
 					return parameter.is_generic_parameter;
 				});
-			entry.runtime_callable = (!method.return_type_is_opaque || method.return_type_is_generic_parameter) &&
+			entry.runtime_callable = method.signature_complete &&
+				(!method.return_type_is_opaque || method.return_type_is_generic_parameter) &&
 				std::none_of(method.parameters.begin(), method.parameters.end(), [](const Inspect::MethodParamInfo& parameter) {
 					return parameter.is_opaque;
 					});
 			if (!entry.runtime_callable)
-				entry.capability_reason = "Runtime-specific by-ref/internal signature; generic invocation is disabled.";
+				entry.capability_reason = !method.signature_complete
+					? "One or more signature types are unavailable; metadata navigation remains available."
+					: "Runtime-specific by-ref/internal signature; generic invocation is disabled.";
 			for (const Inspect::MethodParamInfo& parameter : method.parameters) {
 				entry.parameter_types.push_back(parameter.type_name);
 				entry.parameter_names.push_back(parameter.name);

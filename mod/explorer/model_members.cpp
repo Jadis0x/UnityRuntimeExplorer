@@ -558,6 +558,10 @@ namespace Explorer {
 			return;
 		}
 		const Inspect::MethodInfo& method = reflection->methods[command.member_index];
+		if (!method.signature_complete) {
+			set_status("Invoke " + method.name + " blocked: the runtime exposed incomplete signature metadata");
+			return;
+		}
 		const auto invocation_started = Clock::now();
 		auto publish_method_result = [&](bool succeeded, std::string display, const Inspect::ValueInfo* value = nullptr) {
 			Snapshot::MethodResult record{};

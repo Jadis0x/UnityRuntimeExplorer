@@ -45,6 +45,7 @@ class RuntimeTools {
         std::uint64_t trace_id = 0;
         std::string expected_object_name;
         std::string expected_component_type;
+        std::uintptr_t metadata_address = 0;
     };
 
     std::string issue_reference(RuntimeModel& model, Reference reference);

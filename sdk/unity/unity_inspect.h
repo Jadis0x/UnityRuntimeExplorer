@@ -164,6 +164,10 @@ struct MethodInfo {
     bool return_is_enum = false;
     bool return_type_is_generic_parameter = false;
     bool return_type_is_opaque = false;
+    // False means the method metadata is valid enough to identify and display,
+    // but at least one signature type could not be decoded safely. Callers may
+    // expose it for navigation while keeping invocation/tracing disabled.
+    bool signature_complete = false;
 };
 struct PropertyInfo {
     const void* handle = nullptr;
@@ -630,8 +634,11 @@ inline std::vector<FieldInfo> Fields(Object object, bool includeInherited = true
 inline std::vector<FieldInfo> Fields(const ObjectRefInfo& object, bool includeInherited = true) {
     return object.handle ? Fields(Object{object.handle}, includeInherited) : std::vector<FieldInfo>{};
 }
-inline MethodInfo method_info(const URK::managed::Method* method, TypeInfo declaring) {
+inline MethodInfo method_info(const URK::managed::Method* method, TypeInfo declaring,
+                              bool allow_incomplete = false) {
     MethodInfo info{};
+    if (!method)
+        return info;
     info.handle = method;
     info.declaring_type = std::move(declaring);
     const char* name = URK::managed::method_get_name(method);
@@ -641,7 +648,7 @@ inline MethodInfo method_info(const URK::managed::Method* method, TypeInfo decla
     info.is_abstract = (info.flags & kAbstractMethodFlag) != 0;
     info.return_type_handle = URK::managed::method_get_return_type(method);
     const MemberTypeInfo return_type_info = describe_member_type(info.return_type_handle);
-    info.return_type = return_type_info.name;
+    info.return_type = return_type_info.name.empty() ? "<unknown>" : return_type_info.name;
     info.return_is_value_type = return_type_info.is_value_type;
     info.return_is_enum = return_type_info.is_enum;
     info.return_type_is_generic_parameter = return_type_info.is_generic_parameter;
@@ -651,25 +658,31 @@ inline MethodInfo method_info(const URK::managed::Method* method, TypeInfo decla
         detail::set_error("Unity Inspect::Methods rejected an excessive parameter count");
         return {};
     }
-    if (!info.return_type_handle)
+    bool signature_complete = info.return_type_handle && return_type_info.readable;
+    if (!signature_complete && !allow_incomplete)
         return {};
     info.parameters.reserve(count);
     for (std::uint32_t i = 0; i < count; ++i) {
         const void* paramType = URK::managed::method_get_param(method, i);
-        if (!paramType)
-            return {};
         const char* paramName = URK::managed::method_get_param_name(method, i);
         const MemberTypeInfo parameter_type_info = describe_member_type(paramType);
-        if (!parameter_type_info.readable)
-            return {};
-        info.parameters.push_back(MethodParamInfo{paramType, metadata_display_name(paramName), parameter_type_info.name,
+        if (!paramType || !parameter_type_info.readable) {
+            signature_complete = false;
+            if (!allow_incomplete)
+                return {};
+        }
+        const std::string parameter_name = metadata_display_name(paramName);
+        info.parameters.push_back(MethodParamInfo{paramType, parameter_name,
+                                                  parameter_type_info.name.empty() ? "<unknown>" : parameter_type_info.name,
                                                   parameter_type_info.is_value_type, parameter_type_info.is_enum,
                                                   parameter_type_info.is_by_ref, parameter_type_info.is_generic_parameter,
-                                                  parameter_type_info.is_opaque});
+                                                  !paramType || !parameter_type_info.readable || parameter_type_info.is_opaque});
     }
+    info.signature_complete = signature_complete;
     return info;
 }
-inline std::vector<MethodInfo> methods_from_class(const URK::managed::Class* klass, bool includeInherited) {
+inline std::vector<MethodInfo> methods_from_class(const URK::managed::Class* klass, bool includeInherited,
+                                                  bool include_incomplete = false) {
     std::vector<MethodInfo> out;
     std::unordered_set<const void*> visited;
     std::size_t depth = 0;
@@ -692,7 +705,7 @@ inline std::vector<MethodInfo> methods_from_class(const URK::managed::Class* kla
                 detail::set_error("Unity Inspect::Methods rejected an excessive member count");
                 return out;
             }
-            MethodInfo info = method_info(method, declaring);
+            MethodInfo info = method_info(method, declaring, include_incomplete);
             if (info.handle)
                 out.push_back(std::move(info));
         }

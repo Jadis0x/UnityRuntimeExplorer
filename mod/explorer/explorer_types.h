@@ -107,6 +107,7 @@ struct ComponentInfo {
         std::string capability_reason;
     };
     struct Method {
+        std::uintptr_t metadata_address = 0;
         std::string name;
         std::string return_type;
         std::string declaring_type;
@@ -119,6 +120,7 @@ struct ComponentInfo {
         bool return_is_value_type = false;
         bool return_is_enum = false;
         bool uses_generic_parameter = false;
+        bool signature_complete = true;
         bool runtime_callable = true;
         std::string capability_reason;
     };
@@ -165,6 +167,7 @@ struct BrowserClassInfo {
     std::string namespc;
     std::string class_name;
     std::string full_name;
+    std::string declaring_type_name;
     std::string pointer_text;
     std::string parent_name;
     std::vector<std::string> interfaces;

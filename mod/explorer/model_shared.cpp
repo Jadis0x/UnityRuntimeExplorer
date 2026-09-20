@@ -15,6 +15,7 @@
 #include <cstring>
 #include <limits>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 using namespace URK::Unity;
@@ -47,10 +48,12 @@ namespace Explorer {
 
 		struct IndexedManagedMethod {
 			std::uintptr_t class_address = 0;
+			std::uintptr_t method_address = 0;
 			std::string display;
 			std::string image;
 			std::string namespc;
 			std::string class_name;
+			std::string class_display_name;
 			std::string method_name;
 		};
 
@@ -106,6 +109,58 @@ namespace Explorer {
 		if (VirtualQuery(reinterpret_cast<const void*>(address), &memory, sizeof(memory)) != sizeof(memory))
 			return false;
 		return memory.State == MEM_COMMIT && (memory.Protect & (PAGE_NOACCESS | PAGE_GUARD)) == 0;
+	}
+
+	namespace {
+		const URK::managed::Class* managed_declaring_class(const URK::managed::Class* klass) {
+#if defined(URK_BACKEND_MONO)
+			(void)klass;
+			return nullptr;
+#elif defined(_WIN32)
+			__try {
+				return static_cast<const URK::managed::Class*>(URK::managed::class_get_declaring_type(klass));
+			}
+			__except (capture_native_fault(_exception_info())) {
+				return nullptr;
+			}
+#else
+			return static_cast<const URK::managed::Class*>(URK::managed::class_get_declaring_type(klass));
+#endif
+		}
+	} // namespace
+
+	std::string managed_class_display_name(const URK::managed::Class* klass) {
+		if (!klass)
+			return {};
+		std::vector<Inspect::TypeInfo> chain;
+		std::unordered_set<const URK::managed::Class*> visited;
+		for (const URK::managed::Class* current = klass;
+			 current && chain.size() < Inspect::kMaxMetadataInheritanceDepth && visited.insert(current).second;
+			 current = managed_declaring_class(current)) {
+			Inspect::TypeInfo type = Inspect::DescribeClass(current);
+			if (type.name.empty())
+				break;
+			chain.push_back(std::move(type));
+		}
+		if (chain.empty())
+			return {};
+		std::reverse(chain.begin(), chain.end());
+		std::string display;
+		for (const Inspect::TypeInfo& type : chain) {
+			if (display.empty() && !type.namespc.empty()) {
+				display = type.namespc;
+				display.push_back('.');
+			}
+			else if (!display.empty() && display.back() != '.') {
+				display.push_back('+');
+			}
+			display += type.name;
+		}
+		return display;
+	}
+
+	std::string managed_declaring_class_display_name(const URK::managed::Class* klass) {
+		return managed_class_display_name(managed_declaring_class(klass));
 	}
 
 	const URK::Unity::Inspect::FieldInfo *backing_field_for(
@@ -544,7 +599,7 @@ bool safe_object_alive(Object object) {
 			message.find("Map is empty") != std::string_view::npos;
 	}
 
-#if defined(_WIN32)
+#if defined(_WIN32) && !defined(URK_BACKEND_MONO)
 	namespace {
 		// Only method_pointer() dereferences a possibly-stale native handle;
 		// isolating just that call keeps this leaf function C2712-safe while
@@ -577,6 +632,7 @@ bool safe_object_alive(Object object) {
 		// Raw pointers only, so the structured handler is allowed here (C2712);
 		// the caller builds the std::string names.
 		struct RawIndexedMethod {
+			const void* metadata = nullptr;
 			const void* pointer = nullptr;
 			const char* name = nullptr;
 		};
@@ -597,6 +653,7 @@ bool safe_object_alive(Object object) {
 					const char* name = URK::managed::method_get_name(method);
 					if (!pointer || !name || !name[0])
 						continue;
+					out[count].metadata = method;
 					out[count].pointer = pointer;
 					out[count].name = name;
 					++count;
@@ -623,6 +680,7 @@ bool safe_object_alive(Object object) {
 		const Inspect::TypeInfo declaring = Inspect::DescribeClass(klass);
 		if (!declaring.handle)
 			return 0;
+		const std::string declaring_display = managed_class_display_name(klass);
 		// One buffer for the whole scan; the walk truncates rather than grows.
 		constexpr std::size_t kMethodsPerClassCeiling = 4096;
 		thread_local std::vector<RawIndexedMethod> entries(kMethodsPerClassCeiling);
@@ -639,21 +697,23 @@ bool safe_object_alive(Object object) {
 			const char* name = URK::managed::method_get_name(method);
 			if (!pointer || !name || !name[0])
 				continue;
-			entries[count] = RawIndexedMethod{ pointer, name };
+			entries[count] = RawIndexedMethod{ method, pointer, name };
 			++count;
 		}
 #endif
 		auto& index = managed_caller_index();
 		for (std::size_t entry = 0; entry < count; ++entry) {
-			const std::string display = declaring.full_name.empty()
+			const std::string display = declaring_display.empty()
 				? std::string(entries[entry].name)
-				: declaring.full_name + "." + entries[entry].name;
+				: declaring_display + "." + entries[entry].name;
 			IndexedManagedMethod indexed{};
 			indexed.class_address = reinterpret_cast<std::uintptr_t>(klass);
+			indexed.method_address = reinterpret_cast<std::uintptr_t>(entries[entry].metadata);
 			indexed.display = display;
 			indexed.image = image;
 			indexed.namespc = declaring.namespc;
 			indexed.class_name = declaring.name;
+			indexed.class_display_name = declaring_display;
 			indexed.method_name = entries[entry].name;
 			const auto [found, inserted] =
 				index.methods.emplace(reinterpret_cast<std::uintptr_t>(entries[entry].pointer), std::move(indexed));
@@ -686,17 +746,21 @@ bool safe_object_alive(Object object) {
 		if (!pointer)
 			return;
 #endif
-		const std::string display = method.declaring_type.full_name.empty()
+		const std::string declaring_display = managed_class_display_name(
+			static_cast<const URK::managed::Class*>(method.declaring_type.handle));
+		const std::string display = declaring_display.empty()
 			? method.name
-			: method.declaring_type.full_name + "." + method.name;
+			: declaring_display + "." + method.name;
 		const char* image = method.declaring_type.handle
 			? URK::managed::class_get_assemblyname(method.declaring_type.handle) : nullptr;
 		IndexedManagedMethod indexed{};
 		indexed.class_address = reinterpret_cast<std::uintptr_t>(method.declaring_type.handle);
+		indexed.method_address = reinterpret_cast<std::uintptr_t>(method.handle);
 		indexed.display = display;
 		indexed.image = image ? image : "";
 		indexed.namespc = method.declaring_type.namespc;
 		indexed.class_name = method.declaring_type.name;
+		indexed.class_display_name = declaring_display;
 		indexed.method_name = method.name;
 		auto& index = managed_caller_index();
 		const auto [found, inserted] =
@@ -740,10 +804,12 @@ bool safe_object_alive(Object object) {
 			std::uintptr_t function_start, std::uintptr_t address) {
 			ManagedMethodLocation location{};
 			location.class_address = method.class_address;
+			location.method_address = method.method_address;
 			location.display = method.display;
 			location.image = method.image;
 			location.namespc = method.namespc;
 			location.class_name = method.class_name;
+			location.class_display_name = method.class_display_name;
 			location.method_name = method.method_name;
 			if (address > function_start) {
 				char suffix[32]{};

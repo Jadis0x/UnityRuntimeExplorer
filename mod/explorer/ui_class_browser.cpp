@@ -42,6 +42,9 @@ struct ClassBrowserUiState {
     std::vector<std::size_t> matching_indices;
     MethodTracer::CallerMethod pending_caller_method;
     std::string focused_method;
+    std::uintptr_t focused_method_address = 0;
+    std::string inspected_method;
+    int active_member_tab = 0;
     bool force_method_tab = false;
 };
 
@@ -55,6 +58,40 @@ bool same_browser_class(const BrowserClassInfo &left, const BrowserClassInfo &ri
         return left.metadata_address == right.metadata_address;
     return left.image == right.image && left.namespc == right.namespc &&
            left.class_name == right.class_name;
+}
+
+std::string generated_source_member(std::string_view value) {
+    if (value.size() < 3 || value.front() != '<')
+        return {};
+    const std::size_t closing = value.find('>');
+    return closing == std::string_view::npos || closing == 1
+        ? std::string{} : std::string(value.substr(1, closing - 1));
+}
+
+void render_generated_type_context(const ClassBrowserUiState &state) {
+    const std::string_view name = state.selected.class_name;
+    const bool closure = name.find("<>c__DisplayClass") != std::string_view::npos;
+    const bool state_machine = name.size() > 4 && name.front() == '<' &&
+        name.find(">d__") != std::string_view::npos;
+    const bool lambda_cache = name == "<>c" || name.rfind("<>c`", 0) == 0;
+    if (!closure && !state_machine && !lambda_cache)
+        return;
+
+    ImGui::TextColored(Unity::Skin::action_amber, "%s",
+        closure ? "Compiler-generated closure" :
+        state_machine ? "Compiler-generated async/iterator state machine" :
+                        "Compiler-generated lambda cache");
+    if (!state.selected.declaring_type_name.empty())
+        ImGui::TextDisabled("Declared in: %s", state.selected.declaring_type_name.c_str());
+    std::string source_member = generated_source_member(
+        state_machine ? name : std::string_view(state.inspected_method));
+    if (!source_member.empty())
+        ImGui::TextDisabled("Source member: %s", source_member.c_str());
+    ImGui::TextWrapped("%s", closure
+        ? "Fields are captured locals and references. Find a live instance, then use it as the target to inspect those values."
+        : state_machine
+            ? "MoveNext contains the generated body; fields hold execution state and captured locals."
+            : "This type stores delegates used by compiler-generated lambdas.");
 }
 
 
@@ -151,8 +188,10 @@ void render_class_browser(const Snapshot &snapshot) {
             target.image = requested.image;
             target.namespc = requested.namespc;
             target.class_name = requested.class_name;
-            target.full_name = requested.namespc.empty()
-                ? requested.class_name : requested.namespc + "." + requested.class_name;
+            target.full_name = !requested.class_display_name.empty()
+                ? requested.class_display_name
+                : requested.namespc.empty() ? requested.class_name
+                                             : requested.namespc + "." + requested.class_name;
             char pointer[32]{};
             std::snprintf(pointer, sizeof(pointer), "0x%llX",
                           static_cast<unsigned long long>(requested.class_address));
@@ -165,6 +204,9 @@ void render_class_browser(const Snapshot &snapshot) {
             copy_text(state.assembly_filter, target.image);
             copy_text(state.member_filter, requested.method_name);
             state.focused_method = requested.method_name;
+            state.focused_method_address = requested.method_address;
+            state.inspected_method = requested.method_name;
+            state.active_member_tab = 2;
             state.force_method_tab = true;
 
             Command command{};
@@ -244,8 +286,15 @@ void render_class_browser(const Snapshot &snapshot) {
             const bool selected = same_browser_class(state.selected, entry);
             const std::string label = entry.full_name + "##class-browser-" + entry.image + "-" + entry.pointer_text;
             if (ImGui::Selectable(label.c_str(), selected)) {
-                if (!selected)
+                if (!selected) {
                     state.target_token = 0;
+                    state.member_filter.fill('\0');
+                    state.focused_method.clear();
+                    state.focused_method_address = 0;
+                    state.inspected_method.clear();
+                    state.active_member_tab = 0;
+                    state.force_method_tab = false;
+                }
                 state.selected = entry;
             }
             if (ImGui::IsItemHovered())
@@ -294,6 +343,7 @@ void render_class_browser(const Snapshot &snapshot) {
     else
         kind = "managed class";
     ImGui::TextDisabled("Kind: %s", kind.c_str());
+    render_generated_type_context(state);
     if (ImGui::SmallButton("Copy class info")) {
         const std::string details = type_details_text(state.selected.image, state.selected.namespc,
                                                       state.selected.class_name, state.selected.full_name);
@@ -355,12 +405,50 @@ void render_class_browser(const Snapshot &snapshot) {
         ImGui::InputTextWithHint("##class-member-filter", "Filter member name, type, owner or parameter...",
                                  state.member_filter.data(), state.member_filter.size());
         const std::string_view member_filter = state.member_filter.data();
+        const auto visible_member_count = [&](const auto &collection) {
+            return static_cast<std::size_t>(std::count_if(
+                collection.begin(), collection.end(), [&](const auto &member) {
+                    return member_matches_filter(member.name, member.type_name,
+                                                 member.declaring_type, member_filter);
+                }));
+        };
+        const std::size_t visible_fields = visible_member_count(members.fields);
+        const std::size_t visible_properties = visible_member_count(members.properties);
+        const bool focus_by_address = state.focused_method_address != 0 &&
+            std::any_of(members.methods.begin(), members.methods.end(), [&](const ComponentInfo::Method &method) {
+                return method.metadata_address == state.focused_method_address;
+            });
+        const std::size_t visible_methods = static_cast<std::size_t>(std::count_if(
+            members.methods.begin(), members.methods.end(), [&](const ComponentInfo::Method &method) {
+                const bool focused = focus_by_address
+                    ? method.metadata_address == state.focused_method_address
+                    : !state.focused_method.empty() && method.name == state.focused_method;
+                return focused || method_matches_filter(method, member_filter);
+            }));
+        const std::size_t visible_counts[3] = {visible_fields, visible_properties, visible_methods};
+        if (state.active_member_tab < 0 || state.active_member_tab > 2)
+            state.active_member_tab = 0;
+        int forced_member_tab = state.force_method_tab ? 2 : -1;
+        if (forced_member_tab < 0 && !member_filter.empty() &&
+            visible_counts[state.active_member_tab] == 0) {
+            for (int candidate = 0; candidate < 3; ++candidate) {
+                if (visible_counts[candidate] > 0) {
+                    forced_member_tab = candidate;
+                    break;
+                }
+            }
+        }
+        const auto member_tab_flags = [&](int slot) {
+            return forced_member_tab == slot ? ImGuiTabItemFlags_SetSelected : ImGuiTabItemFlags_None;
+        };
         ImGui::BeginChild("##class-browser-members", ImVec2(0.0f, 210.0f), true);
         // Class members follow the same one-kind-at-a-time layout.
         if (ImGui::BeginTabBar("##class-member-kinds", ImGuiTabBarFlags_FittingPolicyScroll)) {
         char class_tab_label[96];
-        std::snprintf(class_tab_label, sizeof(class_tab_label), "Fields (%zu)###cfields", members.fields.size());
-        if (Unity::begin_member_tab(class_tab_label, Unity::Skin::action_blue)) {
+        std::snprintf(class_tab_label, sizeof(class_tab_label), "Fields (%zu / %zu)###cfields",
+                      visible_fields, members.fields.size());
+        if (Unity::begin_member_tab(class_tab_label, Unity::Skin::action_blue, member_tab_flags(0))) {
+            state.active_member_tab = 0;
             for (std::size_t field_index = 0; field_index < members.fields.size(); ++field_index) {
                 const ComponentInfo::Field &field = members.fields[field_index];
                 if (!member_matches_filter(field.name, field.type_name, field.declaring_type, member_filter))
@@ -382,9 +470,10 @@ void render_class_browser(const Snapshot &snapshot) {
             }
             ImGui::EndTabItem();
         }
-        std::snprintf(class_tab_label, sizeof(class_tab_label), "Properties (%zu)###cproperties",
-                      members.properties.size());
-        if (Unity::begin_member_tab(class_tab_label, Unity::Skin::action_green)) {
+        std::snprintf(class_tab_label, sizeof(class_tab_label), "Properties (%zu / %zu)###cproperties",
+                      visible_properties, members.properties.size());
+        if (Unity::begin_member_tab(class_tab_label, Unity::Skin::action_green, member_tab_flags(1))) {
+            state.active_member_tab = 1;
             for (std::size_t property_index = 0; property_index < members.properties.size(); ++property_index) {
                 const ComponentInfo::Property &property = members.properties[property_index];
                 if (!member_matches_filter(property.name, property.type_name, property.declaring_type, member_filter))
@@ -402,13 +491,18 @@ void render_class_browser(const Snapshot &snapshot) {
             }
             ImGui::EndTabItem();
         }
-        std::snprintf(class_tab_label, sizeof(class_tab_label), "Methods (%zu)###cmethods", members.methods.size());
-        const ImGuiTabItemFlags method_tab_flags =
-            state.force_method_tab ? ImGuiTabItemFlags_SetSelected : ImGuiTabItemFlags_None;
-        if (Unity::begin_member_tab(class_tab_label, Unity::Skin::action_amber, method_tab_flags)) {
+        std::snprintf(class_tab_label, sizeof(class_tab_label), "Methods (%zu / %zu)###cmethods",
+                      visible_methods, members.methods.size());
+        if (Unity::begin_member_tab(class_tab_label, Unity::Skin::action_amber, member_tab_flags(2))) {
+            state.active_member_tab = 2;
             for (std::size_t method_index = 0; method_index < members.methods.size(); ++method_index) {
                 const ComponentInfo::Method &method = members.methods[method_index];
-                if (!method_matches_filter(method, member_filter))
+                const bool focus_method = focus_by_address
+                    ? method.metadata_address == state.focused_method_address
+                    : !state.focused_method.empty() && method.name == state.focused_method;
+                // Exact metadata navigation must win over a display-name
+                // filter (notably when an invalid UTF-8 name was normalized).
+                if (!focus_method && !method_matches_filter(method, member_filter))
                     continue;
                 ImGui::PushID(static_cast<int>(method_index));
                 std::string parameters;
@@ -421,19 +515,24 @@ void render_class_browser(const Snapshot &snapshot) {
                 }
                 const std::string signature = (method.is_static ? "static " : "") + method.name + "(" +
                                               parameters + ") : " + method.return_type;
-                const bool focus_method = !state.focused_method.empty() && method.name == state.focused_method;
                 if (focus_method)
                     ImGui::SetNextItemOpen(true, ImGuiCond_Always);
                 const bool method_open = ImGui::TreeNode("##class-method", "%s", signature.c_str());
                 if (focus_method) {
                     ImGui::SetScrollHereY(0.5f);
                     state.focused_method.clear();
+                    state.focused_method_address = 0;
                     state.force_method_tab = false;
                 }
                 render_method_context_menu(method, class_code);
+                if (!method.signature_complete) {
+                    ImGui::SameLine();
+                    ImGui::TextDisabled("[metadata only]");
+                }
                 const MethodTracer::Snapshot *row_trace = trace_for_method(snapshot.method_traces, method);
                 const bool row_tracing = row_trace && row_trace->active;
                 ImGui::SameLine();
+                ImGui::BeginDisabled(!method.signature_complete && !row_tracing);
                 if (ImGui::SmallButton(row_tracing ? "Stop tracing" : "Trace")) {
                     Command command{};
                     command.kind = CommandKind::SetMethodTrace;
@@ -446,13 +545,18 @@ void render_class_browser(const Snapshot &snapshot) {
                     command.bool_value = !row_tracing;
                     RuntimeModel::instance().enqueue(std::move(command));
                 }
-                if (ImGui::IsItemHovered())
-                    ImGui::SetTooltip("%s", row_tracing ? "Stop recording calls to this method"
-                                                        : "Record every call to this method in Method Calls");
+                ImGui::EndDisabled();
+                if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+                    ImGui::SetTooltip("%s", !method.signature_complete
+                        ? "Tracing is disabled because the runtime did not expose a complete method signature"
+                        : row_tracing ? "Stop recording calls to this method"
+                                      : "Record every call to this method in Method Calls");
                 ImGui::SameLine();
                 if (ImGui::SmallButton("Copy addr"))
                     ImGui::SetClipboardText(method.pointer_text.c_str());
                 if (method_open) {
+                    if (!method.capability_reason.empty())
+                        ImGui::TextWrapped("%s", method.capability_reason.c_str());
                     const std::uint64_t static_scope =
                         0xcb00000000000000ull |
                         (std::hash<std::string>{}(state.selected.image + "\n" + state.selected.full_name) &

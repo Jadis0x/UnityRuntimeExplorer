@@ -39,13 +39,15 @@ struct ValueNode {
 // nested type names out of a formatted string.
 struct CallerMethod {
     std::uintptr_t class_address = 0;
+    std::uintptr_t method_address = 0;
     std::string image;
     std::string namespc;
     std::string class_name;
+    std::string class_display_name;
     std::string method_name;
 
     bool inspectable() const {
-        return class_address != 0 && !class_name.empty() && !method_name.empty();
+        return class_address != 0 && method_address != 0 && !class_name.empty() && !method_name.empty();
     }
 };
 
