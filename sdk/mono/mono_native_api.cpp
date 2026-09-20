@@ -208,6 +208,12 @@ const void* assembly_at(std::size_t index) {
     return current.assemblies[index];
 }
 
+bool has_class_get_image() {
+    State& current = state();
+    std::lock_guard lock(current.mutex);
+    return current.exports.class_get_image != nullptr;
+}
+
 const void* class_get_image(const void* klass) {
     State& current = state();
     std::lock_guard lock(current.mutex);

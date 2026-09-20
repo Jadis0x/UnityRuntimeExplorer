@@ -18,6 +18,22 @@ const URK_MonoApi*& api_slot() {
     return value;
 }
 
+// init() rejects a context for reasons api() cannot re-derive from the context
+// alone -- a failed thread attach above all. Without this latch a rejected
+// init() left every wrapper below still calling into Mono, because api()
+// happily returned context->mono again.
+bool& ready_slot() {
+    static bool value = false;
+    return value;
+}
+
+// True only when mono_class_get_image is missing and class_images() has to
+// stand in for it.
+bool& class_image_fallback_slot() {
+    static bool value = false;
+    return value;
+}
+
 std::string& invocation_error_slot() {
     thread_local std::string value;
     return value;
@@ -41,8 +57,11 @@ std::unordered_map<const Class*, const Image*>& class_images() {
 }
 
 void remember_class_image(const Class* klass, const Image* image) {
-    if (!klass || !image)
+    if (!klass || !image || !class_image_fallback_slot())
         return;
+    // A class-browser sweep enumerates every class in every assembly. Paying a
+    // global lock and a permanent map entry per class is only worth it when
+    // mono_class_get_image cannot answer the question directly.
     std::lock_guard lock(class_image_mutex());
     class_images()[klass] = image;
 }
@@ -53,11 +72,40 @@ const Image* remembered_class_image(const Class* klass) {
     return found == class_images().end() ? nullptr : found->second;
 }
 
+// Obfuscated or corrupt metadata can hand back a parent chain that loops, or a
+// member iterator that never ends. Either one hangs the Unity main thread, and
+// a hang is worse than a fault here: the explorer's structured-exception
+// handler only catches access violations. Bound both walks the way
+// URK::Unity::detail::Backend already bounds its own.
+constexpr std::size_t kMaxHierarchyDepth = 128;
+constexpr std::size_t kMaxMembersPerClass = 32768;
+
+class HierarchyWalk {
+  public:
+    explicit HierarchyWalk(const Class* klass) : current_(klass) {}
+
+    const Class* next() {
+        if (!current_ || depth_++ >= kMaxHierarchyDepth ||
+            !visited_.insert(current_).second)
+            return nullptr;
+        const Class* value = current_;
+        current_ = class_get_parent(current_);
+        return value;
+    }
+
+  private:
+    const Class* current_ = nullptr;
+    std::size_t depth_ = 0;
+    std::unordered_set<const Class*> visited_;
+};
+
 } // namespace
 
 bool init(const URK::ModContext* context) {
     URK::set_context(context);
     api_slot() = nullptr;
+    ready_slot() = false;
+    class_image_fallback_slot() = false;
     invocation_error_slot().clear();
     native::reset();
     {
@@ -80,6 +128,8 @@ bool init(const URK::ModContext* context) {
         api_slot() = nullptr;
         return false;
     }
+    class_image_fallback_slot() = !native::has_class_get_image();
+    ready_slot() = true;
     return true;
 }
 
@@ -95,6 +145,10 @@ const URK_MonoApi* api() {
 }
 
 bool available() {
+    // api() deliberately still resolves after a rejected init() so last_error()
+    // can report why. Availability must not: it gates every managed call below.
+    if (!ready_slot())
+        return false;
     const auto* value = api();
     return value && value->version >= URK_MONO_API_VERSION &&
            value->size >= sizeof(URK_MonoApi);
@@ -128,11 +182,15 @@ const Class* find_class(const char* image, const char* namespc, const char* name
 const Method* resolve_method(const Class* klass, const char* name, int argc) {
     if (!klass || !name)
         return nullptr;
-    std::unordered_set<const Method*> visited;
-    for (const Class* current = klass; current; current = class_get_parent(current)) {
+    HierarchyWalk hierarchy(klass);
+    while (const Class* current = hierarchy.next()) {
         void* iterator = nullptr;
+        // Per class, not per hierarchy: a set shared across the walk made one
+        // repeated handle truncate the whole base class's remaining methods.
+        std::unordered_set<const Method*> visited;
+        std::size_t seen = 0;
         while (const Method* method = class_get_methods(current, &iterator)) {
-            if (!visited.insert(method).second)
+            if (++seen > kMaxMembersPerClass || !visited.insert(method).second)
                 break;
             const char* candidate = method_get_name(method);
             if (candidate && std::strcmp(candidate, name) == 0 &&
@@ -149,9 +207,14 @@ const Method* resolve_method_exact(const Class* klass, const char* name,
     if (!klass || !name || parameter_count < 0 ||
         (parameter_count > 0 && !parameter_types))
         return nullptr;
-    for (const Class* current = klass; current; current = class_get_parent(current)) {
+    HierarchyWalk hierarchy(klass);
+    while (const Class* current = hierarchy.next()) {
         void* iterator = nullptr;
+        std::unordered_set<const Method*> visited;
+        std::size_t seen = 0;
         while (const Method* method = class_get_methods(current, &iterator)) {
+            if (++seen > kMaxMembersPerClass || !visited.insert(method).second)
+                break;
             const char* candidate = method_get_name(method);
             if (!candidate || std::strcmp(candidate, name) != 0 ||
                 method_get_param_count(method) != static_cast<std::uint32_t>(parameter_count))
@@ -174,9 +237,14 @@ const Method* resolve_method_exact(const Class* klass, const char* name,
 const Field* resolve_field(const Class* klass, const char* name) {
     if (!klass || !name)
         return nullptr;
-    for (const Class* current = klass; current; current = class_get_parent(current)) {
+    HierarchyWalk hierarchy(klass);
+    while (const Class* current = hierarchy.next()) {
         void* iterator = nullptr;
+        std::unordered_set<const Field*> visited;
+        std::size_t seen = 0;
         while (const Field* field = class_get_fields(current, &iterator)) {
+            if (++seen > kMaxMembersPerClass || !visited.insert(field).second)
+                break;
             const char* candidate = field_get_name(field);
             if (candidate && std::strcmp(candidate, name) == 0)
                 return field;

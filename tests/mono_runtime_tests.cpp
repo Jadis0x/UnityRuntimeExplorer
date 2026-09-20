@@ -33,6 +33,39 @@ int attach_current_thread() {
     return 1;
 }
 
+int attach_current_thread_fails() {
+    return 0;
+}
+
+// A two-class chain that loops back on itself, plus a class whose method
+// iterator never terminates: both model metadata an obfuscator can emit.
+const auto cyclic_child = reinterpret_cast<const void*>(0x7000);
+const auto cyclic_parent = reinterpret_cast<const void*>(0x7100);
+const auto endless_class = reinterpret_cast<const void*>(0x7200);
+const auto endless_method = reinterpret_cast<const void*>(0x7300);
+const auto endless_field = reinterpret_cast<const void*>(0x7400);
+
+const void* class_get_parent(const void* klass) {
+    if (klass == cyclic_child)
+        return cyclic_parent;
+    if (klass == cyclic_parent)
+        return cyclic_child;
+    return nullptr;
+}
+
+const void* class_get_methods(const void* klass, void** iterator) {
+    if (klass != endless_class || !iterator)
+        return nullptr;
+    // Never advances and never returns null.
+    return endless_method;
+}
+
+const void* class_get_fields(const void* klass, void** iterator) {
+    if (klass != endless_class || !iterator)
+        return nullptr;
+    return endless_field;
+}
+
 const void* find_class(const char*, const char*, const char*) {
     return class_handle;
 }
@@ -67,7 +100,13 @@ const char* last_error() {
 }
 
 const char* method_get_name(const void* method) {
-    return method == incomplete_method_handle ? "<SetupOutfit>b__0" : nullptr;
+    if (method == incomplete_method_handle)
+        return "<SetupOutfit>b__0";
+    return method == endless_method ? "NotTheOneWeWant" : nullptr;
+}
+
+const char* field_get_name(const void* field) {
+    return field == endless_field ? "notTheOneWeWant" : nullptr;
 }
 
 const void* method_get_return_type(const void*) {
@@ -104,6 +143,10 @@ int main() {
     mono.method_get_name = &method_get_name;
     mono.method_get_return_type = &method_get_return_type;
     mono.method_get_flags = &method_get_flags;
+    mono.class_get_parent = &class_get_parent;
+    mono.class_get_methods = &class_get_methods;
+    mono.class_get_fields = &class_get_fields;
+    mono.field_get_name = &field_get_name;
 
     URK_ModContext context{};
     context.version = URK_SDK_MIN_COMPAT_VERSION;
@@ -181,6 +224,51 @@ int main() {
     const char* error = URK::mono::last_error();
     ok &= require(error && std::strstr(error, "mono_assembly_foreach"),
                   "missing advanced Mono exports must remain observable");
+
+    // A parent chain that loops must terminate the walk instead of hanging the
+    // caller: the explorer runs these on the Unity main thread, where the
+    // structured-exception handler catches faults but never a hang.
+    ok &= require(URK::mono::resolve_method(
+                      static_cast<const URK::mono::Class*>(cyclic_child), "Missing", 0) == nullptr,
+                  "a cyclic parent chain must not trap resolve_method");
+    const char* const no_parameters[] = {""};
+    ok &= require(URK::mono::resolve_method_exact(
+                      static_cast<const URK::mono::Class*>(cyclic_child), "Missing",
+                      no_parameters, 0) == nullptr,
+                  "a cyclic parent chain must not trap resolve_method_exact");
+    ok &= require(URK::mono::resolve_field(
+                      static_cast<const URK::mono::Class*>(cyclic_child), "missing") == nullptr,
+                  "a cyclic parent chain must not trap resolve_field");
+    ok &= require(URK::mono::resolve_method(
+                      static_cast<const URK::mono::Class*>(endless_class), "Missing", 0) == nullptr,
+                  "a non-advancing method iterator must not trap resolve_method");
+    ok &= require(URK::mono::resolve_field(
+                      static_cast<const URK::mono::Class*>(endless_class), "missing") == nullptr,
+                  "a non-advancing field iterator must not trap resolve_field");
+
+    // A rejected init() must close the backend. api() still resolves so
+    // last_error() can explain the rejection, so available() is the only gate.
+    URK_MonoApi unattachable = mono;
+    unattachable.attach_current_thread = &attach_current_thread_fails;
+    URK_ModContext unattachable_context = context;
+    unattachable_context.mono = &unattachable;
+    ok &= require(!URK::mono::init(&unattachable_context),
+                  "a failed thread attach must reject the context");
+    ok &= require(!URK::mono::available(),
+                  "a failed thread attach must leave the backend unavailable");
+    ok &= require(URK::mono::find_class("Assembly-CSharp.dll", "Example", "Player") == nullptr,
+                  "a rejected context must not keep serving managed lookups");
+
+    // Same for a context the loader truncated below the compiled struct.
+    URK_ModContext truncated = context;
+    truncated.size = static_cast<std::uint32_t>(
+        offsetof(URK_ModContext, runtimeCapabilities) + sizeof(truncated.runtimeCapabilities));
+    ok &= require(!URK::mono::init(&truncated),
+                  "a truncated mod context must be rejected");
+    ok &= require(!URK::mono::available(),
+                  "a truncated mod context must leave the backend unavailable");
+    ok &= require(URK::mono::find_class("Assembly-CSharp.dll", "Example", "Player") == nullptr,
+                  "a truncated mod context must not keep serving managed lookups");
 
     URK::mono::init(nullptr);
     ok &= require(!URK::mono::available(),

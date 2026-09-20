@@ -19,6 +19,7 @@ void clear_error();
 std::size_t refresh_assemblies();
 const void* assembly_at(std::size_t index);
 
+bool has_class_get_image();
 const void* class_get_image(const void* klass);
 const void* class_get_element_class(const void* klass);
 std::int32_t class_value_size(const void* klass, std::uint32_t* alignment);

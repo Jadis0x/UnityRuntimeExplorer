@@ -324,6 +324,8 @@ namespace Explorer {
 		}
 
 		class_instance_scan_ = std::make_unique<ClassInstanceScan>();
+		class_instance_scan_->assembly_count =
+			std::min<std::size_t>(URK::managed::domain_get_assembly_count(), 4096);
 		class_instance_scan_->target = target;
 		class_instance_scan_->unity_object_base =
 			URK::managed::find_class("UnityEngine.CoreModule.dll", "UnityEngine", "Object");
@@ -388,8 +390,7 @@ namespace Explorer {
 		};
 
 		if (scan.phase == ClassInstanceScan::Phase::StaticRoots) {
-			const std::size_t assembly_count =
-				std::min<std::size_t>(URK::managed::domain_get_assembly_count(), 4096);
+			const std::size_t assembly_count = scan.assembly_count;
 			while (scan.assembly_index < assembly_count && Clock::now() < deadline &&
 				scan.seen.size() < kMaxGraphNodes) {
 				if (!scan.static_owner) {

@@ -80,6 +80,11 @@ struct RuntimeModel::ClassInstanceScan {
 	Phase phase = Phase::StaticRoots;
 	const URK::managed::Class* target = nullptr;
 	const URK::managed::Class* unity_object_base = nullptr;
+	// Captured once when the scan starts. On Mono domain_get_assembly_count()
+	// re-walks the whole domain, so asking again every slice would both cost a
+	// full enumeration per frame and let assembly_index drift onto a different
+	// assembly whenever one loaded mid-scan.
+	std::size_t assembly_count = 0;
 	std::size_t assembly_index = 0;
 	std::size_t class_index = 0;
 	const URK::managed::Class* static_owner = nullptr;
@@ -96,6 +101,8 @@ struct RuntimeModel::ClassInstanceScan {
 // same way the instance scan is: a full IL2CPP image holds hundreds of
 // thousands of methods and doing it in one go would stall the game.
 struct RuntimeModel::CallerIndexScan {
+	// Captured once, for the same reason ClassInstanceScan captures it.
+	std::size_t assembly_count = 0;
 	std::size_t assembly_index = 0;
 	std::size_t class_index = 0;
 	std::size_t indexed_methods = 0;

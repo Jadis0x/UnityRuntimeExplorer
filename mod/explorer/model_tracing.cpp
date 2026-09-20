@@ -95,6 +95,8 @@ namespace Explorer {
 			return;
 		}
 		caller_index_scan_ = std::make_unique<CallerIndexScan>();
+		caller_index_scan_->assembly_count =
+			std::min<std::size_t>(URK::managed::domain_get_assembly_count(), 4096);
 		caller_index_scan_->started = Clock::now();
 		ModLog::info("caller index: walking every loaded assembly for managed method addresses");
 		working_.caller_index_active = true;
@@ -117,7 +119,7 @@ namespace Explorer {
 		const Clock::time_point slice_started = Clock::now();
 		const Clock::time_point deadline = slice_started + kCallerIndexSliceBudget;
 		++scan.ticks;
-		const std::size_t assembly_count = std::min<std::size_t>(URK::managed::domain_get_assembly_count(), 4096);
+		const std::size_t assembly_count = scan.assembly_count;
 		while (scan.assembly_index < assembly_count && Clock::now() < deadline) {
 			const URK::managed::Assembly* assembly = URK::managed::domain_get_assembly(scan.assembly_index);
 			const URK::managed::Image* image = assembly ? URK::managed::assembly_get_image(assembly) : nullptr;

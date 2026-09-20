@@ -216,8 +216,11 @@ const URK::managed::Class* resolve_class_by_name(std::string_view name) {
     // any backend whose class_from_name does not cover the requested image.
     constexpr std::size_t kMaxClassesToSearch = 250000;
     std::size_t visited = 0;
+    // Hoisted: on Mono this re-walks every loaded assembly, so leaving it in
+    // the loop condition made the fallback search quadratic in assembly count.
+    const std::size_t assembly_count = URK::managed::domain_get_assembly_count();
     for (std::size_t assembly_index = 0;
-         assembly_index < URK::managed::domain_get_assembly_count() && visited < kMaxClassesToSearch;
+         assembly_index < assembly_count && visited < kMaxClassesToSearch;
          ++assembly_index) {
         const auto* assembly = URK::managed::domain_get_assembly(assembly_index);
         const auto* image = assembly ? URK::managed::assembly_get_image(assembly) : nullptr;
