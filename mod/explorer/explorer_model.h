@@ -44,6 +44,7 @@ class RuntimeModel {
 
     void process_commands();
     void process_command(const Command &command);
+    bool destroy_request_targets_selection(int instance_id) const;
 #if defined(_WIN32)
     // Isolates the SEH-guarded call: process_commands() has many
     // std::string/std::vector locals, and MSVC forbids mixing __try/__except

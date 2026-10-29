@@ -182,11 +182,14 @@ namespace Explorer {
 			continue_managed_caller_index();
 
 		const Clock::time_point now = Clock::now();
-		update_camera_focus();
 		if (event_refresh_pending_ && now >= event_refresh_due_) {
 			event_refresh_pending_ = false;
 			request_refresh();
 		}
+		// A destroy request can arrive before Unity invalidates the managed
+		// wrapper. Do not let camera focus read that wrapper during the gap.
+		if (!event_refresh_pending_)
+			update_camera_focus();
 		const bool refresh_requested = refresh_requested_.exchange(false);
 		if (refresh_requested || hierarchy_census_) {
 			if (refresh_hierarchy()) {
@@ -346,6 +349,16 @@ namespace Explorer {
 		commands_.push_back(std::move(command));
 	}
 
+	bool RuntimeModel::destroy_request_targets_selection(int instance_id) const {
+		if (instance_id == 0)
+			return false;
+		if (working_.selected_instance_id == instance_id ||
+			(working_.object_inspector.valid && working_.object_inspector.instance_id == instance_id))
+			return true;
+		return std::any_of(working_.inspector.components.begin(), working_.inspector.components.end(),
+			[instance_id](const ComponentInfo& component) { return component.instance_id == instance_id; });
+	}
+
 	std::shared_ptr<const Snapshot> RuntimeModel::snapshot() const {
 		auto current = published_.load();
 		return current ? current : std::make_shared<const Snapshot>();
@@ -383,7 +396,7 @@ namespace Explorer {
 					destroy_index = coalesced.size();
 					coalesced.push_back(std::move(command));
 				}
-				else if (command.instance_id == working_.selected_instance_id) {
+				else if (destroy_request_targets_selection(command.instance_id)) {
 					// Safe to clear early; keeps the selected object's identity without replaying the whole burst.
 					coalesced[*destroy_index] = std::move(command);
 				}
@@ -1077,9 +1090,10 @@ namespace Explorer {
 			event_refresh_due_ = Clock::now() + kEventRefreshDebounce;
 			return;
 		case CommandKind::ObjectDestroyRequested:
-			if (command.instance_id == working_.selected_instance_id) {
+			if (destroy_request_targets_selection(command.instance_id)) {
 				clear_selection();
 				clear_object_inspector();
+				release_all_field_watches();
 			}
 			// Debounce the census instead of silently keeping a stale tree.
 			event_refresh_pending_ = true;

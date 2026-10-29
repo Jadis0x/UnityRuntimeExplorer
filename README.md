@@ -56,9 +56,10 @@ particular need the right embedding exports.
 
 ## Installing
 
-Grab URKit from the [v0.4.0 release](https://github.com/Jadis0x/URKit/releases/tag/v0.4.0)
-(the proxy DLL, or `URKitInjector.dll` for the injector setup below). You don't
-need `urk-sdk.exe` unless you're building your own URKit mods.
+Grab URKit from the [v0.5.1 release](https://github.com/Jadis0x/URKit/releases/tag/v0.5.1)
+(a proxy DLL, or `URKitInjector.dll` for the injector setup below). You don't
+need `urk.exe` unless you want it to install the loader for you or you're
+building your own URKit mods.
 
 Then grab the Explorer DLL matching the game's runtime (Mono or IL2CPP).
 
@@ -74,11 +75,13 @@ Then grab the Explorer DLL matching the game's runtime (Mono or IL2CPP).
 
 ### Proxy-free (injector) setup
 
-1. Grab `URKitInjector.dll` from the URKit release.
-2. No proxy DLL or `Mods` folder needed.
-3. Inject `URKitInjector.dll` into the game (Windows x64 only).
-4. Pick your URKit `.ini` when prompted.
-5. Pick the matching Explorer DLL.
+1. Grab the URKit release and keep `urk.exe` and `URKitInjector.dll` together
+   in one folder.
+2. No proxy DLL needed. Put the matching Explorer DLL in a `Mods` folder next
+   to the game's executable.
+3. Start the game, then open `urk.exe`, go to the **Loader** page, switch to
+   injector mode and press **Inject** (Windows x64 only). From a terminal:
+   `urk.exe loader inject --process Game.exe`.
 
 Don't inject either Explorer DLL directly, it has to be loaded by URKit or
 the injector as a plugin.

@@ -1,5 +1,6 @@
 // Copyright (c) 2026 Jadis0x. All rights reserved.
 #include "mcp_stdio_server.h"
+#include "project_version.h"
 
 #include <Windows.h>
 
@@ -17,7 +18,7 @@ int main(int argc, char** argv) {
     for (int index = 1; index < argc; ++index) {
         const std::string_view argument = argv[index];
         if (argument == "--help") {
-            std::cerr << "UnityRuntimeExplorer MCP Server 0.4.0\n\n"
+            std::cerr << "UnityRuntimeExplorer MCP Server " << URK::project_version << "\n\n"
                          "Usage:\n"
                          "  URK_UnityRuntimeExplorer_McpServer.exe [--game-pid <pid>] [--allow-tracing] [--allow-invocation]\n\n"
                          "Options:\n"
@@ -49,8 +50,8 @@ int main(int argc, char** argv) {
         std::cerr << "Unknown argument: " << argument << '\n';
         return 2;
     }
-    std::cerr << "UnityRuntimeExplorer MCP Server 0.4.0\n"
-                 "Transport : stdio\n"
+    std::cerr << "UnityRuntimeExplorer MCP Server " << URK::project_version << "\n"
+              << "Transport : stdio\n"
               << "Target    : " << (game_pid ? "game PID " + std::to_string(*game_pid) : "automatic discovery") << '\n'
               << "Mode      : Explorer-controlled permissions\n\n"
                  "This helper is normally started by Codex, Claude, ChatGPT, or another MCP client.\n"

@@ -118,13 +118,18 @@ struct Backend {
         auto n=z(name); const void* current=klass; std::unordered_set<const void*> parents; std::size_t depth=0;
         while (current) {
             if (depth++ >= 128 || !parents.insert(current).second) { set_error("Unity method lookup rejected a cyclic or excessive inheritance chain"); return nullptr; }
-            void* it=nullptr; const void* match=nullptr; int matches=0; std::unordered_set<const void*> members; std::size_t member_count=0;
+            void* it=nullptr; const void* match=nullptr; const void* nonGeneric=nullptr; int matches=0; int nonGenericMatches=0; std::unordered_set<const void*> members; std::size_t member_count=0;
             while (const auto* m = URK::managed::class_get_methods(static_cast<const URK::managed::Class*>(current), &it)) {
                 if (++member_count > 32768 || !members.insert(m).second) { set_error("Unity method lookup rejected a cyclic or excessive method iterator"); return nullptr; }
                 const char* mn = URK::managed::method_get_name(m); if (!mn || n != mn) continue;
-                if (argc < 0 || static_cast<int>(URK::managed::method_get_param_count(m)) == argc) { match=m; ++matches; }
+                if (argc < 0 || static_cast<int>(URK::managed::method_get_param_count(m)) == argc) {
+                    match=m; ++matches;
+                    if (!URK::managed::method_is_generic(m)) { nonGeneric=m; ++nonGenericMatches; }
+                }
             }
-            if (matches > 1) { set_error(std::string("Unity method lookup failed: ambiguous overload by name/argc: ")+std::string(name)); return nullptr; }
+            // A generic definition cannot be invoked directly, so a single non-generic candidate wins over generic overloads of the same shape.
+            if (argc >= 0 && nonGenericMatches == 1) { match=nonGeneric; }
+            else if (matches > 1) { set_error(std::string("Unity method lookup failed: ambiguous overload by name/argc: ")+std::string(name)); return nullptr; }
             if (match) { std::lock_guard<std::mutex> lock(cache_mutex()); method_cache()[cacheKey] = match; return match; }
             current = URK::managed::class_get_parent(static_cast<const URK::managed::Class*>(current));
         }

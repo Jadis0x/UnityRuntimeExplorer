@@ -1,6 +1,6 @@
 # MCP integration
 
-UnityRuntimeExplorer 0.4.0 provides Model Context Protocol access to a live
+UnityRuntimeExplorer provides Model Context Protocol access to a live
 Windows Unity game. It supports bounded automatic discovery, inspection,
 managed writes, Unity object/component operations, method tracing, and managed
 method invocation. Explorer Config independently controls each capability. The
@@ -237,7 +237,7 @@ Claude's hosted/API connector likewise requires a publicly reachable HTTP MCP
 server; local stdio is for Claude Desktop or Claude Code. Do not publish the
 bridge discovery directory or forward the Windows named pipe.
 
-An HTTP gateway is deliberately not bundled in 0.4.0. Shipping an unauthenticated
+An HTTP gateway is deliberately not bundled. Shipping an unauthenticated
 ad-hoc web server beside a live game would weaken the process boundary. The
 stdio tool core is transport-neutral, so a reviewed Streamable HTTP frontend
 can reuse the same transport-neutral tool catalog without changing the DLL bridge.

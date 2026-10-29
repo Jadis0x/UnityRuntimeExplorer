@@ -58,7 +58,7 @@ endfunction()
 include(FetchContent)
 FetchContent_Declare(imgui
     GIT_REPOSITORY https://github.com/ocornut/imgui.git
-    GIT_TAG v1.92.2b-docking
+    GIT_TAG v1.92.9b-docking
 )
 FetchContent_MakeAvailable(imgui)
 FetchContent_Declare(nlohmann_json
