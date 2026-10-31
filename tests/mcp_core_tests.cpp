@@ -23,7 +23,7 @@ int main() {
     require(tool_catalog(true).size() == 39, "three tracing tools are exposed");
     require(tool_catalog(false, true).size() == 37, "invocation can be classified independently");
     require(tool_catalog(true, true).size() == 40, "tracing and invocation can be combined");
-    require(tool_catalog(true, true, true).size() == 46, "the complete Explorer-controlled catalog is exposed");
+    require(tool_catalog(true, true, true).size() == 47, "the complete Explorer-controlled catalog is exposed");
     for (const char* navigation : {"list_scenes", "browse_hierarchy", "describe_reference", "list_assemblies",
                                    "list_namespaces", "get_type_hierarchy", "read_static_members"})
         require(is_base_tool(navigation), "navigation tools are always available");
@@ -106,6 +106,12 @@ int main() {
         require(output["fields"]["rows"][3][2].is_null(), "a missing key becomes a null cell");
         require(output["fields"]["rows"][5][3] == 5, "cells keep their column order");
         require(output.dump().size() * 10 < input.dump().size() * 7, "a table saves at least 30 percent");
+        // A column that is null in every row is dropped.
+        nlohmann::json sparse = nlohmann::json::array();
+        for (int index = 0; index < 4; ++index)
+            sparse.push_back({{"name", index}, {"value", index}, {"alias", nullptr}});
+        const nlohmann::json sparse_table = compact_tables(sparse);
+        require(sparse_table["cols"].size() == 2, "all-null columns are removed");
         const nlohmann::json short_list = {{"fields", {{{"a", 1}, {"b", 2}}, {{"a", 3}, {"b", 4}}}}};
         require(compact_tables(short_list) == short_list, "two rows are not worth a table");
         const nlohmann::json mixed = {{"v", {{{"a", 1}, {"b", 2}}, 7, {{"a", 3}, {"b", 4}}}}};

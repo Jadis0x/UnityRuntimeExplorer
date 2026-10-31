@@ -276,6 +276,45 @@ struct RootGuard {
     ~RootGuard() { Inspect::FreeObjectHandle(handle); }
 };
 
+// Engine base-class members (m_CachedPtr, messages, offsets) are noise to a reader.
+bool inherited_engine_member(std::string_view declaring_type, std::string_view own_type) {
+    static constexpr std::array<std::string_view, 5> engine_types = {
+        "UnityEngine.Object", "UnityEngine.Component", "UnityEngine.Behaviour",
+        "UnityEngine.MonoBehaviour", "System.Object"};
+    if (declaring_type.empty() || declaring_type == own_type)
+        return false;
+    return std::find(engine_types.begin(), engine_types.end(), declaring_type) != engine_types.end();
+}
+
+// Plain JSON for the scalar kinds an undo can write back.
+std::optional<Json> scalar_from_display(std::string_view type, const std::string& text) {
+    if (type == "System.Boolean") {
+        if (text == "True" || text == "true")
+            return Json(true);
+        if (text == "False" || text == "false")
+            return Json(false);
+        return std::nullopt;
+    }
+    static constexpr std::array<std::string_view, 8> integers = {
+        "System.Int16", "System.Int32", "System.Int64", "System.UInt16",
+        "System.UInt32", "System.UInt64", "System.Byte", "System.SByte"};
+    const bool integer = std::find(integers.begin(), integers.end(), type) != integers.end();
+    const bool real = type == "System.Single" || type == "System.Double";
+    if (text.empty() || (!integer && !real))
+        return std::nullopt;
+    char* end = nullptr;
+    if (integer) {
+        const long long number = std::strtoll(text.c_str(), &end, 10);
+        if (*end != '\0')
+            return std::nullopt;
+        return Json(number);
+    }
+    const double number = std::strtod(text.c_str(), &end);
+    if (*end != '\0')
+        return std::nullopt;
+    return Json(number);
+}
+
 std::optional<int> requested_limit(const Json& arguments, std::string_view key, int fallback, int maximum) {
     if (!arguments.contains(key))
         return fallback;
@@ -356,6 +395,7 @@ void RuntimeTools::reset() {
     reference_order_.clear();
     snapshots_.clear();
     snapshot_order_.clear();
+    write_journal_.clear();
     scene_generation_ = 0;
     hierarchy_revision_ = 0;
 }
@@ -396,17 +436,21 @@ std::string RuntimeTools::issue_reference(RuntimeModel& model, Reference referen
         }
         reference_order_.pop_front();
     }
-    std::array<unsigned char, 16> random{};
-    if (BCryptGenRandom(nullptr, random.data(), static_cast<ULONG>(random.size()),
-                        BCRYPT_USE_SYSTEM_PREFERRED_RNG) != 0)
-        return {};
-    static constexpr char hex[] = "0123456789abcdef";
-    std::string token = "urkref_";
-    token.reserve(7 + random.size() * 2);
-    for (const unsigned char byte : random) {
-        token.push_back(hex[byte >> 4]);
-        token.push_back(hex[byte & 0x0f]);
-    }
+    // 48 random bits: short tokens cost fewer model tokens, and at most a few
+    // thousand are live on a local, single-user pipe.
+    std::string token;
+    do {
+        std::array<unsigned char, 6> random{};
+        if (BCryptGenRandom(nullptr, random.data(), static_cast<ULONG>(random.size()),
+                            BCRYPT_USE_SYSTEM_PREFERRED_RNG) != 0)
+            return {};
+        static constexpr char hex[] = "0123456789abcdef";
+        token = "r_";
+        for (const unsigned char byte : random) {
+            token.push_back(hex[byte >> 4]);
+            token.push_back(hex[byte & 0x0f]);
+        }
+    } while (references_.contains(token));
     references_[token] = std::move(reference);
     reference_order_.push_back(token);
     return token;
@@ -565,7 +609,9 @@ Response RuntimeTools::execute(RuntimeModel& model, const Request& request) {
             [[fallthrough]];
         case Inspect::ValueKind::ObjectReference:
         case Inspect::ValueKind::ValueType:
-            result["display"] = value.display;
+            // Display is redundant when it only repeats the type name.
+            if (value.display != value.type_name)
+                result["display"] = value.display;
             if (value.object) {
                 const std::string token = capture_managed_reference(Object{value.object}, source,
                                                                     retain_strongly);
@@ -1140,6 +1186,8 @@ Response RuntimeTools::execute(RuntimeModel& model, const Request& request) {
             raw != references_.end() && raw->second.kind == ReferenceKind::Component)
             owner_reference_token = object_reference(raw->second.owner_instance_id, raw->second.expected_object_name);
         const bool include_properties = request.arguments.value("include_properties", false);
+        const bool include_inherited = request.arguments.value("include_inherited", false);
+        std::size_t hidden_inherited = 0;
         const ManagedRead::ObjectPage page = ManagedRead::read_object(
             target, request.arguments.value("member_query", std::string{}),
             static_cast<std::size_t>(*limit), include_properties);
@@ -1149,6 +1197,10 @@ Response RuntimeTools::execute(RuntimeModel& model, const Request& request) {
             return fail("array_requires_paging", "Use read_array for managed arrays.");
         Json fields = Json::array();
         for (ManagedRead::MemberValue member : page.fields) {
+            if (!include_inherited && inherited_engine_member(member.declaring_type, page.type.full_name)) {
+                ++hidden_inherited;
+                continue;
+            }
             Json entry = value_json(member.value, page.type.full_name + "." + member.name);
             entry["name"] = member.name;
             // Omit default values.
@@ -1166,6 +1218,10 @@ Response RuntimeTools::execute(RuntimeModel& model, const Request& request) {
         }
         Json properties = Json::array();
         for (ManagedRead::MemberValue member : page.properties) {
+            if (!include_inherited && inherited_engine_member(member.declaring_type, page.type.full_name)) {
+                ++hidden_inherited;
+                continue;
+            }
             Json entry = value_json(member.value, page.type.full_name + "." + member.name);
             entry["name"] = member.name;
             // Omit default values.
@@ -1181,7 +1237,7 @@ Response RuntimeTools::execute(RuntimeModel& model, const Request& request) {
                 entry["capability_reason"] = member.capability_reason;
             properties.push_back(std::move(entry));
         }
-        return succeed({{"type", {{"assembly", page.assembly}, {"namespace", page.type.namespc},
+        Json inspected = {{"type", {{"assembly", page.assembly}, {"namespace", page.type.namespc},
                                     {"name", page.type.name}, {"full_name", page.type.full_name},
                                     {"is_value_type", page.type.is_value_type},
                                     {"is_enum", page.type.is_enum}}},
@@ -1189,7 +1245,10 @@ Response RuntimeTools::execute(RuntimeModel& model, const Request& request) {
                         {"properties_executed", include_properties},
                         {"owner_reference", owner_reference_token.empty() ? Json(nullptr) : Json(owner_reference_token)},
                         {"matching_members", page.matching_members}, {"truncated", page.truncated},
-                        {"member_limit", *limit}});
+                        {"member_limit", *limit}};
+        if (hidden_inherited > 0)
+            inspected["hidden_inherited"] = hidden_inherited;
+        return succeed(std::move(inspected));
     }
 
     if (request.tool == "snapshot_object" || request.tool == "diff_snapshot") {
@@ -1244,6 +1303,8 @@ Response RuntimeTools::execute(RuntimeModel& model, const Request& request) {
             out.members.clear();
             for (auto* group : {&page.fields, &page.properties}) {
                 for (ManagedRead::MemberValue& member : *group) {
+                    if (inherited_engine_member(member.declaring_type, page.type.full_name))
+                        continue;
                     Json value = plain_value(member.value);
                     out.members.push_back({member.name, member.declaring_type, std::move(value)});
                 }
@@ -2895,6 +2956,27 @@ Response RuntimeTools::execute(RuntimeModel& model, const Request& request) {
         return succeed({{"watches", std::move(watches)}});
     }
 
+    if (request.tool == "undo_write") {
+        if (write_journal_.empty())
+            return fail("nothing_to_undo", "No restorable write is recorded.");
+        const WriteRecord record = write_journal_.back();
+        write_journal_.pop_back();
+        Request replay;
+        replay.id = request.id;
+        replay.tool = "write_member";
+        replay.context = request.context;
+        replay.arguments = {{record.reference_key, record.reference},
+                            {"member", record.member},
+                            {"kind", record.kind},
+                            {"value", record.previous}};
+        replaying_undo_ = true;
+        Response replayed = execute(model, replay);
+        replaying_undo_ = false;
+        if (!replayed.ok)
+            return replayed;
+        return succeed({{"undone", record.member}, {"value", record.previous}});
+    }
+
     if (request.tool == "write_member") {
         const bool by_object = request.arguments.contains("reference");
         const bool by_type = request.arguments.contains("type_reference");
@@ -2962,6 +3044,20 @@ Response RuntimeTools::execute(RuntimeModel& model, const Request& request) {
                 result["type_reference"] = request.arguments["type_reference"];
             return result;
         };
+        const auto remember_write = [&](const std::string& type_name, const std::string& previous,
+                                        const char* resolved_kind, const std::string& member) {
+            constexpr std::size_t kMaxJournal = 32;
+            if (replaying_undo_)
+                return;
+            const std::optional<Json> value = scalar_from_display(type_name, previous);
+            if (!value)
+                return;
+            const char* key = by_object ? "reference" : "type_reference";
+            write_journal_.push_back({key, request.arguments[key].get<std::string>(), member,
+                                      resolved_kind, *value});
+            if (write_journal_.size() > kMaxJournal)
+                write_journal_.pop_front();
+        };
         if (kind != "property") {
             const auto fields = Inspect::fields_from_class(klass, true);
             if (const Inspect::FieldInfo* field = find_named_member(fields, Labels::Kind::Field, member_name, owner_of)) {
@@ -2969,6 +3065,10 @@ Response RuntimeTools::execute(RuntimeModel& model, const Request& request) {
                     return fail("member_not_static", "That field belongs to instances; use reference instead of type_reference.");
                 if (!Inspect::FieldCanWrite(*field))
                     return fail("member_not_writable", "The requested field is readonly or opaque.");
+                // Native pointers (m_CachedPtr) detach the object from the engine.
+                if (field->type_name == "System.IntPtr" || field->type_name == "System.UIntPtr" ||
+                    field->name == "m_CachedPtr")
+                    return fail("member_not_writable", "Native pointer fields cannot be written.");
                 ManagedInvoke::PreparedValue prepared = ManagedInvoke::prepare_value(
                     field->name, field->type_name, field->type, field->is_value_type, field->is_enum,
                     request.arguments["value"], resolver);
@@ -2983,6 +3083,7 @@ Response RuntimeTools::execute(RuntimeModel& model, const Request& request) {
                     const char* detail = last_error();
                     return fail("write_failed", detail && detail[0] ? detail : "Managed field write failed.");
                 }
+                remember_write(field->type_name, previous, "field", field->name);
                 Inspect::ValueInfo observed = Inspect::ReadField(write_target, *field);
                 Json result = target_json({{"member", field->name}, {"kind", "field"}, {"previous", previous},
                                            {"value", value_json(observed, field->name)}});
@@ -3020,6 +3121,7 @@ Response RuntimeTools::execute(RuntimeModel& model, const Request& request) {
             const char* detail = last_error();
             return fail("write_failed", detail && detail[0] ? detail : "Managed property write failed.");
         }
+        remember_write(property->type_name, previous, "property", property->name);
         Json result = target_json({{"member", property->name}, {"kind", "property"}, {"written", true}});
         if (property->can_read) {
             Inspect::ValueInfo observed = Inspect::ReadProperty(write_target, *property);

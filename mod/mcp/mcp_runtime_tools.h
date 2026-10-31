@@ -64,6 +64,15 @@ class RuntimeTools {
         std::vector<SnapshotMember> members;
     };
 
+    // A write that can be reverted: where it went and the value it replaced.
+    struct WriteRecord {
+        std::string reference_key;
+        std::string reference;
+        std::string member;
+        std::string kind;
+        nlohmann::json previous;
+    };
+
     std::string issue_reference(RuntimeModel& model, Reference reference);
     void release_reference_storage(RuntimeModel& model, const Reference& reference);
     const Reference* find_reference(std::string_view token, ReferenceKind kind,
@@ -75,6 +84,8 @@ class RuntimeTools {
     std::deque<std::string> reference_order_;
     std::unordered_map<std::string, ObjectSnapshot> snapshots_;
     std::deque<std::string> snapshot_order_;
+    std::deque<WriteRecord> write_journal_;
+    bool replaying_undo_ = false;
     std::uint64_t scene_generation_ = 0;
     std::uint64_t hierarchy_revision_ = 0;
     std::uint64_t next_instance_scan_id_ = 1;

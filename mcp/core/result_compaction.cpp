@@ -28,6 +28,15 @@ Json tabulate(const Json& rows) {
                     return nullptr;
             }
     }
+    // A column that is null in every row carries nothing.
+    std::erase_if(columns, [&](const std::string& column) {
+        return std::all_of(rows.begin(), rows.end(), [&](const Json& row) {
+            const auto found = row.find(column);
+            return found == row.end() || found->is_null();
+        });
+    });
+    if (columns.size() < kMinimumColumns)
+        return nullptr;
     Json table_rows = Json::array();
     for (const Json& row : rows) {
         Json cells = Json::array();

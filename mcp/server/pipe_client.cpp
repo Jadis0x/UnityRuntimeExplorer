@@ -26,6 +26,15 @@ std::filesystem::path discovery_directory() {
            L"UnityRuntimeExplorer" / L"bridges";
 }
 
+bool process_alive(std::uint32_t pid) {
+    const HANDLE process = OpenProcess(SYNCHRONIZE, FALSE, pid);
+    if (!process)
+        return GetLastError() == ERROR_ACCESS_DENIED;
+    const bool alive = WaitForSingleObject(process, 0) == WAIT_TIMEOUT;
+    CloseHandle(process);
+    return alive;
+}
+
 std::vector<Discovery> discoveries() {
     std::vector<Discovery> result;
     const std::filesystem::path directory = discovery_directory();
@@ -35,18 +44,27 @@ std::vector<Discovery> discoveries() {
     for (const auto& entry : std::filesystem::directory_iterator(directory, error)) {
         if (error || !entry.is_regular_file() || entry.path().extension() != L".json")
             continue;
+        std::uint32_t pid = 0;
+        std::string pipe;
+        CapabilityMask capabilities = 0;
         try {
             std::ifstream input(entry.path());
             const nlohmann::json value = nlohmann::json::parse(input);
             if (value.value("protocol", std::string{}) != bridge_protocol_version ||
                 !value.contains("pid") || !value.contains("pipe"))
                 continue;
-            const std::string pipe = value["pipe"].get<std::string>();
-            result.push_back({value["pid"].get<std::uint32_t>(), std::wstring(pipe.begin(), pipe.end()),
-                              value.value("capabilities", CapabilityMask{0})});
+            pipe = value["pipe"].get<std::string>();
+            pid = value["pid"].get<std::uint32_t>();
+            capabilities = value.value("capabilities", CapabilityMask{0});
         } catch (const nlohmann::json::exception&) {
             continue;
         }
+        if (!process_alive(pid)) {
+            // Left behind by a crashed game; the file is closed by now.
+            std::filesystem::remove(entry.path(), error);
+            continue;
+        }
+        result.push_back({pid, std::wstring(pipe.begin(), pipe.end()), capabilities});
     }
     return result;
 }

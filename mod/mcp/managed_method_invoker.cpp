@@ -154,7 +154,7 @@ bool parse_argument(const URK::Unity::Inspect::MethodParamInfo& parameter,
         return true;
     }
     if (!input.is_object() || !input.contains("reference") || !input["reference"].is_string()) {
-        error = "parameter " + parameter.name + " requires {\"reference\": \"urkref_...\"}";
+        error = "parameter " + parameter.name + " requires {\"reference\": \"r_...\"}";
         return false;
     }
     std::string reference_error;

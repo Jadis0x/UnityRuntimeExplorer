@@ -173,8 +173,6 @@ set(URK_COMMON_HEADERS
         mod/ui/theme.h
         mod/ui/localization.h
         mod/ui/widgets.h
-        mod/ui/tabs/about_tab.h
-        mod/ui/tabs/config_tab.h
         mod/ui/menu.h
         mod/ui/highlight.h
         mod/hooks/render_imgui_hook.h

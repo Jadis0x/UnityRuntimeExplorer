@@ -95,6 +95,11 @@ Lists of records are returned as tables, `{"cols":[names],"rows":[[values]]}`, w
 state each key once instead of once per row. A null cell can also mean the field
 was absent. Start the helper with `--verbose-output` to get plain objects.
 
+`inspect_managed_object` hides members inherited from engine base types
+(`UnityEngine.Object`, `Component`, `Behaviour`, `MonoBehaviour`, `System.Object`)
+and reports `hidden_inherited`; pass `include_inherited` to see them.
+All-null table columns are dropped.
+
 Member values are lean: a scalar carries `value` without a repeated `display`, and
 `readable` (true), `static` (false), `runtime_safe` (true) and a `declaring_type` equal
 to the object's own type are omitted when they hold their default. Floats print
@@ -137,6 +142,7 @@ Full-access operations are:
 | Tool | Behavior |
 | --- | --- |
 | `write_member` | Writes an instance field or property (`reference`) or a static one (`type_reference`) from bounded JSON, and returns the previous and the observed new value. |
+| `undo_write` | Reverts the most recent `write_member` whose old value is a boolean or number. Up to 32 writes are remembered. Native pointer fields (`m_CachedPtr`, `IntPtr`) cannot be written. |
 | `mutate_game_object` | Changes identity/state/transform, duplicates, or destroys a GameObject. |
 | `manage_component` | Adds, removes, or enables components. |
 | `load_scene` | Loads a build scene by index or name. |
@@ -300,7 +306,7 @@ can reuse the same transport-neutral tool catalog without changing the DLL bridg
   lock each other out. A fifth client is refused with `bridge_busy`. Object,
   snapshot and trace references are shared between clients. Each connection has
   its own request budget.
-- Object and component references are random 128-bit opaque tokens stored only
+- Object and component references are random 48-bit opaque tokens (`r_` plus 12 hex digits) stored only
   in the DLL. They survive ordinary hierarchy refreshes and expire on a scene
   generation change. Graph references additionally expire when their hierarchy
   revision changes.
