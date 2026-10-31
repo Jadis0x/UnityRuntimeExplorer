@@ -262,13 +262,13 @@ void render_current_object_inspector(const Snapshot &snapshot) {
                 ImGui::PushID(static_cast<int>(index));
                 ImGui::TableNextRow();
                 ImGui::TableSetColumnIndex(0);
-                ImGui::TextUnformatted(member.name.c_str());
+                render_member_name(property_members ? Labels::Kind::Property : Labels::Kind::Field,
+                                   member.declaring_type.empty() ? info.type_name : member.declaring_type,
+                                   member.name, {}, Labels::humanize(member.type_name));
                 if constexpr (requires { member.can_write; })
                     render_property_context_menu(member, object_code, {});
                 else
                     render_field_context_menu(member, object_code, {});
-                if (ImGui::IsItemHovered())
-                    ImGui::SetTooltip("%s\nRight-click for copy/code options", member.type_name.c_str());
                 ImGui::TableSetColumnIndex(1);
                 bool writable = !info.is_value_type || info.value_origin_component_id != 0;
                 if constexpr (requires { member.can_write; })
@@ -348,16 +348,18 @@ void render_current_object_inspector(const Snapshot &snapshot) {
             if (!method_matches_filter(method, member_filter))
                 continue;
             ImGui::PushID(static_cast<int>(index));
-            ImGui::TextDisabled("%s", method.return_type.c_str());
+            ImGui::TextDisabled("%s", Labels::humanize(method.return_type).c_str());
             ImGui::SameLine();
-            ImGui::TextUnformatted(method.name.c_str());
+            render_member_name(Labels::Kind::Method,
+                               method.declaring_type.empty() ? info.type_name : method.declaring_type, method.name,
+                               Labels::method_signature(method.parameter_types));
             render_method_context_menu(method, object_code);
             ImGui::SameLine();
             std::string parameters = "(";
             for (std::size_t parameter = 0; parameter < method.parameter_types.size(); ++parameter) {
                 if (parameter)
                     parameters += ", ";
-                parameters += method.parameter_types[parameter];
+                parameters += Labels::humanize(method.parameter_types[parameter]);
             }
             parameters += ")";
             ImGui::TextDisabled("%s", parameters.c_str());

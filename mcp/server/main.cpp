@@ -15,18 +15,24 @@ int main(int argc, char** argv) {
     std::optional<std::uint32_t> game_pid;
     bool allow_tracing = false;
     bool allow_invocation = false;
+    bool compact_output = true;
     for (int index = 1; index < argc; ++index) {
         const std::string_view argument = argv[index];
         if (argument == "--help") {
             std::cerr << "UnityRuntimeExplorer MCP Server " << URK::project_version << "\n\n"
                          "Usage:\n"
-                         "  URK_UnityRuntimeExplorer_McpServer.exe [--game-pid <pid>] [--allow-tracing] [--allow-invocation]\n\n"
+                         "  URK_UnityRuntimeExplorer_McpServer.exe [--game-pid <pid>] [--allow-tracing] [--allow-invocation] [--verbose-output]\n\n"
                          "Options:\n"
                          "  --game-pid <pid>  Select one Explorer-enabled game.\n"
                          "  --allow-tracing   Deprecated compatibility option; permissions live in Explorer Config.\n"
                          "  --allow-invocation Deprecated compatibility option; permissions live in Explorer Config.\n"
+                         "  --verbose-output  Keep arrays of objects as objects instead of {cols, rows} tables.\n"
                          "  --help            Show this help.\n";
             return 0;
+        }
+        if (argument == "--verbose-output") {
+            compact_output = false;
+            continue;
         }
         if (argument == "--allow-tracing") {
             allow_tracing = true;
@@ -59,5 +65,6 @@ int main(int argc, char** argv) {
                  "Configure discovery, properties, writes, tracing, invocation, and destructive operations in Explorer > Config.\n"
               << "Waiting for MCP messages on stdin...\n" << std::flush;
     Explorer::Mcp::StdioServer server(game_pid, allow_tracing, allow_invocation);
+    server.set_compact_output(compact_output);
     return server.run();
 }

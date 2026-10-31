@@ -3,7 +3,7 @@
 UnityRuntimeExplorer provides Model Context Protocol access to a live
 Windows Unity game. It supports bounded automatic discovery, inspection,
 managed writes, Unity object/component operations, method tracing, and managed
-method invocation. Explorer Config independently controls each capability. The
+method invocation. The Explorer MCP menu independently controls each capability. The
 MCP protocol and client transport remain outside the injected mod DLL.
 
 ## Architecture
@@ -45,8 +45,10 @@ managed object itself.
 | `get_selected_object` | Current Explorer selection and an opaque reference. |
 | `inspect_game_object` | Identity, state, transform, and components without changing the UI selection. |
 | `list_components` | Component types and opaque component references. |
-| `read_member` | Explicitly samples one field or readable property. Property getters are game code and may have their own behavior. |
+| `read_member` | Reads one field or readable property of a component or managed object (`reference`), or a static member (`type_reference`). The member can be named by its real name, its alias, or a saved label. Property getters are game code and may have their own behavior. |
 | `inspect_managed_object` | Reads bounded fields from component or managed-object references. Property getters execute only when explicitly requested. |
+| `snapshot_object` | Remembers the member values of a component or managed object and returns only a `snapshot_reference`. Values are compared as plain data, never as reference tokens. At most sixteen snapshots are kept. |
+| `diff_snapshot` | Returns only what changed since a snapshot: `changed` (`member`, `from`, `to`), `added`, `removed` and an `unchanged` count. `against` compares two snapshots, `rebase` makes the current state the new baseline, `epsilon` ignores small float noise. Object references are compared by their display text. |
 | `read_array` | Pages a managed array and returns opaque references for reference elements. |
 | `decode_byte_array` | Copies and decodes bounded `System.Byte[]` data without exposing managed memory. |
 | `start_instance_scan` | Starts a direct Unity-object query or time-sliced reachable managed-graph scan for a type. |
@@ -61,6 +63,51 @@ managed object itself.
 | `build_reference_graph` | Bounded graph for the current Explorer selection. |
 | `get_watch_history` | Current watches and bounded recent change events. |
 | `export_diagnostic_bundle` | Writes to the Explorer's fixed `URK_Diagnostics` directory and returns only the path. |
+| `list_labels` | Lists the labels and notes saved for this game's types and members. |
+
+Navigation tools let a client move through the game without guessing names.
+Every result carries references that lead one step further in, and
+`describe_reference` and the `parent`/`owner` fields lead back out:
+
+| Tool | Behavior |
+| --- | --- |
+| `list_scenes` | Loaded scenes with root counts, plus build scenes. |
+| `browse_hierarchy` | One level of the GameObject tree: a scene's roots, or an object with its parent, ancestors (breadcrumb) and a page of children. |
+| `select_game_object` | Selects an object in the overlay so the person watching sees it. Changes only the UI selection. |
+| `describe_reference` | What a reference points to and whether it is still valid. A component reports its `owner_reference`; a managed object reports its type and source. |
+| `list_assemblies` / `list_namespaces` | Browse loaded assemblies and their namespaces with type counts. |
+| `get_type_hierarchy` | Base chain, interfaces, and a page of derived types for a type reference. |
+| `read_static_members` | Static fields (and, when permitted, static properties) of a type. |
+
+List tools take `offset` and report `has_more`. A result larger than the
+28 KiB response budget is trimmed from its largest array and marked `truncated`
+with `trimmed_arrays`, instead of failing. Page for the rest.
+
+`batch` runs up to ten read tools (`calls: [{tool, arguments}]`) in one call and
+returns `results` in the same order, each `{ok, result}` or `{ok, error}`.
+Tracing, invocation and every write stay out of a batch, each sub-call is
+validated and permission-checked like a normal call, and a batch stops
+dispatching once its results pass about 24 KiB (the rest report
+`batch_budget_exhausted`; send them again). Prefer it to separate calls: it
+costs one model turn instead of one per call.
+
+Lists of records are returned as tables, `{"cols":[names],"rows":[[values]]}`, which
+state each key once instead of once per row. A null cell can also mean the field
+was absent. Start the helper with `--verbose-output` to get plain objects.
+
+Member values are lean: a scalar carries `value` without a repeated `display`, and
+`readable` (true), `static` (false), `runtime_safe` (true) and a `declaring_type` equal
+to the object's own type are omitted when they hold their default. Floats print
+as the game shows them (`0.1`, not `0.10000000149011612`).
+
+The published tool list is kept compact (no titles, minimal annotations, short
+descriptions) because every session re-reads it.
+
+`search_types`, `search_members`, and `inspect_type` report each saved
+`label` (and `label_note`), plus an `alias` such as `m_7c1e2a` for any name
+that cannot be read or typed. Their queries also match labels and notes.
+List results stop short of the 64 KiB bridge limit and set `truncated`
+instead of failing.
 
 The helper always publishes the complete catalog so agents can plan and
 self-discover. Explorer checks the current in-game permission on every call.
@@ -89,10 +136,15 @@ Full-access operations are:
 
 | Tool | Behavior |
 | --- | --- |
-| `write_member` | Writes an instance field or writable property from bounded JSON. |
+| `write_member` | Writes an instance field or property (`reference`) or a static one (`type_reference`) from bounded JSON, and returns the previous and the observed new value. |
 | `mutate_game_object` | Changes identity/state/transform, duplicates, or destroys a GameObject. |
 | `manage_component` | Adds, removes, or enables components. |
 | `load_scene` | Loads a build scene by index or name. |
+| `set_label` | Saves a readable name and note for a type or member. The target is a type full name plus a member name, or the member's `alias`; methods are labelled per overload unless `all_overloads` is set. Unknown targets are rejected. |
+| `remove_label` | Deletes a saved label, identified the same way. |
+
+Labels never touch game state, but they persist and are shown to the person
+using the overlay, so writing them follows the write permission.
 
 Scripting, assembly loading, raw addresses, and arbitrary native execution
 remain outside the MCP surface because they bypass Explorer's lifetime and type
@@ -124,8 +176,7 @@ keep a separate helper window open.
 
 ### MCP permissions in Explorer
 
-Open Explorer with **F7** and use the **MCP access and automation** section in
-Config. **Enable full access** enables automatic discovery, property getters,
+Open Explorer with **F7** and use the **MCP** menu in the top menu bar. **Full access** enables automatic discovery, property getters,
 writes, tracing, invocation, and destructive operations. **Read-only preset**
 keeps bounded field discovery/inspection while disabling executable or mutating
 paths. Individual toggles are stored under `[MCP]` in `URK_Explorer.ini`.
@@ -244,7 +295,11 @@ can reuse the same transport-neutral tool catalog without changing the DLL bridg
 
 ## Security properties and limits
 
-- The bridge is local-only and limited to one helper connection at a time.
+- The bridge is local-only and serves up to four helper connections at once, so
+  two agents, or a restarted helper whose predecessor has not exited yet, do not
+  lock each other out. A fifth client is refused with `bridge_busy`. Object,
+  snapshot and trace references are shared between clients. Each connection has
+  its own request budget.
 - Object and component references are random 128-bit opaque tokens stored only
   in the DLL. They survive ordinary hierarchy refreshes and expire on a scene
   generation change. Graph references additionally expire when their hierarchy
@@ -264,9 +319,15 @@ can reuse the same transport-neutral tool catalog without changing the DLL bridg
 - JSON-RPC envelopes and tool arguments are type-checked against the published
   input schema before reaching the game process. Each tool also publishes an
   output schema and returns backward-compatible text plus structured content.
-- The bridge uses a token-bucket limit of five calls per second with a burst of
-  twenty, and processes at most four requests per game frame.
-- A request waits at most five seconds for the Unity main thread.
+- The bridge paces requests with a cost-weighted token bucket (default 20
+  tokens per second, burst 60). Snapshot reads cost 0.25, scans, searches and
+  graph builds cost 3, everything else 1. A request that finds the bucket empty
+  waits up to two seconds for a refill; only a longer wait is refused, with
+  `rate_limited` and a `retry_after_ms` hint that the helper honours with up to
+  two automatic retries. At most four requests are processed per game frame.
+- A request waits at most eight seconds (default) for the Unity main thread.
+  `RatePerSecond`, `Burst` and `TimeoutMs` under `[MCP]` in `URK_Explorer.ini`
+  (also sliders in the MCP menu) change these limits.
 - Every successful or failed MCP tool call is recorded in the Explorer flight
   recorder shown by the Activity Log/diagnostic bundle.
 - Trace control requires the persisted in-game permission. Enabling tracing
@@ -276,8 +337,9 @@ can reuse the same transport-neutral tool catalog without changing the DLL bridg
   and does not enable writes or native-address inputs.
 - Trace sessions are capped at twelve and retain at most 1,024 records each.
   Overwritten-record and native-fault counts remain visible to the client.
-- Hooks installed through MCP are automatically stopped when the helper
-  disconnects or the in-game tracing permission is disabled. Trace sessions
+- Hooks installed through MCP are automatically stopped when the helper has
+  been disconnected for 30 seconds (a client restart reconnects in time) or the
+  in-game tracing permission is disabled. Trace sessions
   started manually from the Explorer UI are not affected by MCP revocation.
 - Error responses use stable categories and omit native fault addresses.
 - There is no arbitrary command execution, assembly loading, scripting tool,
@@ -300,12 +362,13 @@ properties.
   conceptual object such as "the player" does not exist.
 - **Timeout:** the game main thread may be paused or blocked. Resume it and
   retry; the helper does not call the managed runtime from a worker thread.
-- **Rate limited:** reduce polling frequency. Prefer one bounded query over
-  repeatedly requesting the same snapshot.
+- **Rate limited:** rare now; the helper already waits and retries. If it still
+  appears, raise **Requests per second** / **Burst** in the MCP menu, or
+  prefer one bounded query over repeatedly requesting the same snapshot.
 - **Member unavailable:** the runtime may have stripped metadata, the component
   may have been destroyed, or the member may be opaque/unsafe for generic
   inspection. The tool reports the failure rather than returning a default.
-- **Tracing permission required:** enable the in-game Config option.
+- **Tracing permission required:** enable it in the MCP menu.
 - **Invocation permission required:** enable the separate in-game invocation
   option.
 - **Caller shown as a module:** inspect likely caller types with `search_types`

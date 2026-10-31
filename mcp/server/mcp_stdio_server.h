@@ -14,6 +14,8 @@ class StdioServer {
   public:
     StdioServer(std::optional<std::uint32_t> game_pid, bool allow_tracing, bool allow_invocation)
         : game_pid_(game_pid) { (void)allow_tracing; (void)allow_invocation; }
+    // Tabulate arrays of uniform objects.
+    void set_compact_output(bool enabled) { compact_output_ = enabled; }
     int run();
     int run(std::istream& input, std::ostream& output);
 
@@ -27,11 +29,15 @@ class StdioServer {
 
     bool ensure_connected(std::string& error);
     nlohmann::json call_tool(std::string tool_name, nlohmann::json arguments);
+    nlohmann::json call_single(std::string tool_name, nlohmann::json arguments);
+    // Runs several read tools in one call.
+    nlohmann::json call_batch(const nlohmann::json& arguments);
     ToolPermissions permissions();
     // True when the granted permissions changed since the last catalog answer.
     bool catalog_changed();
 
     std::optional<std::uint32_t> game_pid_;
+    bool compact_output_ = true;
     bool connection_announced_ = false;
     CapabilityMask announced_capabilities_ = 0;
     bool announced_capabilities_valid_ = false;

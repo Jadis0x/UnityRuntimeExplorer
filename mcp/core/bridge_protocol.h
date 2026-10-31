@@ -50,6 +50,8 @@ struct Response {
     nlohmann::json result = nlohmann::json::object();
     std::string error_code;
     std::string error_message;
+    // Suggested wait before retrying; 0 means no hint.
+    std::uint32_t retry_after_ms = 0;
 };
 
 bool parse_request(std::string_view text, Request& request, std::string& error);

@@ -125,7 +125,7 @@ Json JsonRpcSession::initialize(const RpcMessage& message) {
         {"capabilities", std::move(capabilities)},
         {"serverInfo", {{"name", "unity-runtime-explorer"},
                         {"title", "Unity Runtime Explorer"}, {"version", URK::project_version}}},
-        {"instructions", "Discover and inspect the live Unity runtime through opaque references. Explorer Config is the authoritative permission boundary. Prefer discover_runtime before targeted tools; property getters, writes, tracing, invocation, and destructive operations are independently audited."}});
+        {"instructions", "Discover and inspect the live Unity runtime through opaque references. Explorer Config is the authoritative permission boundary. Prefer discover_runtime before targeted tools; property getters, writes, tracing, invocation, and destructive operations are independently audited. Lists of records arrive as tables {cols:[names], rows:[[values]]}; a null cell may mean the field was absent. Omitted flags take their defaults (readable true, static false, runtime_safe true), and a member without declaring_type belongs to the object's own type. Use batch for several reads, and snapshot_object then diff_snapshot to see what changed."}});
 }
 
 void JsonRpcSession::initialized() {

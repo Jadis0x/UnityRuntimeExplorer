@@ -104,6 +104,7 @@ bool parse_response(std::string_view text, Response& response, std::string& erro
         response.result = value.value("result", nlohmann::json::object());
         response.error_code = value.value("error_code", std::string{});
         response.error_message = value.value("error_message", std::string{});
+        response.retry_after_ms = value.value("retry_after_ms", std::uint32_t{0});
         return true;
     } catch (const nlohmann::json::exception&) {
         error = "response is not valid JSON";
@@ -123,6 +124,8 @@ std::string serialize(const Response& response) {
     else {
         value["error_code"] = response.error_code;
         value["error_message"] = response.error_message;
+        if (response.retry_after_ms != 0)
+            value["retry_after_ms"] = response.retry_after_ms;
     }
     redact_json(value);
     return value.dump();

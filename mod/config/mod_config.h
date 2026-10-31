@@ -38,6 +38,11 @@ inline std::atomic<bool> enable_mcp_writes{true};
 inline std::atomic<bool> enable_mcp_tracing{true};
 inline std::atomic<bool> enable_mcp_invocation{true};
 inline std::atomic<bool> enable_mcp_destructive_operations{true};
+// Bridge pacing, loaded from [MCP].
+inline std::atomic<int> mcp_requests_per_second{20};
+inline std::atomic<int> mcp_burst{60};
+// Max wait for the Unity main thread.
+inline std::atomic<int> mcp_timeout_ms{8000};
 // English is used as the fixed language when localization support is not generated.
 inline bool enable_localization = false;
 inline constexpr const char *default_language = "en";

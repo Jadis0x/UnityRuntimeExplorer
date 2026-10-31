@@ -64,6 +64,8 @@ class RuntimeModel {
     void continue_class_instance_scan();
     void clear_class_instance_scan();
     void load_class_browser_static_state(const Command &command);
+    // The runtime class a Class Browser command names, validated against its metadata identity.
+    const URK::managed::Class *browser_class(const Command &command) const;
     void load_class_browser_members(const Command &command);
     void set_class_browser_static_field(const Command &command);
     void create_class_instance(const Command &command);

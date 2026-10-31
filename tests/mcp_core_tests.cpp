@@ -1,6 +1,7 @@
 // Copyright (c) 2026 Jadis0x. All rights reserved.
 #include "mcp/core/bridge_protocol.h"
 #include "mcp/core/object_discovery.h"
+#include "mcp/core/result_compaction.h"
 #include "mcp/core/tool_catalog.h"
 
 #include <cstdlib>
@@ -18,11 +19,18 @@ void require(bool condition, const char* message) {
 
 int main() {
     using namespace Explorer::Mcp;
-    require(tool_catalog().size() == 24, "twenty-four base tools are exposed");
-    require(tool_catalog(true).size() == 27, "three tracing tools are exposed");
-    require(tool_catalog(false, true).size() == 25, "invocation can be classified independently");
-    require(tool_catalog(true, true).size() == 28, "tracing and invocation can be combined");
-    require(tool_catalog(true, true, true).size() == 32, "the complete Explorer-controlled catalog is exposed");
+    require(tool_catalog().size() == 36, "thirty-six base tools (including batch and snapshots) are exposed");
+    require(tool_catalog(true).size() == 39, "three tracing tools are exposed");
+    require(tool_catalog(false, true).size() == 37, "invocation can be classified independently");
+    require(tool_catalog(true, true).size() == 40, "tracing and invocation can be combined");
+    require(tool_catalog(true, true, true).size() == 46, "the complete Explorer-controlled catalog is exposed");
+    for (const char* navigation : {"list_scenes", "browse_hierarchy", "describe_reference", "list_assemblies",
+                                   "list_namespaces", "get_type_hierarchy", "read_static_members"})
+        require(is_base_tool(navigation), "navigation tools are always available");
+    require(!is_write_tool("select_game_object"), "selecting never needs write permission");
+    require(is_read_only_tool("list_labels"), "label listing is read-only");
+    require(is_write_tool("set_label") && is_write_tool("remove_label"), "label edits need write permission");
+    require(!is_destructive_tool("set_label"), "labels never change game state");
     require(is_read_only_tool("runtime_status"), "runtime_status is allowed");
     require(is_read_only_tool("search_types"), "managed type search is read-only");
     require(is_read_only_tool("get_method_trace"), "trace reads are read-only");
@@ -65,6 +73,45 @@ int main() {
                     "invocation is not mislabeled read-only");
     }
 
+    require(is_base_tool("batch") && !is_read_only_tool("batch"), "batch is a base tool that stays gated by its sub-calls");
+    for (const auto& tool : tool_catalog(true, true, true)) {
+        const auto& annotations = tool["annotations"];
+        require(annotations.contains("readOnlyHint") && annotations.contains("openWorldHint"),
+                "every tool publishes its read-only and open-world hints");
+        if (annotations["readOnlyHint"].get<bool>())
+            require(!annotations.contains("destructiveHint"), "read-only tools omit redundant hints");
+        else
+            require(annotations.contains("destructiveHint") && annotations.contains("idempotentHint"),
+                    "mutable tools spell out destructive and idempotent hints");
+        require(!tool.contains("title"), "tool titles only repeat the name");
+        require(!tool["inputSchema"].contains("required") || !tool["inputSchema"]["required"].empty(),
+                "an empty required list is not published");
+    }
+    // Keep the tool list compact.
+    require(tool_catalog(true, true, true).dump().size() < 24000, "the full tool list stays compact");
+
+
+    // Uniform records become {cols, rows} tables.
+    {
+        nlohmann::json records = nlohmann::json::array();
+        for (int index = 0; index < 20; ++index)
+            records.push_back({{"name", "member_" + std::to_string(index)}, {"kind", "signed_integer"},
+                               {"value", index}, {"readable", true}});
+        records[3].erase("readable");
+        const nlohmann::json input = {{"fields", records}, {"count", 20}, {"tags", {"a", "b", "c"}}};
+        const nlohmann::json output = compact_tables(input);
+        require(output["count"] == 20 && output["tags"] == input["tags"], "scalars and string arrays are untouched");
+        require(output["fields"].contains("cols") && output["fields"]["rows"].size() == 20,
+                "uniform records become a table");
+        require(output["fields"]["rows"][3][2].is_null(), "a missing key becomes a null cell");
+        require(output["fields"]["rows"][5][3] == 5, "cells keep their column order");
+        require(output.dump().size() * 10 < input.dump().size() * 7, "a table saves at least 30 percent");
+        const nlohmann::json short_list = {{"fields", {{{"a", 1}, {"b", 2}}, {{"a", 3}, {"b", 4}}}}};
+        require(compact_tables(short_list) == short_list, "two rows are not worth a table");
+        const nlohmann::json mixed = {{"v", {{{"a", 1}, {"b", 2}}, 7, {{"a", 3}, {"b", 4}}}}};
+        require(compact_tables(mixed) == mixed, "mixed arrays are untouched");
+    }
+
     Request input{"42", "hierarchy_search", {{"query", "camera"}}};
     input.context.capabilities = capability_bit(Capability::Read) | capability_bit(Capability::Write);
     Request parsed;
@@ -77,6 +124,15 @@ int main() {
     Response parsed_output;
     require(parse_response(serialize(output), parsed_output, error), "bridge response round trip");
     require(parsed_output.ok && parsed_output.result["connected"].get<bool>(), "bridge result preserved");
+
+    Response limited = failure("9", "rate_limited", "budget exhausted");
+    limited.retry_after_ms = 750;
+    Response parsed_limited;
+    require(parse_response(serialize(limited), parsed_limited, error) && !parsed_limited.ok &&
+                parsed_limited.retry_after_ms == 750,
+            "retry_after_ms survives the bridge round trip");
+    require(serialize(failure("9", "x", "y")).find("retry_after_ms") == std::string::npos,
+            "retry_after_ms is omitted when there is no hint");
 
     Response sensitive{"7", true, {{"safe", "object at 0x1234ABCDEF and small 0x12"}}};
     const std::string redacted = serialize(sensitive);

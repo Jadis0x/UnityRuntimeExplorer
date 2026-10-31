@@ -2,6 +2,7 @@
 #include "mcp_stdio_server.h"
 
 #include "bounded_stdio_transport.h"
+#include "mcp/core/result_compaction.h"
 #include "mcp/core/tool_catalog.h"
 #include "mcp/core/schema_validator.h"
 #include "project_version.h"
@@ -10,8 +11,11 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <chrono>
+#include <functional>
 #include <iostream>
 #include <string>
+#include <thread>
 
 namespace Explorer::Mcp {
 namespace {
@@ -19,6 +23,8 @@ using Json = nlohmann::json;
 
 constexpr std::uint64_t kDefaultTaskTtlMs = 300000;
 constexpr std::size_t kMaximumStdioOutputBytes = 128 * 1024;
+constexpr int kMaximumAutoRetries = 2;
+constexpr std::uint32_t kMaximumAutoRetryMs = 4000;
 } // namespace
 
 bool StdioServer::ensure_connected(std::string& error) {
@@ -57,6 +63,69 @@ bool StdioServer::catalog_changed() {
 }
 
 nlohmann::json StdioServer::call_tool(std::string tool_name, Json arguments) {
+    if (tool_name == "batch")
+        return call_batch(arguments);
+    return call_single(std::move(tool_name), std::move(arguments));
+}
+
+namespace {
+// Stop dispatching a batch once its results pass this size.
+constexpr std::size_t kBatchResultBytes = 24 * 1024;
+
+// Reads only; no tracing, invocation or writes.
+bool batchable(std::string_view tool) {
+    return tool != "batch" && is_base_tool(tool) &&
+           (is_read_only_tool(tool) || tool == "read_member" || tool == "inspect_managed_object" ||
+            tool == "read_static_members");
+}
+
+using ToolRunner = std::function<Json(std::string, Json)>;
+
+Json batch_failure(const std::string& error) {
+    return {{"ok", false}, {"error", error}};
+}
+
+Json batch_entry(const Json& call, std::size_t spent, const ToolRunner& run) {
+    const std::string tool = call.value("tool", std::string{});
+    Json arguments = call.value("arguments", Json::object());
+    if (!batchable(tool))
+        return batch_failure("not_batchable: " + tool);
+
+    const auto& catalog = tool_catalog(true, true, true);
+    const auto definition = std::find_if(catalog.begin(), catalog.end(), [&](const Json& entry) {
+        return entry.value("name", std::string{}) == tool;
+    });
+    std::string problem;
+    if (definition == catalog.end())
+        return batch_failure("not_batchable: " + tool);
+    if (!validate_json_schema(arguments, (*definition)["inputSchema"], problem))
+        return batch_failure("invalid_arguments: " + problem);
+    if (spent >= kBatchResultBytes)
+        return batch_failure("batch_budget_exhausted: send this call again");
+
+    Json outcome = run(tool, std::move(arguments));
+    if (outcome.value("isError", false))
+        return batch_failure(outcome["content"][0].value("text", std::string{}));
+    return {{"ok", true}, {"result", std::move(outcome["structuredContent"])}};
+}
+} // namespace
+
+nlohmann::json StdioServer::call_batch(const Json& arguments) {
+    Json results = Json::array();
+    std::size_t spent = 0;
+    for (const Json& call : arguments.value("calls", Json::array())) {
+        Json entry = batch_entry(call, spent, [this](std::string tool, Json call_arguments) {
+            return call_single(std::move(tool), std::move(call_arguments));
+        });
+        spent += entry.dump().size();
+        results.push_back(std::move(entry));
+    }
+    Json structured = {{"results", std::move(results)}};
+    return {{"content", {{{"type", "text"}, {"text", structured.dump()}}}},
+            {"structuredContent", std::move(structured)}, {"isError", false}};
+}
+
+nlohmann::json StdioServer::call_single(std::string tool_name, Json arguments) {
     if (!is_available_tool(tool_name, true, true, true))
         return {{"content", {{{"type", "text"}, {"text", "Unknown MCP tool: " + tool_name}}}},
                 {"isError", true}};
@@ -73,15 +142,31 @@ nlohmann::json StdioServer::call_tool(std::string tool_name, Json arguments) {
     Request request{std::to_string(next_bridge_id_++), std::move(tool_name), std::move(arguments)};
     Response response;
     std::string bridge_error;
-    if (!bridge_.transact(request, response, bridge_error)) {
-        connection_announced_ = false;
-        return {{"content", {{{"type", "text"}, {"text", bridge_error}}}}, {"isError", true}};
+    // Honour the bridge's retry hint instead of failing.
+    for (int attempt = 0;; ++attempt) {
+        if (!bridge_.transact(request, response, bridge_error)) {
+            connection_announced_ = false;
+            return {{"content", {{{"type", "text"}, {"text", bridge_error}}}}, {"isError", true}};
+        }
+        const bool retryable = !response.ok && response.retry_after_ms != 0 &&
+                               response.retry_after_ms <= kMaximumAutoRetryMs;
+        if (!retryable || attempt >= kMaximumAutoRetries)
+            break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(response.retry_after_ms));
+        request.id = std::to_string(next_bridge_id_++);
     }
-    if (!response.ok)
-        return {{"content", {{{"type", "text"},
-            {"text", response.error_code + ": " + response.error_message}}}}, {"isError", true}};
-    return {{"content", {{{"type", "text"}, {"text", response.result.dump()}}}},
-            {"structuredContent", response.result}, {"isError", false}};
+    if (!response.ok) {
+        std::string text = response.error_code + ": " + response.error_message;
+        if (response.retry_after_ms != 0)
+            text += " (retry_after_ms=" + std::to_string(response.retry_after_ms) + ")";
+        return {{"content", {{{"type", "text"}, {"text", text}}}}, {"isError", true}};
+    }
+    Json result = std::move(response.result);
+    if (compact_output_)
+        result = compact_tables(std::move(result));
+    return {{"content", {{{"type", "text"}, {"text", result.dump()}}}},
+            {"structuredContent", std::move(result)},
+            {"isError", false}};
 }
 
 int StdioServer::run() {

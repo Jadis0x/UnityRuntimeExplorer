@@ -121,6 +121,8 @@ set(URK_COMMON_SOURCES
         mod/explorer/ui_state.cpp
         mod/explorer/ui_members.cpp
         mod/explorer/ui_hierarchy.cpp
+        mod/explorer/ui_labels.cpp
+        mod/explorer/member_labels.cpp
         mod/explorer/ui_class_browser.cpp
         mod/explorer/ui_object_inspector.cpp
         mod/explorer/ui_inspector.cpp
@@ -185,6 +187,7 @@ set(URK_COMMON_HEADERS
         mod/explorer/explorer_commands.h
         mod/explorer/explorer_model.h
         mod/explorer/explorer_ui.h
+        mod/explorer/member_labels.h
         mod/explorer/unity_editor_theme.h
         sdk/unity/unity_euler.h
         mod/explorer/pick_geometry.h
@@ -282,6 +285,8 @@ add_executable(URK_UnityRuntimeExplorer_McpServer
     mcp/core/bridge_protocol.h
     mcp/core/object_discovery.cpp
     mcp/core/object_discovery.h
+    mcp/core/result_compaction.cpp
+    mcp/core/result_compaction.h
     mcp/core/schema_validator.cpp
     mcp/core/schema_validator.h
     mcp/core/tool_catalog.cpp
@@ -557,6 +562,7 @@ if(URK_BUILD_TESTS)
         tests/mcp_core_tests.cpp
         mcp/core/bridge_protocol.cpp
         mcp/core/object_discovery.cpp
+        mcp/core/result_compaction.cpp
         mcp/core/schema_validator.cpp
         mcp/core/tool_catalog.cpp
     )
@@ -577,6 +583,7 @@ if(URK_BUILD_TESTS)
         mcp/server/request_dispatcher.cpp
         mcp/core/bridge_protocol.cpp
         mcp/core/object_discovery.cpp
+        mcp/core/result_compaction.cpp
         mcp/core/schema_validator.cpp
         mcp/core/tool_catalog.cpp
     )

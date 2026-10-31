@@ -73,6 +73,96 @@ void render_toggle_key_setting() {
                            ModConfig::UserSettings::last_error().c_str());
 }
 
+namespace Settings = ModConfig::UserSettings;
+
+void mcp_toggle(const char *label, std::atomic<bool> &state, bool (*save)(bool), const char *hint) {
+    bool value = state.load();
+    if (ImGui::Checkbox(label, &value))
+        save(value);
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("%s", hint);
+}
+
+void render_mcp_access() {
+    ImGui::SeparatorText("Access");
+    mcp_toggle("Enable MCP bridge", ModConfig::enable_mcp, Settings::save_mcp_enabled,
+               "Master switch. Off hides every tool from MCP clients.");
+    if (ImGui::SmallButton("Full access"))
+        Settings::save_mcp_full_access(true);
+    ImGui::SameLine();
+    if (ImGui::SmallButton("Read-only preset")) {
+        Settings::save_mcp_enabled(true);
+        Settings::save_mcp_auto_discovery(true);
+        Settings::save_mcp_property_access(false);
+        Settings::save_mcp_writes(false);
+        Settings::save_mcp_tracing(false);
+        Settings::save_mcp_invocation(false);
+        Settings::save_mcp_destructive_operations(false);
+    }
+
+    ImGui::BeginDisabled(!ModConfig::enable_mcp.load());
+    mcp_toggle("Automatic runtime discovery", ModConfig::enable_mcp_auto_discovery,
+               Settings::save_mcp_auto_discovery, "Lets clients search live objects and loaded types.");
+    mcp_toggle("Managed property getters", ModConfig::enable_mcp_property_access,
+               Settings::save_mcp_property_access, "Property getters run game code.");
+    mcp_toggle("Member and object writes", ModConfig::enable_mcp_writes,
+               Settings::save_mcp_writes, "Field/property writes, labels and diagnostic bundles.");
+    mcp_toggle("Method tracing", ModConfig::enable_mcp_tracing,
+               Settings::save_mcp_tracing, "Install and read native method trace hooks.");
+    mcp_toggle("Method invocation", ModConfig::enable_mcp_invocation,
+               Settings::save_mcp_invocation, "Call game methods. Runs game code.");
+    mcp_toggle("Destructive operations", ModConfig::enable_mcp_destructive_operations,
+               Settings::save_mcp_destructive_operations,
+               "Scene loads, component changes, duplicating and destroying objects.");
+    ImGui::EndDisabled();
+}
+
+void render_mcp_pacing() {
+    // Edit locally and save when the drag ends.
+    static int rate = 0;
+    static int burst = 0;
+    static int seconds = 0;
+    static int active_items = 0;
+    static bool primed = false;
+    if (!primed || active_items == 0) {
+        rate = ModConfig::mcp_requests_per_second.load();
+        burst = ModConfig::mcp_burst.load();
+        seconds = ModConfig::mcp_timeout_ms.load() / 1000;
+        primed = true;
+    }
+    active_items = 0;
+    bool commit = false;
+
+    const auto slider = [&](const char *label, int &value, int minimum, int maximum, const char *hint) {
+        ImGui::SetNextItemWidth(180.0f);
+        ImGui::SliderInt(label, &value, minimum, maximum);
+        if (ImGui::IsItemActive())
+            ++active_items;
+        if (ImGui::IsItemDeactivatedAfterEdit())
+            commit = true;
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("%s", hint);
+    };
+
+    ImGui::SeparatorText("Pacing");
+    ImGui::BeginDisabled(!ModConfig::enable_mcp.load());
+    slider("Requests per second", rate, 1, 200, "Refill rate of the request budget.");
+    slider("Burst", burst, 1, 500, "Budget available at once before requests wait.");
+    slider("Main-thread timeout (s)", seconds, 1, 30, "Max wait for the Unity main thread.");
+    if (commit)
+        Settings::save_mcp_pacing(rate, burst, seconds * 1000);
+    ImGui::TextDisabled("Cheap reads cost less; a request with no budget waits instead of failing.");
+    ImGui::EndDisabled();
+}
+
+// MCP permissions and pacing.
+void render_mcp_settings() {
+    render_mcp_access();
+    render_mcp_pacing();
+    if (!Settings::last_error().empty())
+        ImGui::TextColored(ImVec4(0.78f, 0.42f, 0.38f, 1.0f), "%s", Settings::last_error().c_str());
+}
+
 void render_diagnostics(const Snapshot &snapshot) {
     if (ImGui::Button("Create diagnostic bundle"))
         RuntimeModel::instance().enqueue(Command{.kind = CommandKind::ExportDiagnosticBundle});
@@ -276,7 +366,12 @@ void render() {
     const auto hierarchy = snapshot->hierarchy ? snapshot->hierarchy : empty_hierarchy;
     const ImVec2 work_pos = viewport->WorkPos;
     const ImVec2 work_size = viewport->WorkSize;
-    static float opacity = 0.94f;
+    static float opacity = ModConfig::UserSettings::panel_opacity();
+    static const bool appearance_restored = [] {
+        Unity::ui_scale() = ModConfig::UserSettings::ui_scale();
+        return true;
+    }();
+    (void)appearance_restored;
     static float highlight_max_distance = 0.0f;
     static bool show_hierarchy = true;
     static bool show_inspector = true;
@@ -286,6 +381,7 @@ void render() {
     static bool show_field_watches = false;
     static bool show_reference_graph = false;
     static bool show_diagnostics = false;
+    static bool show_labels = false;
     static ImVec2 inspector_window_size{};
     static int previous_selection_id = 0;
     static std::uint64_t previous_object_token = 0;
@@ -341,6 +437,15 @@ void render() {
         const float toolbar_ratio =
             std::clamp(Unity::toolbar_height() / std::max(1.0f, work_size.y), 0.02f, 0.20f);
         ImGui::DockBuilderSplitNode(content_dock, ImGuiDir_Up, toolbar_ratio, &workspace_dock, &content_dock);
+        // The status strip is fixed like the toolbar: no tab, nothing docks over or beside it.
+        ImGuiID status_dock = 0;
+        const float status_ratio =
+            std::clamp(Unity::status_bar_height() / std::max(1.0f, work_size.y), 0.02f, 0.12f);
+        ImGui::DockBuilderSplitNode(content_dock, ImGuiDir_Down, status_ratio, &status_dock, &content_dock);
+        if (ImGuiDockNode *status_node = ImGui::DockBuilderGetNode(status_dock))
+            status_node->LocalFlags |= ImGuiDockNodeFlags_NoTabBar | ImGuiDockNodeFlags_NoDockingOverMe |
+                                       ImGuiDockNodeFlags_NoDockingSplit;
+        ImGui::DockBuilderDockWindow("URK Explorer Status", status_dock);
         ImGuiID hierarchy_dock = 0;
         ImGui::DockBuilderSplitNode(content_dock, ImGuiDir_Left, 0.21f, &hierarchy_dock, &content_dock);
         ImGuiID inspector_dock = 0;
@@ -369,10 +474,28 @@ void render() {
             ImGui::DockBuilderDockWindow("###urk-reference-graph", content_dock);
         if (show_diagnostics)
             ImGui::DockBuilderDockWindow("###urk-diagnostics", diagnostics_dock);
+        if (show_labels)
+            ImGui::DockBuilderDockWindow("###urk-labels", content_dock);
         ImGui::DockBuilderFinish(dockspace_id);
         dock_layout_initialized = true;
     }
     ImGui::DockSpaceOverViewport(dockspace_id, viewport, ImGuiDockNodeFlags_PassthruCentralNode);
+
+    struct PanelToggle {
+        const char *label;
+        bool *visible;
+    };
+    const PanelToggle panel_toggles[] = {
+        {"Hierarchy", &show_hierarchy},
+        {"Inspector", &show_inspector},
+        {"Object Inspector", &show_object_inspector},
+        {"Class Browser", &show_class_browser},
+        {"Method Calls", &show_method_traces},
+        {"Value Watches", &show_field_watches},
+        {"Reference Graph", &show_reference_graph},
+        {"Labels", &show_labels},
+        {"Console", &show_diagnostics},
+    };
 
     ImGui::SetNextWindowPos(ImVec2(work_pos.x + 12.0f, work_pos.y + 12.0f), ImGuiCond_FirstUseEver);
     ImGui::SetNextWindowSize(ImVec2(std::min(980.0f, work_size.x - 24.0f), 112.0f), ImGuiCond_FirstUseEver);
@@ -383,7 +506,7 @@ void render() {
                      ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_MenuBar | ImGuiWindowFlags_NoScrollbar |
                          ImGuiWindowFlags_NoScrollWithMouse)) {
         if (ImGui::BeginMenuBar()) {
-            if (ImGui::BeginMenu("Panels")) {
+            if (ImGui::BeginMenu("Window")) {
                 ImGui::MenuItem("Hierarchy", nullptr, &show_hierarchy);
                 ImGui::MenuItem("Inspector", nullptr, &show_inspector);
                 ImGui::MenuItem("Object Inspector", nullptr, &show_object_inspector);
@@ -393,6 +516,7 @@ void render() {
                 ImGui::MenuItem("Value Watches", nullptr, &show_field_watches);
                 ImGui::MenuItem("Reference Graph", nullptr, &show_reference_graph);
                 ImGui::MenuItem("Console", nullptr, &show_diagnostics);
+                ImGui::MenuItem("Labels", nullptr, &show_labels);
                 ImGui::Separator();
                 if (ImGui::MenuItem("Runtime Monitor")) {
                     show_method_traces = true;
@@ -439,13 +563,19 @@ void render() {
                 ImGui::SeparatorText("Overlay");
                 ImGui::SetNextItemWidth(180.0f);
                 ImGui::SliderFloat("UI scale", &Unity::ui_scale(), 0.75f, 2.0f, "%.2fx");
+                bool appearance_changed = ImGui::IsItemDeactivatedAfterEdit();
                 if (ImGui::IsItemHovered())
                     ImGui::SetTooltip("Text and control size. 1.00x matches the Unity editor at 100%% display scaling.");
                 ImGui::SameLine();
-                if (ImGui::SmallButton("Reset##ui-scale"))
+                if (ImGui::SmallButton("Reset##ui-scale")) {
                     Unity::ui_scale() = 1.0f;
+                    appearance_changed = true;
+                }
                 ImGui::SetNextItemWidth(180.0f);
                 ImGui::SliderFloat("Panel background", &opacity, 0.35f, 1.0f, "%.2f");
+                appearance_changed = appearance_changed || ImGui::IsItemDeactivatedAfterEdit();
+                if (appearance_changed)
+                    ModConfig::UserSettings::save_appearance(Unity::ui_scale(), opacity);
                 ImGui::TextDisabled("Text, controls and borders remain opaque for readability.");
                 const bool multi_monitor =
                     (ImGui::GetIO().ConfigFlags & ImGuiConfigFlags_ViewportsEnable) != 0;
@@ -527,6 +657,10 @@ void render() {
                     : "Distance preserves the active view axis; X/Y/Z offsets the camera in world space.");
                 ImGui::EndMenu();
             }
+            if (ImGui::BeginMenu("MCP")) {
+                render_mcp_settings();
+                ImGui::EndMenu();
+            }
             if (ImGui::BeginMenu("Help")) {
                 if (ImGui::MenuItem("GitHub"))
                     ShellExecuteA(nullptr, "open", ModConfig::url, nullptr, nullptr, SW_SHOWNORMAL);
@@ -539,105 +673,122 @@ void render() {
                 ImGui::EndMenu();
             }
 
-            // Kept out of the toolbar row, which grows with the panel count and
-            // used to draw straight over this.
-            char version[32];
-            std::snprintf(version, sizeof(version), "v%s", ModConfig::version);
-            const std::string status = snapshot->status.empty() ? "Ready" : snapshot->status;
-            const ImGuiStyle &menu_style = ImGui::GetStyle();
-            const auto segment_width = [&menu_style](const char *text) {
-                return ImGui::CalcTextSize(text).x + menu_style.ItemSpacing.x;
-            };
-            const float identity_width = segment_width(ModConfig::short_name) +
-                                         segment_width(ModConfig::backend_name) + segment_width(version) +
-                                         segment_width(ModConfig::author) + segment_width(status.c_str());
-            const float identity_x = ImGui::GetContentRegionMax().x - identity_width;
-            if (identity_x > ImGui::GetCursorPosX() + 12.0f) {
-                ImGui::SetCursorPosX(identity_x);
-                ImGui::TextColored(ImVec4(0.92f, 0.92f, 0.92f, 1.0f), "%s", ModConfig::short_name);
-                ImGui::TextColored(Unity::Skin::accent, "%s", ModConfig::backend_name);
-                ImGui::TextDisabled("%s", version);
-                ImGui::TextColored(ImVec4(0.82f, 0.66f, 0.36f, 1.0f), "%s", ModConfig::author);
-                // Green when idle, amber when the last command left something to read.
-                ImGui::TextColored(status == "Ready" ? ImVec4(0.48f, 0.74f, 0.52f, 1.0f) : Unity::Skin::warning,
-                                   "%s", status.c_str());
-                if (ImGui::IsItemHovered())
-                    ImGui::SetTooltip("%s", status.c_str());
-            }
             ImGui::EndMenuBar();
         }
-        // The toolbar row. Refresh sits where Unity puts Play - leftmost and
-        // always one click away - then the runtime toggles, then the panel
-        // buttons that stand in for Unity's Layers / Layout controls.
+        // Unity's toolbar: pick tools on the left, the refresh/live pair in the
+        // middle where Play sits, and the layout menu pinned to the right.
+        constexpr float kGap = 2.0f;
+        constexpr float kGroupGap = 14.0f;
+        const bool narrow = ImGui::GetContentRegionAvail().x < 30.0f * Unity::font_size();
+        const char *const pick_label = narrow ? "Pick" : "Select in Game";
+        const char *const return_label = narrow ? "Return" : "Return Camera";
+        const float left_width = Unity::toolbar_control_width(pick_label) + kGap + Unity::toolbar_control_width(return_label);
+        const float center_width = Unity::toolbar_control_width("Refresh") + kGap + Unity::toolbar_control_width("Live");
+        const float right_width = Unity::toolbar_dropdown_width("Layout");
+        const float row_start = ImGui::GetCursorPosX();
+        const float row_end = ImGui::GetWindowContentRegionMax().x;
+        const float center_x = std::max(row_start + (row_end - row_start - center_width) * 0.5f,
+                                        row_start + left_width + kGroupGap);
+        const float right_x = std::max(row_end - right_width, center_x + center_width + kGroupGap);
+
+        if (Unity::toolbar_toggle(pick_label, pick_state().armed, Unity::Skin::action_violet,
+                                  "Click anything in the game to select it in the Hierarchy, the way the scene view "
+                                  "does in the editor. Esc cancels."))
+            pick_state().armed = !pick_state().armed;
+        ImGui::SameLine(0.0f, kGap);
+        ImGui::BeginDisabled(!snapshot->camera_focus_active);
+        if (Unity::toolbar_button(return_label, Unity::Skin::action_amber,
+                                  "Restore the camera pose saved before focusing"))
+            enqueue_simple(CommandKind::RestoreCamera, 0);
+        ImGui::EndDisabled();
+
+        ImGui::SameLine(center_x);
         if (Unity::toolbar_button("Refresh", Unity::Skin::action_blue,
                                   "Re-read the scene hierarchy from the running game"))
             enqueue_simple(CommandKind::Refresh, 0);
-        ImGui::SameLine(0.0f, 2.0f);
+        ImGui::SameLine(0.0f, kGap);
         if (Unity::toolbar_toggle("Live", snapshot->live_data, Unity::Skin::action_green,
                                   "Re-read inspected values from the running game every tick")) {
             Command command{.kind = CommandKind::SetLiveData};
             command.bool_value = !snapshot->live_data;
             RuntimeModel::instance().enqueue(std::move(command));
         }
-        ImGui::SameLine(0.0f, 2.0f);
-        ImGui::BeginDisabled(!snapshot->camera_focus_active);
-        if (Unity::toolbar_button("Return Camera", Unity::Skin::action_amber,
-                                  "Restore the camera pose saved before focusing"))
-            enqueue_simple(CommandKind::RestoreCamera, 0);
-        ImGui::EndDisabled();
-        ImGui::SameLine(0.0f, 2.0f);
-        if (Unity::toolbar_toggle("Select in Game", pick_state().armed, Unity::Skin::action_violet,
-                                  "Click anything in the game to select it in the Hierarchy, the way the scene view "
-                                  "does in the editor. Esc cancels."))
-            pick_state().armed = !pick_state().armed;
-        Unity::toolbar_separator();
 
-        struct PanelToggle {
-            const char *label;
-            bool *visible;
-        };
-        // Abbreviations here told nobody anything: each button now carries the
-        // panel's own title, which is what the tab and the Panels menu say too.
-        const PanelToggle toggles[] = {
-            {"Hierarchy", &show_hierarchy},
-            {"Inspector", &show_inspector},
-            {"Object Inspector", &show_object_inspector},
-            {"Class Browser", &show_class_browser},
-            {"Method Calls", &show_method_traces},
-            {"Value Watches", &show_field_watches},
-            {"Reference Graph", &show_reference_graph},
-            {"Console", &show_diagnostics},
-        };
-        // The strip does not scroll or wrap, so a row too wide for it runs off the
-        // edge rather than clipping. Measure first, collapse to a dropdown if needed.
-        constexpr float kToggleSpacing = 2.0f;
-        float toggles_width = 0.0f;
-        for (const PanelToggle &toggle : toggles)
-            toggles_width += Unity::toolbar_control_width(toggle.label) + kToggleSpacing;
-        const float toggles_space = ImGui::GetWindowContentRegionMax().x - ImGui::GetCursorPosX();
-        if (toggles_width <= toggles_space) {
-            for (std::size_t index = 0; index < static_cast<std::size_t>(IM_ARRAYSIZE(toggles)); ++index) {
-                if (index > 0)
-                    ImGui::SameLine(0.0f, kToggleSpacing);
-                if (Unity::toolbar_toggle(toggles[index].label, *toggles[index].visible))
-                    *toggles[index].visible = !*toggles[index].visible;
-            }
-        } else {
-            std::size_t open_panels = 0;
-            for (const PanelToggle &toggle : toggles)
-                open_panels += *toggle.visible ? 1u : 0u;
-            char label[48];
-            std::snprintf(label, sizeof(label), "Panels (%zu/%d)", open_panels, IM_ARRAYSIZE(toggles));
-            if (Unity::toolbar_toggle(label, open_panels != 0, "Show or hide Explorer panels"))
-                ImGui::OpenPopup("##urk-panel-toggles");
-            if (ImGui::BeginPopup("##urk-panel-toggles")) {
-                for (const PanelToggle &toggle : toggles)
-                    ImGui::MenuItem(toggle.label, nullptr, toggle.visible);
-                ImGui::EndPopup();
-            }
+        ImGui::SameLine(right_x);
+        if (Unity::toolbar_dropdown("Layout", ImGui::IsPopupOpen("##urk-layout"), "Show or hide panels"))
+            ImGui::OpenPopup("##urk-layout");
+        const ImVec2 layout_anchor(ImGui::GetItemRectMax().x, ImGui::GetItemRectMax().y);
+        ImGui::SetNextWindowPos(layout_anchor, ImGuiCond_Always, ImVec2(1.0f, 0.0f));
+        if (ImGui::BeginPopup("##urk-layout")) {
+            ImGui::SeparatorText("Panels");
+            for (const PanelToggle &toggle : panel_toggles)
+                ImGui::MenuItem(toggle.label, nullptr, toggle.visible);
+            ImGui::Separator();
+            if (ImGui::MenuItem("Reset layout"))
+                dock_layout_initialized = false;
+            ImGui::EndPopup();
         }
     }
     ImGui::End();
+
+    {
+        // Unity's status bar: the last thing that happened on the left, what is
+        // running on the right.
+        ImGui::PushStyleColor(ImGuiCol_WindowBg, Unity::Skin::toolbar);
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(8.0f, 2.0f));
+        ImGui::SetNextWindowSize(ImVec2(work_size.x, Unity::status_bar_height()), ImGuiCond_FirstUseEver);
+        if (ImGui::Begin("URK Explorer Status", nullptr,
+                         ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoScrollbar |
+                             ImGuiWindowFlags_NoScrollWithMouse)) {
+            const bool idle = snapshot->status.empty() || snapshot->status == "Ready";
+            const std::string status = idle ? "Ready" : snapshot->status;
+            char version[32];
+            std::snprintf(version, sizeof(version), "v%s", ModConfig::version);
+            const ImGuiStyle &style = ImGui::GetStyle();
+            const float spacing = style.ItemSpacing.x * 2.0f;
+            const char *live_text = snapshot->live_data ? "LIVE" : "";
+            const float identity_width = ImGui::CalcTextSize(ModConfig::backend_name).x + spacing +
+                                         ImGui::CalcTextSize(version).x + spacing +
+                                         ImGui::CalcTextSize(ModConfig::author).x +
+                                         (snapshot->live_data ? ImGui::CalcTextSize(live_text).x + spacing : 0.0f);
+            ImGui::AlignTextToFramePadding();
+            const float dot = ImGui::GetFontSize() * 0.55f;
+            const ImVec2 dot_origin = ImGui::GetCursorScreenPos();
+            if (ImDrawList *draw_list = ImGui::GetWindowDrawList())
+                draw_list->AddCircleFilled(
+                    ImVec2(dot_origin.x + dot * 0.5f, dot_origin.y + ImGui::GetFrameHeight() * 0.5f), dot * 0.4f,
+                    ImGui::GetColorU32(idle ? ImVec4(0.48f, 0.74f, 0.52f, 1.0f) : Unity::Skin::warning));
+            ImGui::Dummy(ImVec2(dot + style.ItemSpacing.x, 0.0f));
+            ImGui::SameLine(0.0f, 0.0f);
+            const float room = ImGui::GetContentRegionAvail().x - identity_width - spacing * 2.0f;
+            std::string shown = status;
+            bool clipped = false;
+            while (shown.size() > 1 && ImGui::CalcTextSize(shown.c_str()).x > room) {
+                shown.pop_back();
+                while (!shown.empty() && (static_cast<unsigned char>(shown.back()) & 0xC0) == 0x80)
+                    shown.pop_back();
+                clipped = true;
+            }
+            if (clipped && room > 0.0f)
+                shown += "...";
+            ImGui::TextColored(idle ? Unity::Skin::text_dim : Unity::Skin::text, "%s", room > 0.0f ? shown.c_str() : "");
+            if (clipped && ImGui::IsItemHovered())
+                ImGui::SetTooltip("%s", status.c_str());
+            ImGui::SameLine(ImGui::GetWindowContentRegionMax().x - identity_width);
+            if (snapshot->live_data) {
+                ImGui::TextColored(ImVec4(0.48f, 0.74f, 0.52f, 1.0f), "%s", live_text);
+                ImGui::SameLine(0.0f, spacing);
+            }
+            ImGui::TextColored(Unity::Skin::accent, "%s", ModConfig::backend_name);
+            ImGui::SameLine(0.0f, spacing);
+            ImGui::TextDisabled("%s", version);
+            ImGui::SameLine(0.0f, spacing);
+            ImGui::TextDisabled("%s", ModConfig::author);
+        }
+        ImGui::End();
+        ImGui::PopStyleVar();
+        ImGui::PopStyleColor();
+    }
 
     if (show_hierarchy) {
         ImGui::SetNextWindowPos(ImVec2(work_pos.x + 12.0f, work_pos.y + 120.0f), ImGuiCond_FirstUseEver);
@@ -739,6 +890,15 @@ void render() {
             ImGui::Separator();
             render_diagnostics(*snapshot);
         }
+        ImGui::End();
+    }
+
+    if (show_labels) {
+        ImGui::SetNextWindowPos(ImVec2(work_pos.x + work_size.x * 0.22f, work_pos.y + 150.0f), ImGuiCond_FirstUseEver);
+        ImGui::SetNextWindowSize(ImVec2(std::max(620.0f, work_size.x * 0.46f), std::max(380.0f, work_size.y * 0.55f)),
+                                 ImGuiCond_FirstUseEver);
+        if (ImGui::Begin("Labels###urk-labels", &show_labels, ImGuiWindowFlags_NoCollapse))
+            render_labels_panel();
         ImGui::End();
     }
 

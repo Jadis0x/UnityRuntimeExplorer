@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <string>
 
 namespace Explorer::UI::Unity {
 namespace {
@@ -213,6 +214,44 @@ bool toolbar_toggle(const char *label, bool active, const char *tooltip) {
 
 bool toolbar_toggle(const char *label, bool active, const ImVec4 &accent, const char *tooltip) {
     return toolbar_control(label, active ? accent : Skin::button, tooltip);
+}
+
+float toolbar_dropdown_width(const char *label) {
+    const ImGuiStyle &style = ImGui::GetStyle();
+    return ImGui::CalcTextSize(label).x + style.FramePadding.x * 3.0f + ImGui::GetFontSize() * 0.9f;
+}
+
+bool toolbar_dropdown(const char *label, bool open, const char *tooltip) {
+    static constexpr ImVec4 kWhite{1.0f, 1.0f, 1.0f, 1.0f};
+    static constexpr ImVec4 kBlack{0.0f, 0.0f, 0.0f, 1.0f};
+    const ImGuiStyle &style = ImGui::GetStyle();
+    const ImVec2 size(toolbar_dropdown_width(label), row_height());
+    const ImVec4 background = open ? Skin::selection : Skin::button;
+    ImGui::PushStyleColor(ImGuiCol_Button, background);
+    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, mix(background, kWhite, 0.16f));
+    ImGui::PushStyleColor(ImGuiCol_ButtonActive, mix(background, kBlack, 0.22f));
+    const std::string id = std::string("##dropdown-") + label;
+    const ImVec2 origin = ImGui::GetCursorScreenPos();
+    const bool pressed = ImGui::Button(id.c_str(), size);
+    ImGui::PopStyleColor(3);
+    if (tooltip && ImGui::IsItemHovered())
+        ImGui::SetTooltip("%s", tooltip);
+    if (ImDrawList *draw_list = ImGui::GetWindowDrawList()) {
+        const float text_y = origin.y + (size.y - ImGui::GetTextLineHeight()) * 0.5f;
+        draw_list->AddText(ImVec2(origin.x + style.FramePadding.x * 1.5f, text_y), ImGui::GetColorU32(Skin::text),
+                           label);
+        // The caret is drawn rather than typed: not every overlay font has the glyph.
+        const float half = ImGui::GetFontSize() * 0.22f;
+        const float cx = origin.x + size.x - style.FramePadding.x * 1.5f - half;
+        const float cy = origin.y + size.y * 0.5f;
+        draw_list->AddTriangleFilled(ImVec2(cx - half, cy - half * 0.6f), ImVec2(cx + half, cy - half * 0.6f),
+                                     ImVec2(cx, cy + half * 0.8f), ImGui::GetColorU32(Skin::text));
+    }
+    return pressed;
+}
+
+float status_bar_height() {
+    return row_height() + 4.0f;
 }
 
 void toolbar_separator() {

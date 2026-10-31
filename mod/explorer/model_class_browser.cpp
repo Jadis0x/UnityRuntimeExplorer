@@ -40,6 +40,10 @@ namespace Explorer {
 	// RuntimeModel::ClassInstanceScan is defined in model_shared.h: explorer_model.cpp's
 	// destructor and unique_ptr<ClassInstanceScan> resets also need the complete type.
 
+	const URK::managed::Class* RuntimeModel::browser_class(const Command& command) const {
+		return browser_command_class(command);
+	}
+
 	void RuntimeModel::load_component_class_catalog() {
 		// Managed metadata is read only from the Unity main thread.
 		const URK::managed::Class* component_base =

@@ -7,6 +7,7 @@
 
 #include "explorer_commands.h"
 #include "explorer_types.h"
+#include "member_labels.h"
 #include "method_tracer.h"
 #include "ui_state.h"
 
@@ -94,6 +95,20 @@ std::uint64_t generic_type_key(int component_id, std::size_t method, std::uint64
 bool member_matches_filter(std::string_view name, std::string_view type, std::string_view declaring_type,
                            std::string_view filter);
 bool method_matches_filter(const ComponentInfo::Method &method, std::string_view filter);
+
+// Labels, defined in ui_labels.cpp. A member name is drawn as its label with
+// the original (or its alias, when unreadable) dimmed after it; the group is
+// the last item, so a context menu and the tooltip cover the whole name.
+void render_member_name(Labels::Kind kind, std::string_view type_name, std::string_view member,
+                        std::string_view signature = {}, std::string_view tooltip = {}, bool dimmed = false);
+// One-line forms for widgets that take a single label (tree nodes, selectables).
+std::string member_name_text(Labels::Kind kind, std::string_view type_name, std::string_view member,
+                             std::string_view signature = {});
+std::string type_name_text(std::string_view type_name);
+// Inline label editor for an open context menu.
+void render_label_editor(Labels::Kind kind, std::string_view type_name, std::string_view member = {},
+                         std::string_view signature = {});
+void render_labels_panel();
 
 // Context menus. `extra` prepends caller-specific entries and may be empty.
 void render_field_context_menu(const ComponentInfo::Field &field, const CodeContext &context,

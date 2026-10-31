@@ -96,6 +96,18 @@ namespace ModUI::Tabs::Config {
         ImGui::PushTextWrapPos(0.0f);
         ImGui::TextDisabled("Full access permits field/property writes, method execution, tracing, scene changes, component changes, duplication and destruction. Every request remains bounded and audited.");
         ImGui::PopTextWrapPos();
+        ImGui::Dummy(ImVec2(0.0f, 8.0f));
+        int rate = ModConfig::mcp_requests_per_second.load();
+        int burst = ModConfig::mcp_burst.load();
+        int timeout_seconds = ModConfig::mcp_timeout_ms.load() / 1000;
+        bool pacing_changed = ImGui::SliderInt("Requests per second", &rate, 1, 200);
+        pacing_changed |= ImGui::SliderInt("Burst", &burst, 1, 500);
+        pacing_changed |= ImGui::SliderInt("Main-thread timeout (s)", &timeout_seconds, 1, 30);
+        if (pacing_changed)
+            ModConfig::UserSettings::save_mcp_pacing(rate, burst, timeout_seconds * 1000);
+        ImGui::PushTextWrapPos(0.0f);
+        ImGui::TextDisabled("Cheap reads cost less than scans and searches. A request that finds the budget empty waits briefly instead of failing.");
+        ImGui::PopTextWrapPos();
         ImGui::EndDisabled();
         if (!ModConfig::UserSettings::last_error().empty())
             ImGui::TextColored(ImVec4(1.0f, 0.48f, 0.34f, 1.0f), "%s",

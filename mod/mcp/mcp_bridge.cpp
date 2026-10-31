@@ -14,6 +14,7 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <deque>
 #include <filesystem>
 #include <fstream>
@@ -21,11 +22,21 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <string_view>
 #include <thread>
+#include <vector>
 
 namespace Explorer::Mcp::Bridge {
 namespace {
 using Clock = std::chrono::steady_clock;
+
+// Grace period before an unattended trace hook is detached.
+constexpr std::int64_t kRevokeGraceMs = 30000;
+
+std::int64_t now_ms() {
+    const auto since_start = Clock::now().time_since_epoch();
+    return std::chrono::duration_cast<std::chrono::milliseconds>(since_start).count();
+}
 
 CapabilityMask current_capabilities() {
     if (!ModConfig::enable_mcp.load(std::memory_order_acquire))
@@ -52,10 +63,24 @@ struct PendingRequest {
     std::atomic<bool> cancelled{false};
 };
 
+// A served client; joined once finished.
+struct ClientThread {
+    std::thread thread;
+    std::atomic<bool> finished{false};
+};
+
+// One extra pipe instance waits for the next client.
+constexpr int kMaxClients = 4;
+
 struct State {
     std::atomic<bool> stopping{false};
     std::atomic<bool> running{false};
+    // Revocation waits out the grace period after a client leaves.
     std::atomic<bool> revoke_instrumentation{false};
+    std::atomic<int> active_clients{0};
+    std::mutex clients_mutex;
+    std::vector<std::unique_ptr<ClientThread>> clients;
+    std::atomic<std::int64_t> disconnected_at_ms{0};
     // Signalled once by stop() so every blocking wait on the server thread
     // unblocks. CancelSynchronousIo cannot reach a thread parked in
     // ConnectNamedPipe, which used to leave stop() joining forever.
@@ -142,11 +167,11 @@ HANDLE create_pipe(std::string& error) {
         return INVALID_HANDLE_VALUE;
     }
     SECURITY_ATTRIBUTES attributes{sizeof(SECURITY_ATTRIBUTES), descriptor, FALSE};
+    const DWORD buffer_bytes = static_cast<DWORD>(max_message_bytes + 1);
     const HANDLE pipe = CreateNamedPipeW(
         g_state.pipe_name.c_str(), PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED,
         PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
-        1, static_cast<DWORD>(max_message_bytes + 1), static_cast<DWORD>(max_message_bytes + 1),
-        5000, &attributes);
+        kMaxClients + 1, buffer_bytes, buffer_bytes, 5000, &attributes);
     LocalFree(descriptor);
     if (pipe == INVALID_HANDLE_VALUE)
         error = "MCP named pipe creation failed (Win32 " + std::to_string(GetLastError()) + ")";
@@ -250,8 +275,28 @@ bool write_line(Connection& connection, std::string text) {
     return true;
 }
 
+// Relative cost of a request: reads are cheap, scans are heavy.
+double request_cost(std::string_view tool) {
+    static constexpr std::array<std::string_view, 15> cheap = {
+        "runtime_status", "list_scenes", "browse_hierarchy", "get_selected_object", "describe_reference",
+        "list_labels", "get_activity_log", "list_method_traces", "get_method_trace", "get_watch_history",
+        "get_instance_scan", "hierarchy_search", "list_components", "inspect_game_object", "read_member"};
+    static constexpr std::array<std::string_view, 11> heavy = {
+        "start_instance_scan", "search_types", "search_members", "discover_runtime", "find_game_objects",
+        "build_reference_graph", "build_call_graph", "export_diagnostic_bundle", "invoke_method",
+        "get_type_hierarchy", "list_assemblies"};
+    if (std::find(cheap.begin(), cheap.end(), tool) != cheap.end())
+        return 0.25;
+    if (std::find(heavy.begin(), heavy.end(), tool) != heavy.end())
+        return 3.0;
+    return 1.0;
+}
+
+// Longest a request waits for budget before it is refused.
+constexpr double kMaxBudgetWaitSeconds = 2.0;
+
 void serve_client(Connection& connection) {
-    double tokens = 20.0;
+    double tokens = static_cast<double>(ModConfig::mcp_burst.load(std::memory_order_acquire));
     Clock::time_point last_refill = Clock::now();
     std::string line;
     for (;;) {
@@ -264,9 +309,6 @@ void serve_client(Connection& connection) {
                 return;
             continue;
         }
-        const Clock::time_point now = Clock::now();
-        tokens = std::min(20.0, tokens + std::chrono::duration<double>(now - last_refill).count() * 5.0);
-        last_refill = now;
         Request request;
         std::string parse_error;
         if (!parse_request(line, request, parse_error)) {
@@ -274,13 +316,37 @@ void serve_client(Connection& connection) {
                 return;
             continue;
         }
-        if (tokens < 1.0) {
-            if (!write_line(connection, serialize(failure(request.id, "rate_limited",
-                                                          "MCP bridge rate limit exceeded; retry shortly."))))
+        const int rate_setting = ModConfig::mcp_requests_per_second.load(std::memory_order_acquire);
+        const int burst_setting = ModConfig::mcp_burst.load(std::memory_order_acquire);
+        const double rate = static_cast<double>(rate_setting);
+        const double burst = static_cast<double>(burst_setting);
+        // Cost is capped at the bucket size.
+        const double cost = std::min(request_cost(request.tool), burst);
+        const auto refill = [&] {
+            const Clock::time_point now = Clock::now();
+            const double elapsed = std::chrono::duration<double>(now - last_refill).count();
+            tokens = std::min(burst, tokens + elapsed * rate);
+            last_refill = now;
+        };
+        refill();
+        if (tokens < cost) {
+            // Wait for a refill; refuse only when the wait is too long.
+            const double wait_seconds = (cost - tokens) / rate;
+            const double wait_ms = std::ceil(wait_seconds * 1000.0);
+            if (wait_seconds > kMaxBudgetWaitSeconds) {
+                Response refusal = failure(request.id, "rate_limited",
+                                           "Request budget exhausted; retry after the suggested delay.");
+                refusal.retry_after_ms = static_cast<std::uint32_t>(wait_ms);
+                if (!write_line(connection, serialize(refusal)))
+                    return;
+                continue;
+            }
+            const DWORD woke = WaitForSingleObject(g_state.stop_event, static_cast<DWORD>(wait_ms));
+            if (woke == WAIT_OBJECT_0)
                 return;
-            continue;
+            refill();
         }
-        tokens -= 1.0;
+        tokens -= cost;
         connection.served_request = true;
         auto pending = std::make_shared<PendingRequest>();
         pending->request = std::move(request);
@@ -288,15 +354,25 @@ void serve_client(Connection& connection) {
         {
             std::lock_guard lock(g_state.mutex);
             if (g_state.pending.size() >= 64) {
-                if (!write_line(connection, serialize(failure(pending->request.id, "busy",
-                                                              "The MCP bridge request queue is full."))))
+                Response busy = failure(pending->request.id, "busy", "Request queue is full.");
+                busy.retry_after_ms = 250;
+                if (!write_line(connection, serialize(busy)))
                     return;
                 continue;
             }
             g_state.pending.push_back(pending);
         }
-        if (completion.wait_for(std::chrono::seconds(5)) != std::future_status::ready) {
+        // Short wait slices keep stop() responsive.
+        const int timeout_ms = ModConfig::mcp_timeout_ms.load(std::memory_order_acquire);
+        const Clock::time_point deadline = Clock::now() + std::chrono::milliseconds(timeout_ms);
+        std::future_status completed = std::future_status::timeout;
+        while (completed != std::future_status::ready && Clock::now() < deadline &&
+               !g_state.stopping.load(std::memory_order_acquire))
+            completed = completion.wait_for(std::chrono::milliseconds(100));
+        if (completed != std::future_status::ready) {
             pending->cancelled.store(true, std::memory_order_release);
+            if (g_state.stopping.load(std::memory_order_acquire))
+                return;
             if (!write_line(connection, serialize(failure(pending->request.id, "timeout",
                                                           "The Unity main thread did not answer in time."))))
                 return;
@@ -311,38 +387,95 @@ void serve_client(Connection& connection) {
     }
 }
 
-void server_main(HANDLE first_pipe, HANDLE io_event) {
-    g_state.running.store(true, std::memory_order_release);
-    Connection connection;
-    connection.pipe = first_pipe;
-    connection.io_event = io_event;
-    while (!g_state.stopping.load(std::memory_order_acquire)) {
-        if (await_connection(connection) && !g_state.stopping.load(std::memory_order_acquire)) {
-            connection.carry.clear();
-            connection.served_request = false;
-            serve_client(connection);
-            // A helper enumerating bridges opens and closes every candidate
-            // pipe without sending anything. Only a connection that actually
-            // issued requests may revoke the instrumentation it was granted.
-            if (connection.served_request)
-                g_state.revoke_instrumentation.store(true, std::memory_order_release);
-        }
+void close_connection(Connection& connection) {
+    if (connection.pipe != INVALID_HANDLE_VALUE) {
         FlushFileBuffers(connection.pipe);
         DisconnectNamedPipe(connection.pipe);
         CloseHandle(connection.pipe);
         connection.pipe = INVALID_HANDLE_VALUE;
+    }
+    if (connection.io_event) {
+        CloseHandle(connection.io_event);
+        connection.io_event = nullptr;
+    }
+}
+
+void run_client(Connection& connection) {
+    serve_client(connection);
+    // Only clients that sent requests can trigger trace revocation.
+    if (connection.served_request)
+        g_state.revoke_instrumentation.store(true, std::memory_order_release);
+    close_connection(connection);
+    g_state.disconnected_at_ms.store(now_ms(), std::memory_order_release);
+    g_state.active_clients.fetch_sub(1, std::memory_order_acq_rel);
+}
+
+void reap_finished_clients() {
+    std::vector<std::unique_ptr<ClientThread>> finished;
+    {
+        std::lock_guard lock(g_state.clients_mutex);
+        for (auto it = g_state.clients.begin(); it != g_state.clients.end();) {
+            if ((*it)->finished.load(std::memory_order_acquire)) {
+                finished.push_back(std::move(*it));
+                it = g_state.clients.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
+    for (auto& client : finished)
+        if (client->thread.joinable())
+            client->thread.join();
+}
+
+void listener_main(HANDLE first_pipe) {
+    g_state.running.store(true, std::memory_order_release);
+    HANDLE pipe = first_pipe;
+    while (!g_state.stopping.load(std::memory_order_acquire)) {
+        auto connection = std::make_unique<Connection>();
+        connection->pipe = pipe;
+        connection->io_event = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        if (!connection->io_event) {
+            ModLog::error("MCP bridge I/O event could not be created (Win32 %lu)", GetLastError());
+            close_connection(*connection);
+            break;
+        }
+        bool connected = await_connection(*connection);
+        if (g_state.stopping.load(std::memory_order_acquire))
+            connected = false;
+        reap_finished_clients();
+        const bool full = g_state.active_clients.load(std::memory_order_acquire) >= kMaxClients;
+        if (connected && full) {
+            const Response busy = failure("invalid", "bridge_busy", "Too many MCP clients are connected.");
+            write_line(*connection, serialize(busy));
+            close_connection(*connection);
+        } else if (connected) {
+            auto client = std::make_unique<ClientThread>();
+            ClientThread* slot = client.get();
+            g_state.active_clients.fetch_add(1, std::memory_order_acq_rel);
+            try {
+                client->thread = std::thread([slot, owned = std::move(connection)]() mutable {
+                    run_client(*owned);
+                    slot->finished.store(true, std::memory_order_release);
+                });
+                std::lock_guard lock(g_state.clients_mutex);
+                g_state.clients.push_back(std::move(client));
+            } catch (const std::system_error& exception) {
+                g_state.active_clients.fetch_sub(1, std::memory_order_acq_rel);
+                ModLog::error("MCP client thread could not start: %s", exception.what());
+            }
+        } else {
+            close_connection(*connection);
+        }
         if (g_state.stopping.load(std::memory_order_acquire))
             break;
         std::string error;
-        connection.pipe = create_pipe(error);
-        if (connection.pipe == INVALID_HANDLE_VALUE) {
+        pipe = create_pipe(error);
+        if (pipe == INVALID_HANDLE_VALUE) {
             ModLog::error("MCP bridge listener failed: %s", error.c_str());
             break;
         }
     }
-    if (connection.pipe != INVALID_HANDLE_VALUE)
-        CloseHandle(connection.pipe);
-    CloseHandle(io_event);
     g_state.running.store(false, std::memory_order_release);
 }
 } // namespace
@@ -358,32 +491,22 @@ bool start(std::string& error) {
         error = "MCP bridge stop event could not be created (Win32 " + std::to_string(GetLastError()) + ")";
         return false;
     }
-    const HANDLE io_event = CreateEventW(nullptr, TRUE, FALSE, nullptr);
-    if (!io_event) {
-        error = "MCP bridge I/O event could not be created (Win32 " + std::to_string(GetLastError()) + ")";
-        CloseHandle(g_state.stop_event);
-        g_state.stop_event = nullptr;
-        return false;
-    }
     const HANDLE first_pipe = create_pipe(error);
     if (first_pipe == INVALID_HANDLE_VALUE) {
-        CloseHandle(io_event);
         CloseHandle(g_state.stop_event);
         g_state.stop_event = nullptr;
         return false;
     }
     if (!write_discovery(error)) {
         CloseHandle(first_pipe);
-        CloseHandle(io_event);
         CloseHandle(g_state.stop_event);
         g_state.stop_event = nullptr;
         return false;
     }
     try {
-        g_state.server_thread = std::thread(server_main, first_pipe, io_event);
+        g_state.server_thread = std::thread(listener_main, first_pipe);
     } catch (const std::system_error& exception) {
         CloseHandle(first_pipe);
-        CloseHandle(io_event);
         CloseHandle(g_state.stop_event);
         g_state.stop_event = nullptr;
         error = "MCP bridge thread could not start: " + std::string(exception.what());
@@ -395,8 +518,15 @@ bool start(std::string& error) {
 }
 
 void tick(RuntimeModel& model) {
-    if (g_state.revoke_instrumentation.exchange(false, std::memory_order_acq_rel))
-        g_state.tools.revoke_instrumentation(model, "MCP helper disconnected");
+    if (g_state.revoke_instrumentation.load(std::memory_order_acquire)) {
+        const std::int64_t away_ms = now_ms() - g_state.disconnected_at_ms.load(std::memory_order_acquire);
+        if (g_state.active_clients.load(std::memory_order_acquire) > 0) {
+            g_state.revoke_instrumentation.store(false, std::memory_order_release);
+        } else if (away_ms >= kRevokeGraceMs) {
+            if (g_state.revoke_instrumentation.exchange(false, std::memory_order_acq_rel))
+                g_state.tools.revoke_instrumentation(model, "MCP helper disconnected");
+        }
+    }
     // Explorer Config is the permission authority, so a toggle has to reach the
     // discovery document a helper reads before it advertises any tool.
     if (!g_state.discovery_path.empty() &&
@@ -431,19 +561,35 @@ void stop() {
     g_state.stopping.store(true, std::memory_order_release);
     if (g_state.stop_event)
         SetEvent(g_state.stop_event);
+    const auto fail_queued_requests = [] {
+        std::deque<std::shared_ptr<PendingRequest>> pending;
+        {
+            std::lock_guard lock(g_state.mutex);
+            pending.swap(g_state.pending);
+        }
+        for (const auto& request : pending) {
+            const Response stopped = failure(request->request.id, "bridge_stopped", "The MCP bridge stopped.");
+            request->completion.set_value(stopped);
+        }
+    };
+    // Unblock client threads waiting on the main thread.
+    fail_queued_requests();
     if (g_state.server_thread.joinable())
         g_state.server_thread.join();
+    std::vector<std::unique_ptr<ClientThread>> clients;
+    {
+        std::lock_guard lock(g_state.clients_mutex);
+        clients.swap(g_state.clients);
+    }
+    for (auto& client : clients)
+        if (client->thread.joinable())
+            client->thread.join();
+    fail_queued_requests();
+    g_state.active_clients.store(0, std::memory_order_release);
     if (g_state.stop_event) {
         CloseHandle(g_state.stop_event);
         g_state.stop_event = nullptr;
     }
-    std::deque<std::shared_ptr<PendingRequest>> pending;
-    {
-        std::lock_guard lock(g_state.mutex);
-        pending.swap(g_state.pending);
-    }
-    for (const auto& request : pending)
-        request->completion.set_value(failure(request->request.id, "bridge_stopped", "The MCP bridge stopped."));
     g_state.tools.reset();
     std::error_code ignored;
     if (!g_state.discovery_path.empty())

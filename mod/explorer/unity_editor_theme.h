@@ -84,6 +84,12 @@ bool toolbar_button(const char *label, const ImVec4 &accent, const char *tooltip
 bool toolbar_toggle(const char *label, bool active, const char *tooltip = nullptr);
 bool toolbar_toggle(const char *label, bool active, const ImVec4 &accent, const char *tooltip = nullptr);
 void toolbar_separator();
+// A toolbar control that opens a menu: the label with a caret. The caller opens
+// the popup when it returns true; `open` keeps it lit while the popup is up.
+float toolbar_dropdown_width(const char *label);
+bool toolbar_dropdown(const char *label, bool open, const char *tooltip = nullptr);
+// Height of the status strip along the bottom of the workspace.
+float status_bar_height();
 
 // Unity's component band: full-width strip, disclosure triangle, optional
 // enable checkbox and a dimmed right-aligned suffix. `enabled` may be null for

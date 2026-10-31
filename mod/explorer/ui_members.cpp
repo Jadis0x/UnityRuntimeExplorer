@@ -537,6 +537,12 @@ void copy_code_menu_item(const char *label, const std::string &code, bool enable
         ImGui::SetClipboardText(code.c_str());
 }
 
+// Labels key on the declaring type; a member without one belongs to the type
+// the menu was opened on.
+std::string label_owner(std::string_view declaring_type, const CodeContext &context) {
+    return declaring_type.empty() ? context_managed_name(context) : std::string(declaring_type);
+}
+
 } // namespace
 } // namespace
 void render_field_context_menu(const ComponentInfo::Field &field, const CodeContext &context,
@@ -546,7 +552,8 @@ void render_field_context_menu(const ComponentInfo::Field &field, const CodeCont
     if (extra)
         extra();
     copy_code_menu_item("Copy signature", field_signature(field));
-    ImGui::Separator();
+    render_label_editor(Labels::Kind::Field, label_owner(field.declaring_type, context), field.name);
+    ImGui::SeparatorText("Code");
     const bool code_supported = field.runtime_safe && !custom_value_type_requires_abi(field.type_name, field.is_value_type);
     copy_code_menu_item("Copy URKit field read", field_get_code(field, context), code_supported);
     copy_code_menu_item("Copy URKit field write", field_set_code(field, context), code_supported);
@@ -563,7 +570,8 @@ void render_property_context_menu(const ComponentInfo::Property &property, const
     if (extra)
         extra();
     copy_code_menu_item("Copy signature", property_signature(property));
-    ImGui::Separator();
+    render_label_editor(Labels::Kind::Property, label_owner(property.declaring_type, context), property.name);
+    ImGui::SeparatorText("Code");
     const bool code_supported = property.runtime_safe && !custom_value_type_requires_abi(property.type_name, property.is_value_type);
     copy_code_menu_item("Copy URKit property get", property_get_code(property, context), property.can_read && code_supported);
     copy_code_menu_item("Copy URKit property set", property_set_code(property, context), property.can_write && code_supported);
@@ -577,7 +585,9 @@ void render_method_context_menu(const ComponentInfo::Method &method, const CodeC
     if (!ImGui::BeginPopupContextItem("##method-code-menu"))
         return;
     copy_code_menu_item("Copy signature", method_signature(method));
-    ImGui::Separator();
+    render_label_editor(Labels::Kind::Method, label_owner(method.declaring_type, context), method.name,
+                        Labels::method_signature(method.parameter_types));
+    ImGui::SeparatorText("Code");
     const bool code_supported = method.runtime_callable && !method_requires_custom_value_abi(method);
     copy_code_menu_item("Copy URKit method call", method_call_code(method, context), code_supported);
     copy_code_menu_item("Copy Detours managed-method hook", method_hook_code(method, context), code_supported);
@@ -809,13 +819,21 @@ bool query_matches_member(std::string_view filter, std::initializer_list<std::st
 } // namespace
 bool member_matches_filter(std::string_view name, std::string_view type, std::string_view declaring_type,
 	std::string_view filter) {
-	return filter.empty() || query_matches_member(filter, {name, type, declaring_type});
+	if (filter.empty())
+		return true;
+	// Fields and properties share this filter; a name labels only one of them.
+	const std::string labels = Labels::search_text(Labels::Kind::Field, declaring_type, name) + " " +
+		Labels::search_text(Labels::Kind::Property, declaring_type, name);
+	const std::string readable_type = Labels::humanize(type);
+	return query_matches_member(filter, {name, type, declaring_type, labels, readable_type});
 }
 namespace {
 } // namespace
 bool method_matches_filter(const ComponentInfo::Method& method, std::string_view filter) {
 	if (filter.empty())
 		return true;
+	const std::string label_text = Labels::search_text(Labels::Kind::Method, method.declaring_type, method.name,
+		Labels::method_signature(method.parameter_types));
 	std::size_t start = 0;
 	while (start < filter.size()) {
 		while (start < filter.size() && std::isspace(static_cast<unsigned char>(filter[start])))
@@ -823,7 +841,8 @@ bool method_matches_filter(const ComponentInfo::Method& method, std::string_view
 		const std::size_t end = filter.find_first_of(" \t\r\n", start);
 		const std::string_view token = filter.substr(start, end == std::string_view::npos ? filter.size() - start : end - start);
 		bool found = token.empty() || contains_case_insensitive(method.name, token) ||
-			contains_case_insensitive(method.return_type, token) || contains_case_insensitive(method.declaring_type, token);
+			contains_case_insensitive(method.return_type, token) || contains_case_insensitive(method.declaring_type, token) ||
+			contains_case_insensitive(label_text, token);
 		for (std::size_t index = 0; !found && index < method.parameter_types.size(); ++index) {
 			found = contains_case_insensitive(method.parameter_types[index], token) ||
 				(index < method.parameter_names.size() && contains_case_insensitive(method.parameter_names[index], token));
@@ -1532,8 +1551,8 @@ void render_method_argument(int component_id, std::size_t method_index, std::siz
             } else {
                 for (const ManagedReferenceInfo& reference : *managed_references) {
                     ImGui::PushID(static_cast<int>(reference.token));
-                    const std::string label = reference.display + "  [" + reference.type_name + "]";
-                    if (ImGui::Selectable(label.c_str())) {
+                    const std::string reference_label = reference.display + "  [" + reference.type_name + "]";
+                    if (ImGui::Selectable(reference_label.c_str())) {
                         copy_text(buffer.text, "@ref:" + std::to_string(reference.token));
                         ImGui::CloseCurrentPopup();
                     }

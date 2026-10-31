@@ -4,6 +4,7 @@
 
 #include "config/mod_config.h"
 #include "explorer_model.h"
+#include "member_labels.h"
 #include "method_trace_format.h"
 #include "ui_shared.h"
 #include "ui_state.h"
@@ -42,6 +43,12 @@ void append_csv_value(std::string &out, std::string_view value) {
 
 TraceViewState &trace_view_state(MethodTracer::TraceId id) {
     return ui_state().trace_views.touch(id);
+}
+
+// Traced methods are usually the obfuscated ones, so they read by their labels.
+std::string traced_method_name(const MethodTracer::Snapshot& trace) {
+    return Labels::member_display(Labels::Kind::Method, trace.declaring_type, trace.method_name,
+                                  Labels::method_signature(trace.parameter_types));
 }
 
 std::string short_trace_type_name(std::string_view type_name) {
@@ -424,7 +431,7 @@ void render_method_trace(const Snapshot &snapshot, const MethodTracer::Snapshot 
                 ImGui::TableSetupColumn("label", ImGuiTableColumnFlags_WidthFixed, 76.0f);
                 ImGui::TableSetupColumn("value", ImGuiTableColumnFlags_WidthStretch);
                 const std::string when = "+" + elapsed_text + " | thread " + std::to_string(record.thread_id);
-                const std::string what = trace.declaring_type + "." + trace.method_name;
+                const std::string what = Labels::type_display(trace.declaring_type) + "." + traced_method_name(trace);
                 trace_card_row("When", when, when, false);
                 if (repeat_count > 1) {
                     const std::string repeats = std::to_string(repeat_count) + " identical calls (" +
@@ -574,7 +581,9 @@ void enqueue_method_trace_close(MethodTracer::TraceId id) {
 }
 
 std::string trace_list_display_name(const MethodTracer::Snapshot& trace) {
-    const std::string method = short_trace_type_name(trace.declaring_type) + "." + trace.method_name;
+    const std::string method =
+        Labels::humanize(short_trace_type_name(Labels::type_display(trace.declaring_type))) + "." +
+        traced_method_name(trace);
     const char* const dispatch = trace.is_static ? "static" : "instance";
     return method + " [" + dispatch + "; " + std::to_string(trace.parameter_types.size()) + " args]";
 }
@@ -615,7 +624,8 @@ void render_method_traces(const Snapshot &snapshot) {
         if (ImGui::Selectable(label.c_str(), selected == trace.id))
             selected = trace.id;
         if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("%s.%s\n%s | %zu parameters | %llu calls", trace.declaring_type.c_str(), trace.method_name.c_str(),
+            ImGui::SetTooltip("%s.%s\n%s | %zu parameters | %llu calls", Labels::type_display(trace.declaring_type).c_str(),
+                              traced_method_name(trace).c_str(),
                               trace.active ? "Recording" : "Stopped", trace.parameter_types.size(),
                               static_cast<unsigned long long>(trace.total_calls));
         ImGui::PopID();
@@ -626,7 +636,7 @@ void render_method_traces(const Snapshot &snapshot) {
     const MethodTracer::Snapshot *trace = &*std::find_if(snapshot.method_traces.begin(), snapshot.method_traces.end(),
                                                            [](const MethodTracer::Snapshot &entry) { return entry.id == selected; });
     ImGui::TextColored(trace->active ? ImVec4(0.60f, 0.68f, 0.60f, 1.0f) : ImVec4(0.72f, 0.72f, 0.72f, 1.0f),
-                       "%s.%s", trace->declaring_type.c_str(), trace->method_name.c_str());
+                       "%s.%s", Labels::type_display(trace->declaring_type).c_str(), traced_method_name(*trace).c_str());
     ImGui::SameLine();
     ImGui::TextDisabled("[%s]", trace->active ? "RECORDING" : "STOPPED");
     ImGui::SameLine();

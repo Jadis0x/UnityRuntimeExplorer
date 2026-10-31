@@ -15,6 +15,7 @@
 #include <cstdio>
 #include <cstring>
 #include <functional>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -47,7 +48,9 @@ void render_components(const InspectorInfo &info, const Snapshot &snapshot, int 
         if (only_component_id != 0 && component.instance_id != only_component_id)
             continue;
         ImGui::PushID(component.instance_id);
-        const std::string display_type = short_field_component_name(component.type_name);
+        const std::optional<Labels::Label> type_label = Labels::find(Labels::Kind::Type, component.type_name);
+        const std::string display_type = type_label ? type_label->name
+                                                    : Labels::humanize(short_field_component_name(component.type_name));
         // While a search is running the list shows only components that can
         // answer it. A component whose metadata has not arrived yet cannot be
         // judged, so it stays visible until its members are known.
@@ -108,6 +111,7 @@ void render_components(const InspectorInfo &info, const Snapshot &snapshot, int 
                                                               component.class_name, component.type_name);
                 ImGui::SetClipboardText(details.c_str());
             }
+            render_label_editor(Labels::Kind::Type, component.type_name);
             ImGui::Separator();
             ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.95f, 0.55f, 0.50f, 1.0f));
             if (ImGui::MenuItem("Remove Component"))
@@ -292,7 +296,10 @@ void render_components(const InspectorInfo &info, const Snapshot &snapshot, int 
                             ImGui::PushID(static_cast<int>(index));
                             ImGui::TableNextRow();
                             ImGui::TableSetColumnIndex(0);
-                            ImGui::TextUnformatted(member.name.c_str());
+                            const std::string &owner =
+                                member.declaring_type.empty() ? component.type_name : member.declaring_type;
+                            render_member_name(properties ? Labels::Kind::Property : Labels::Kind::Field, owner,
+                                               member.name, {}, Labels::humanize(member.type_name));
                             // Watching lives in the row menu now; a per-row button
                             // cost every member a column of its own.
                             const Snapshot::FieldWatch *row_watch =
@@ -310,8 +317,6 @@ void render_components(const InspectorInfo &info, const Snapshot &snapshot, int 
                                 render_field_context_menu(member, component_code, watch_menu_item);
                             if (watching)
                                 ImGui::SameLine(), ImGui::TextDisabled("watching");
-                            if (ImGui::IsItemHovered())
-                                ImGui::SetTooltip("%s\nRight-click to watch, copy or generate code", member.type_name.c_str());
                             if constexpr (requires { member.is_static; }) {
                                 if (member.is_static)
                                     ImGui::SameLine(), ImGui::TextDisabled("static");
@@ -410,11 +415,16 @@ void render_components(const InspectorInfo &info, const Snapshot &snapshot, int 
                             parameters += method.parameter_types[parameter];
                         }
                         parameters += ")";
-                        const std::string method_label = method.name + " " + parameters;
+                        const std::string method_label =
+                            member_name_text(Labels::Kind::Method,
+                                             method.declaring_type.empty() ? component.type_name
+                                                                           : method.declaring_type,
+                                             method.name, Labels::method_signature(method.parameter_types)) +
+                            " " + Labels::humanize(parameters);
                         const bool method_open = ImGui::TreeNode("##method", "%s", method_label.c_str());
                         render_method_context_menu(method, component_code);
                         ImGui::SameLine();
-                        ImGui::TextDisabled("%s", method.return_type.c_str());
+                        ImGui::TextDisabled("%s", Labels::humanize(method.return_type).c_str());
 						if (!method.runtime_callable) {
 							ImGui::SameLine();
 							ImGui::TextDisabled("metadata only");

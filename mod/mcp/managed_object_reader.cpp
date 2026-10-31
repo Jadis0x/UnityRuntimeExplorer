@@ -1,6 +1,8 @@
 // Copyright (c) 2026 Jadis0x. All rights reserved.
 #include "managed_object_reader.h"
 
+#include "explorer/member_labels.h"
+
 #include <algorithm>
 #include <cctype>
 #include <limits>
@@ -16,11 +18,13 @@ std::string lowercase(std::string value) {
 }
 
 bool matches(std::string_view query, std::string_view name, std::string_view type,
-             std::string_view declaring_type) {
+             std::string_view declaring_type, Explorer::Labels::Kind kind, std::string_view fallback_owner) {
     if (query.empty())
         return true;
     const std::string haystack = lowercase(std::string(name) + " " + std::string(type) + " " +
-                                           std::string(declaring_type));
+                                           std::string(declaring_type) + " " +
+                                           Explorer::Labels::search_text(
+                                               kind, declaring_type.empty() ? fallback_owner : declaring_type, name));
     return haystack.find(lowercase(std::string(query))) != std::string::npos;
 }
 
@@ -46,7 +50,8 @@ ObjectPage read_object(URK::Unity::Object object, std::string_view member_query,
     const auto fields = URK::Unity::Inspect::fields_from_class(
         static_cast<const URK::managed::Class*>(page.type.handle), true);
     for (const URK::Unity::Inspect::FieldInfo& field : fields) {
-        if (!matches(member_query, field.name, field.type_name, field.declaring_type.full_name))
+        if (!matches(member_query, field.name, field.type_name, field.declaring_type.full_name,
+                     Explorer::Labels::Kind::Field, page.type.full_name))
             continue;
         ++page.matching_members;
         if (page.fields.size() + page.properties.size() >= member_limit) {
@@ -75,8 +80,8 @@ ObjectPage read_object(URK::Unity::Object object, std::string_view member_query,
     const auto properties = URK::Unity::Inspect::properties_from_class(
         static_cast<const URK::managed::Class*>(page.type.handle), true);
     for (const URK::Unity::Inspect::PropertyInfo& property : properties) {
-        if (!matches(member_query, property.name, property.type_name,
-                     property.declaring_type.full_name))
+        if (!matches(member_query, property.name, property.type_name, property.declaring_type.full_name,
+                     Explorer::Labels::Kind::Property, page.type.full_name))
             continue;
         ++page.matching_members;
         if (page.fields.size() + page.properties.size() >= member_limit) {

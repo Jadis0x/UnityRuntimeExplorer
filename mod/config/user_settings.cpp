@@ -5,7 +5,10 @@
 
 #include <Windows.h>
 
+#include <algorithm>
 #include <array>
+#include <cmath>
+#include <cwchar>
 #include <cstdio>
 #include <filesystem>
 #include <string>
@@ -19,6 +22,25 @@ std::string g_last_error;
 int g_module_anchor = 0;
 std::array<bool, 256> g_capture_key_down{};
 bool g_capture_active = false;
+// Opaque by default: a translucent panel over a bright scene is what made text hard to read.
+float g_ui_scale = 1.0f;
+float g_panel_opacity = 1.0f;
+
+float read_float(const wchar_t* key, float fallback, float minimum, float maximum, const std::filesystem::path& path) {
+    wchar_t text[32]{};
+    GetPrivateProfileStringW(L"Explorer", key, L"", text, static_cast<DWORD>(std::size(text)), path.c_str());
+    wchar_t* end = nullptr;
+    const float value = std::wcstof(text, &end);
+    if (end == text || !std::isfinite(value))
+        return fallback;
+    return std::clamp(value, minimum, maximum);
+}
+
+int read_mcp_int(const wchar_t* key, int fallback, int minimum, int maximum,
+                const std::filesystem::path& path) {
+    const UINT stored = GetPrivateProfileIntW(L"MCP", key, static_cast<UINT>(fallback), path.c_str());
+    return std::clamp(static_cast<int>(stored), minimum, maximum);
+}
 
 std::filesystem::path settings_path() {
     HMODULE module = nullptr;
@@ -81,6 +103,8 @@ bool load() {
         return false;
     }
     menu_toggle_key = stored;
+    g_ui_scale = read_float(L"UiScale", 1.0f, 0.75f, 2.0f, path);
+    g_panel_opacity = read_float(L"PanelOpacity", 1.0f, 0.35f, 1.0f, path);
     enable_mcp.store(GetPrivateProfileIntW(L"MCP", L"Enabled", 1, path.c_str()) == 1);
     enable_mcp_auto_discovery.store(GetPrivateProfileIntW(L"MCP", L"AutoDiscovery", 1, path.c_str()) == 1);
     enable_mcp_property_access.store(GetPrivateProfileIntW(L"MCP", L"AllowProperties", 1, path.c_str()) == 1);
@@ -89,6 +113,9 @@ bool load() {
     enable_mcp_invocation.store(GetPrivateProfileIntW(L"MCP", L"AllowInvocation", 1, path.c_str()) == 1);
     enable_mcp_destructive_operations.store(
         GetPrivateProfileIntW(L"MCP", L"AllowDestructiveOperations", 1, path.c_str()) == 1);
+    mcp_requests_per_second.store(read_mcp_int(L"RatePerSecond", 20, 1, 200, path));
+    mcp_burst.store(read_mcp_int(L"Burst", 60, 1, 500, path));
+    mcp_timeout_ms.store(read_mcp_int(L"TimeoutMs", 8000, 1000, 30000, path));
     return true;
 }
 
@@ -157,6 +184,35 @@ bool save_mcp_full_access(bool enabled) {
         save_mcp_destructive_operations(enabled);
 }
 
+bool save_mcp_pacing(int requests_per_second, int burst, int timeout_ms) {
+    g_last_error.clear();
+    requests_per_second = std::clamp(requests_per_second, 1, 200);
+    burst = std::clamp(burst, 1, 500);
+    timeout_ms = std::clamp(timeout_ms, 1000, 30000);
+    const std::filesystem::path path = settings_path();
+    if (path.empty()) {
+        g_last_error = "Could not resolve the Explorer DLL directory";
+        return false;
+    }
+    const std::pair<const wchar_t*, int> entries[] = {
+        {L"RatePerSecond", requests_per_second},
+        {L"Burst", burst},
+        {L"TimeoutMs", timeout_ms},
+    };
+    for (const auto& [key, value] : entries) {
+        const std::wstring text = std::to_wstring(value);
+        if (!WritePrivateProfileStringW(L"MCP", key, text.c_str(), path.c_str())) {
+            set_win32_error("Writing MCP pacing settings");
+            return false;
+        }
+    }
+    WritePrivateProfileStringW(nullptr, nullptr, nullptr, path.c_str());
+    mcp_requests_per_second.store(requests_per_second, std::memory_order_release);
+    mcp_burst.store(burst, std::memory_order_release);
+    mcp_timeout_ms.store(timeout_ms, std::memory_order_release);
+    return true;
+}
+
 void begin_toggle_key_capture() {
     for (int key = 0x08; key <= 0xfe; ++key)
         g_capture_key_down[static_cast<std::size_t>(key)] =
@@ -203,6 +259,36 @@ std::string virtual_key_name(int virtual_key) {
     char fallback[16]{};
     std::snprintf(fallback, sizeof(fallback), "VK 0x%02X", virtual_key);
     return fallback;
+}
+
+float ui_scale() {
+    return g_ui_scale;
+}
+
+float panel_opacity() {
+    return g_panel_opacity;
+}
+
+bool save_appearance(float ui_scale, float panel_opacity) {
+    g_last_error.clear();
+    g_ui_scale = std::clamp(ui_scale, 0.75f, 2.0f);
+    g_panel_opacity = std::clamp(panel_opacity, 0.35f, 1.0f);
+    const std::filesystem::path path = settings_path();
+    if (path.empty()) {
+        g_last_error = "Could not resolve the Explorer DLL directory";
+        return false;
+    }
+    wchar_t scale[16]{};
+    wchar_t opacity[16]{};
+    _snwprintf_s(scale, _TRUNCATE, L"%.2f", g_ui_scale);
+    _snwprintf_s(opacity, _TRUNCATE, L"%.2f", g_panel_opacity);
+    if (!WritePrivateProfileStringW(L"Explorer", L"UiScale", scale, path.c_str()) ||
+        !WritePrivateProfileStringW(L"Explorer", L"PanelOpacity", opacity, path.c_str())) {
+        set_win32_error("Writing URK_Explorer.ini");
+        return false;
+    }
+    WritePrivateProfileStringW(nullptr, nullptr, nullptr, path.c_str());
+    return true;
 }
 
 const std::string& last_error() {

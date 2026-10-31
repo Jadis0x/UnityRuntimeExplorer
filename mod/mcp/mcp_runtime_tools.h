@@ -7,6 +7,7 @@
 #include <deque>
 #include <string>
 #include <unordered_map>
+#include <vector>
 
 namespace Explorer {
 class RuntimeModel;
@@ -48,6 +49,21 @@ class RuntimeTools {
         std::uintptr_t metadata_address = 0;
     };
 
+    // One remembered member value (plain JSON).
+    struct SnapshotMember {
+        std::string name;
+        std::string declaring_type;
+        nlohmann::json value;
+    };
+    struct ObjectSnapshot {
+        std::string origin_reference;
+        std::string type_name;
+        std::string member_query;
+        std::size_t member_limit = 250;
+        bool include_properties = false;
+        std::vector<SnapshotMember> members;
+    };
+
     std::string issue_reference(RuntimeModel& model, Reference reference);
     void release_reference_storage(RuntimeModel& model, const Reference& reference);
     const Reference* find_reference(std::string_view token, ReferenceKind kind,
@@ -57,6 +73,8 @@ class RuntimeTools {
 
     std::unordered_map<std::string, Reference> references_;
     std::deque<std::string> reference_order_;
+    std::unordered_map<std::string, ObjectSnapshot> snapshots_;
+    std::deque<std::string> snapshot_order_;
     std::uint64_t scene_generation_ = 0;
     std::uint64_t hierarchy_revision_ = 0;
     std::uint64_t next_instance_scan_id_ = 1;

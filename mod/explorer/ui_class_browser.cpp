@@ -265,7 +265,8 @@ void render_class_browser(const Snapshot &snapshot) {
             if (!state.show_abstract && entry.is_abstract)
                 continue;
             if (!search.empty() && !contains_case_insensitive(entry.full_name, search) &&
-                !contains_case_insensitive(entry.image, search))
+                !contains_case_insensitive(entry.image, search) &&
+                !contains_case_insensitive(Labels::search_text(Labels::Kind::Type, entry.full_name), search))
                 continue;
             if (!assembly_filter.empty() && !contains_case_insensitive(entry.image, assembly_filter))
                 continue;
@@ -275,16 +276,22 @@ void render_class_browser(const Snapshot &snapshot) {
         }
     }
 
-    ImGui::BeginChild("##class-browser-results", ImVec2(0.0f, 235.0f), true);
     constexpr std::size_t kMaxShownClasses = 256;
     const std::size_t visible_count = std::min(kMaxShownClasses, state.matching_indices.size());
+    const float list_row = ImGui::GetTextLineHeightWithSpacing();
+    const float list_height =
+        std::clamp(static_cast<float>(std::max<std::size_t>(visible_count, 1) + 1) * list_row +
+                       ImGui::GetStyle().WindowPadding.y * 2.0f,
+                   list_row * 4.0f, list_row * 14.0f);
+    ImGui::BeginChild("##class-browser-results", ImVec2(0.0f, list_height), true);
     ImGuiListClipper clipper;
     clipper.Begin(static_cast<int>(visible_count));
     while (clipper.Step()) {
         for (int row = clipper.DisplayStart; row < clipper.DisplayEnd; ++row) {
             const BrowserClassInfo &entry = catalog.classes[state.matching_indices[static_cast<std::size_t>(row)]];
             const bool selected = same_browser_class(state.selected, entry);
-            const std::string label = entry.full_name + "##class-browser-" + entry.image + "-" + entry.pointer_text;
+            const std::string label =
+                type_name_text(entry.full_name) + "##class-browser-" + entry.image + "-" + entry.pointer_text;
             if (ImGui::Selectable(label.c_str(), selected)) {
                 if (!selected) {
                     state.target_token = 0;
@@ -314,7 +321,13 @@ void render_class_browser(const Snapshot &snapshot) {
     if (state.selected.class_name.empty())
         return;
     ImGui::SeparatorText("Selected Class");
-    ImGui::TextColored(ImVec4(0.62f, 0.72f, 0.82f, 1.0f), "%s", state.selected.full_name.c_str());
+    ImGui::TextColored(ImVec4(0.62f, 0.72f, 0.82f, 1.0f), "%s", type_name_text(state.selected.full_name).c_str());
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Right-click to label this class");
+    if (ImGui::BeginPopupContextItem("##selected-class-label")) {
+        render_label_editor(Labels::Kind::Type, state.selected.full_name);
+        ImGui::EndPopup();
+    }
     ImGui::TextDisabled("Assembly: %s", state.selected.image.c_str());
     if (!state.selected.parent_name.empty())
         ImGui::TextDisabled("Base: %s", state.selected.parent_name.c_str());
@@ -441,7 +454,11 @@ void render_class_browser(const Snapshot &snapshot) {
         const auto member_tab_flags = [&](int slot) {
             return forced_member_tab == slot ? ImGuiTabItemFlags_SetSelected : ImGuiTabItemFlags_None;
         };
-        ImGui::BeginChild("##class-browser-members", ImVec2(0.0f, 210.0f), true);
+        const float member_row = ImGui::GetTextLineHeightWithSpacing();
+        const bool static_state_below = same_browser_class(snapshot.class_browser_static_query, state.selected);
+        const float members_height = std::max(member_row * 12.0f, ImGui::GetContentRegionAvail().y -
+                                                                       (static_state_below ? member_row * 11.0f : 0.0f));
+        ImGui::BeginChild("##class-browser-members", ImVec2(0.0f, members_height), true);
         // Class members follow the same one-kind-at-a-time layout.
         if (ImGui::BeginTabBar("##class-member-kinds", ImGuiTabBarFlags_FittingPolicyScroll)) {
         char class_tab_label[96];
@@ -454,12 +471,19 @@ void render_class_browser(const Snapshot &snapshot) {
                 if (!member_matches_filter(field.name, field.type_name, field.declaring_type, member_filter))
                     continue;
                 ImGui::PushID(static_cast<int>(field_index));
-                ImGui::TextDisabled("%s%s : %s", field.is_static ? "static " : "", field.name.c_str(),
-                                    field.type_name.c_str());
-                render_field_context_menu(field, class_code, {});
-                if (!field.declaring_type.empty()) {
+                if (field.is_static) {
+                    ImGui::TextDisabled("static");
                     ImGui::SameLine();
-                    ImGui::TextDisabled("[%s]", field.declaring_type.c_str());
+                }
+                render_member_name(Labels::Kind::Field,
+                                   field.declaring_type.empty() ? state.selected.full_name : field.declaring_type,
+                                   field.name);
+                render_field_context_menu(field, class_code, {});
+                ImGui::SameLine();
+                ImGui::TextDisabled(": %s", Labels::humanize(field.type_name).c_str());
+                if (!field.declaring_type.empty() && field.declaring_type != state.selected.full_name) {
+                    ImGui::SameLine();
+                    ImGui::TextDisabled("[%s]", Labels::humanize(field.declaring_type).c_str());
                 }
                 ImGui::SameLine();
                 if (ImGui::SmallButton("Copy addr"))
@@ -479,9 +503,14 @@ void render_class_browser(const Snapshot &snapshot) {
                 if (!member_matches_filter(property.name, property.type_name, property.declaring_type, member_filter))
                     continue;
                 ImGui::PushID(static_cast<int>(property_index));
-                ImGui::TextDisabled("%s : %s  %s%s", property.name.c_str(), property.type_name.c_str(),
-                                    property.can_read ? "get" : "", property.can_write ? "/set" : "");
+                render_member_name(Labels::Kind::Property,
+                                   property.declaring_type.empty() ? state.selected.full_name
+                                                                   : property.declaring_type,
+                                   property.name);
                 render_property_context_menu(property, class_code, {});
+                ImGui::SameLine();
+                ImGui::TextDisabled(": %s  %s%s", Labels::humanize(property.type_name).c_str(),
+                                    property.can_read ? "get" : "", property.can_write ? "/set" : "");
                 ImGui::SameLine();
                 if (ImGui::SmallButton("Copy addr"))
                     ImGui::SetClipboardText(property.pointer_text.c_str());
@@ -509,12 +538,15 @@ void render_class_browser(const Snapshot &snapshot) {
                 for (std::size_t index = 0; index < method.parameter_types.size(); ++index) {
                     if (!parameters.empty())
                         parameters += ", ";
-                    parameters += method.parameter_types[index];
+                    parameters += Labels::humanize(method.parameter_types[index]);
                     if (index < method.parameter_names.size() && !method.parameter_names[index].empty())
-                        parameters += " " + method.parameter_names[index];
+                        parameters += " " + Labels::parameter_display(method.parameter_names[index]);
                 }
-                const std::string signature = (method.is_static ? "static " : "") + method.name + "(" +
-                                              parameters + ") : " + method.return_type;
+                const std::string method_name = member_name_text(
+                    Labels::Kind::Method, method.declaring_type.empty() ? state.selected.full_name : method.declaring_type,
+                    method.name, Labels::method_signature(method.parameter_types));
+                const std::string signature = (method.is_static ? "static " : "") + method_name + "(" + parameters +
+                                              ") : " + Labels::humanize(method.return_type);
                 if (focus_method)
                     ImGui::SetNextItemOpen(true, ImGuiCond_Always);
                 const bool method_open = ImGui::TreeNode("##class-method", "%s", signature.c_str());
@@ -630,7 +662,8 @@ void render_class_browser(const Snapshot &snapshot) {
         for (const ClassBrowserStaticFieldInfo &field : snapshot.class_browser_static_fields) {
             ImGui::PushID(field.is_property ? "property" : "field");
             ImGui::PushID(static_cast<int>(field.member_index));
-            ImGui::TextUnformatted(field.name.c_str());
+            render_member_name(field.is_property ? Labels::Kind::Property : Labels::Kind::Field,
+                               state.selected.full_name, field.name);
             if (field.is_property) {
                 const ComponentInfo::Property property_member{
                     field.name, field.type_name, state.selected.full_name, field.readable, field.writable};
@@ -645,7 +678,7 @@ void render_class_browser(const Snapshot &snapshot) {
                                  state.selected.class_name, state.selected.full_name), {});
             }
             ImGui::SameLine();
-            ImGui::TextDisabled("%s = %s", field.type_name.c_str(), field.display.c_str());
+            ImGui::TextDisabled("%s = %s", Labels::humanize(field.type_name).c_str(), field.display.c_str());
             if (field.token != 0) {
                 ImGui::SameLine();
                 if (ImGui::SmallButton("Inspect"))
